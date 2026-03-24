@@ -581,7 +581,7 @@ def get_megatron_optimizer(
     mp_group = [mp_group] if not isinstance(mp_group, list) else mp_group
     model_parallel_rank = mp_group[0].rank()
     engram_dp_group = process_groups['engram_dp_group']
-    engram_embed_group = process_groups['engram_embed_group']
+    engram_mp_group = process_groups['engram_mp_group']
     engram_dp_group_gloo = process_groups['engram_dp_group_gloo']
     ########## FlagScale End ##########
     expt_tp_pp_group = process_groups['expt_tp_pp_group']
@@ -731,7 +731,7 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(engram_param_groups) > 0:
-        model_parallel_rank = get_pg_rank(engram_embed_group)
+        model_parallel_rank = get_pg_rank(engram_mp_group)
 
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
@@ -745,7 +745,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=engram_param_groups,
                 per_model_buffers=engram_buffers,
-                model_parallel_group=engram_embed_group,
+                model_parallel_group=engram_mp_group,
                 data_parallel_group=engram_dp_group,
                 data_parallel_group_gloo=engram_data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
