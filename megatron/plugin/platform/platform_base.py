@@ -203,10 +203,6 @@ class PlatformBase(ABC):
         ...
 
     @abc.abstractmethod
-    def is_available(self):
-        ...
-
-    @abc.abstractmethod
     def range(self, msg):
         ...
 
@@ -220,10 +216,6 @@ class PlatformBase(ABC):
 
     @abc.abstractmethod
     def lazy_call(self, callback):
-        ...
-
-    @abc.abstractmethod
-    def communication_backend_name(self):
         ...
 
     @abc.abstractmethod
@@ -293,10 +285,6 @@ class PlatformBase(ABC):
 
     @abc.abstractmethod
     def build_extension(self):
-        ...
-
-    @abc.abstractmethod
-    def export_envs(self):
         ...
 
     @abc.abstractmethod

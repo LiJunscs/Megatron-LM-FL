@@ -31,7 +31,7 @@ class PlatformCUDA(PlatformBase):
                 return True
             else:
                 return False
-        except (RuntimeError, ImportError) as e:
+        except Exception as e:
             return False
 
     def get_device_properties(self, device_index=None):
@@ -57,9 +57,6 @@ class PlatformCUDA(PlatformBase):
         if device_index is None:
             return 'cuda'
         return 'cuda:{}'.format(device_index)
-
-    def communication_backend_version(self):
-        return torch.cuda.nccl.version()
 
     def device(self, device_index=None):
         return torch.device('cuda', device_index)
@@ -213,7 +210,7 @@ class PlatformCUDA(PlatformBase):
             return False
         # See https://docs.nvidia.com/deeplearning/tensorrt/support-matrix/index.html#hardware-precision-matrix
         # FP16 on compute capability 6.x is deprecated
-        allow_deprecated_fp16 = os.environ.get('DS_ALLOW_DEPRECATED_FP16', '0') == '1'
+        allow_deprecated_fp16 = os.environ.get('MG_ALLOW_DEPRECATED_FP16', '0') == '1'
         major, _ = torch.cuda.get_device_capability()
         if major >= 7:
             return True
@@ -236,9 +233,6 @@ class PlatformCUDA(PlatformBase):
             return torch.cuda.amp
         return None
 
-    def is_available(self):
-        return torch.cuda.is_available()
-
     def range(self, msg):
         if hasattr(torch.cuda.nvtx, 'range'):
             return torch.cuda.nvtx.range(msg)
@@ -253,9 +247,6 @@ class PlatformCUDA(PlatformBase):
 
     def lazy_call(self, callback):
         return torch.cuda._lazy_call(callback)
-
-    def communication_backend_name(self):
-        return self._communication_backend_name
 
     def is_triton_supported(self):
         if not self.is_available():
@@ -330,9 +321,6 @@ class PlatformCUDA(PlatformBase):
     def build_extension(self):
         from torch.utils.cpp_extension import BuildExtension
         return BuildExtension
-
-    def export_envs(self):
-        return ['NCCL']
 
     def visible_devices_envs(self):
         return ['CUDA_VISIBLE_DEVICES']
