@@ -209,7 +209,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    is quick_gelu or swiglu."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -769,6 +769,27 @@ class TransformerConfig(ModelParallelConfig):
     If positive, generates new random bias each forward pass.
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
+
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
+    lookup table for expert selection instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
+    tid2eid lookup buffer in hash-based MoE routing."""
+
+    dense_grouped_gemm: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
+    log_moe_overload_factor: bool = False
+    """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
+    overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
+    fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
+    use for debugging."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -1794,6 +1815,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
+        if self.activation_func_clamp_value is not None:
+            # swiglu
+            if self.activation_func == F.silu and self.gated_linear_unit:
+                if self.use_te_activation_func:
+                    raise ValueError(
+                        "use_te_activation_func must be False "
+                        "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+                if self.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        "use_transformer_engine_op_fuser must be False "
+                        "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
@@ -1918,6 +1953,26 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
                 "Please set --moe-router-score-function sigmoid for sigmoid score function."
             )
+
+        if self.moe_n_hash_layers > 0:
+            assert self.actual_vocab_size is not None, (
+                "actual_vocab_size must be set when moe_n_hash_layers > 0."
+            )
+            if self.pipeline_model_parallel_size > 1:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                # All hash MoE layers must be in the same virtual pipeline stage.
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
+                    f"as the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

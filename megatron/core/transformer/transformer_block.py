@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Set, Union, cast
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -382,6 +383,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = nn.Linear(hc_dim, hc_mult, bias=False)
+                self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.empty(1))
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -457,6 +464,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         layer_offset: int = 0,
+        input_ids: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing.
 
@@ -515,6 +523,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            input_ids=input_ids,
                         )
                 return hidden_states, context
 
@@ -663,6 +672,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -807,6 +817,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    input_ids=input_ids,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -847,6 +858,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            mhc_recompute_manager=mhc_manager,
+                            input_ids=input_ids,
                         )
 
                     if (
@@ -859,6 +872,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+        # Only contract if the final layer norm is in this stage
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            # [s, b, n*C] -> [s, b, C]
+            # DSv4 modifies the output contract implementation
+            rsqrt = torch.rsqrt(
+                hidden_states.square().mean(-1, keepdim=True) + self.config.layernorm_epsilon
+            )
+            mixes = self.hc_head_fn(hidden_states) * rsqrt
+            pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + 1e-6
+            n = self.config.num_residual_streams
+            hidden_states = torch.sum(
+                pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2
+            )
 
         # Final layer norm.
         if self.final_layernorm is not None:
