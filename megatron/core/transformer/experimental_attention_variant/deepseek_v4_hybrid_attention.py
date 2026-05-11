@@ -280,9 +280,10 @@ class DSv4HybridAttention(Attention):
                 x=hidden_states,
                 qr=q_compressed,
             )
-        core_attn_out = core_attn_manager.group_offload(
-            core_attn_out, forced_released_tensors=[query, key, value]
-        )
+        # NOTE: Not implement in version core_v0.17.0
+        # core_attn_out = core_attn_manager.group_offload(
+        #     core_attn_out, forced_released_tensors=[query, key, value]
+        # )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -381,7 +382,8 @@ class DSv4HybridAttention(Attention):
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        # NOTE: Not implement in version core_v0.17.0
+        # output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
 

@@ -740,7 +740,7 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
+    moe_router_score_function: Literal['softmax', 'sigmoid', "sqrtsoftplus"] = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
