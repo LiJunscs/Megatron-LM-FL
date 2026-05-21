@@ -329,7 +329,7 @@ class TransformerConfig(ModelParallelConfig):
     engram_kernel_size: int = 1
     """Kernel size for Engram short convolution"""
 
-    engram_embedding_parallel_size: int = 1
+    engram_embedding_parallel_size: Optional[int] = None
     """Parallel size for Engram embedding"""
 
     engram_embedding_parallel_method: Literal["alltoall", "allreduce"] = "alltoall"

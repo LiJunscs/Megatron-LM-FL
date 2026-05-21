@@ -80,6 +80,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "dense_grouped_gemm": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
@@ -94,6 +95,19 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_autocast": False,
     "enable_hetero": None,
     "enable_cuda_graph": False,
+    ##### FlagScale Begin #####
+    "enable_hyper_connections": False,
+    "engram_embedding_parallel_method": "alltoall",
+    "engram_embedding_parallel_size": None,
+    "engram_kernel_size": 1,
+    "engram_layer_ids": None,
+    "engram_offload_embedding_optimizer_states": False,
+    "engram_pad_id": 0,
+    "engram_seed": 0,
+    "engram_tokenizer_name_or_path": None,
+    "engram_vocab_size": None,
+    "log_moe_overload_factor": False,
+    ##### FlagScale End #####
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
     "hetero_pipeline_layer_split": None,
@@ -221,6 +235,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_standalone": False,
     "mtp_use_repeated_layer": False,
     "multi_latent_attention": False,
+    ##### FlagScale Begin #####
+    "max_ngram_size": 1,
+    "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_layer_num": None,
+    "mhc_sinkhorn_iterations": 10,
+    ##### FlagScale End #####
     "nccl_all_reduce_for_prefill": False,
     "no_rope_freq": None,
     "no_sync_func": None,
@@ -234,6 +254,11 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "num_microbatches_with_partial_activation_checkpoints": None,
     "num_moe_experts": 128,
     "num_query_groups": 2,
+    ##### FlagScale Begin #####
+    "n_embed_per_ngram": None,
+    "n_head_per_ngram": 1,
+    "num_residual_streams": 4,
+    ##### FlagScale End #####
     "output_layer_init_method": {},
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
@@ -287,6 +312,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "transformer_impl": "transformer_engine",
     "use_cpu_initialization": None,
     "use_dualpipev": False,
+    ##### FlagScale Begin #####
+    "use_engram": False,
+    "use_fused_mhc": False,
+    ##### FlagScale End #####
     "use_fused_weighted_squared_relu": False,
     "use_inference_optimized_layers": False,
     "use_kitchen": False,
