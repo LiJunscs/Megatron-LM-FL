@@ -1,12 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import warnings
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from tests.unit_tests.test_utilities import Utils
+
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -272,11 +278,6 @@ class TestFusedMLARope:
         _test_fused_mla_rope_inplace(
             input_format, inverse=inverse, remove_interleaving=remove_interleaving
         )
-
-    def test_forward_backward_for_kv(self, input_format):
-        _test_fused_apply_mla_rope_for_kv(input_format)
-    def test_inplace_inverse_forward_backward(self, input_format):
-        _test_fused_mla_rope_inplace(input_format, inverse=True)
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):

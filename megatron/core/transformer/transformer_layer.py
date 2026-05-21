@@ -718,6 +718,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        ##### FlagScale ##### Common TransformLayer._forward_attention and _forward_mlp has no keyword argument mhc_recompute_manager
+        kwargs.pop("mhc_recompute_manager", None)
+        ##### FlagScale End #####
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
