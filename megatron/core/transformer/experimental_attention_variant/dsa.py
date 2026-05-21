@@ -874,6 +874,7 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
+            mla_rotary_interleaved=False,
         )
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_nope, x_pe], dim=-1)

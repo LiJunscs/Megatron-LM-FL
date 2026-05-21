@@ -100,6 +100,7 @@ def _apply_rotary_pos_emb_bshd(
     t: Tensor,
     freqs: Tensor,
     rotary_interleaved: bool = False,
+    mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
@@ -112,6 +113,7 @@ def _apply_rotary_pos_emb_bshd(
     Args:
         t (Tensor): Input tensor T is of shape [seq_length, ... , dim]
         freqs (Tensor): Rotary Positional embedding tensor freq is of shape [seq_length, ..., dim]
+        mla_rotary_interleaved (bool): Whether to apply MLA-style interleaving for RoPE.
 
     Returns:
         Tensor: The input tensor after applying RoPE
@@ -135,7 +137,7 @@ def _apply_rotary_pos_emb_bshd(
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 
-    if multi_latent_attention:
+    if mla_rotary_interleaved:
         x1 = t[..., 0::2]
         x2 = t[..., 1::2]
         t = torch.cat((x1, x2), dim=-1)
@@ -213,11 +215,12 @@ def _apply_rotary_pos_emb_thd(
     cu_seqlens: Tensor,
     freqs: Tensor,
     rotary_interleaved: bool = False,
-    multi_latent_attention: bool = False,
+    mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
+    multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -231,7 +234,12 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
-
+    if multi_latent_attention is not None:
+        warnings.warn(
+            "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
+            DeprecationWarning,
+        )
+        mla_rotary_interleaved = multi_latent_attention
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
@@ -260,8 +268,8 @@ def _apply_rotary_pos_emb_thd(
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
             freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=multi_latent_attention,
+                rotary_interleaved=rotary_interleaved,
+                mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
@@ -279,7 +287,7 @@ def _apply_rotary_pos_emb_thd(
             t.unsqueeze(1),
             freqs_packed,
             rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
@@ -355,7 +363,7 @@ def apply_rotary_pos_emb(
             t,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
@@ -366,7 +374,7 @@ def apply_rotary_pos_emb(
             cu_seqlens,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
             inverse=inverse,
@@ -397,7 +405,7 @@ def apply_rotary_pos_emb_with_cos_sin(
             t,
             freqs,
             rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=False,
+            mla_rotary_interleaved=False,
             mscale=1.0,
         )
     else:

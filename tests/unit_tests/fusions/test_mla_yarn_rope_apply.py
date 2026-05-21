@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import warnings
 from unittest.mock import MagicMock, patch
-
+import sys
+sys.path.append("/workspace/repos/megatron-fl/")
 import pytest
 import torch
 
