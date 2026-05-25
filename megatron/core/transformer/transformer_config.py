@@ -1312,8 +1312,6 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
 
             if self.apply_dsa_kernel_fusion:
-                import torch
-
                 assert (
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
