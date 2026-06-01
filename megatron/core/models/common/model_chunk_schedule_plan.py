@@ -558,7 +558,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
             )
             ##### FlagScale #####
-            print(f"f_layer_{i}.mhc_recompute_manager = {f_layer.layer_state.mhc_recompute_manager}")
             TransformerBlock._finalize_mhc_recompute_layer(
                 mhc_manager=f_layer.layer_state.mhc_recompute_manager,
                 hidden_states=f_input,
@@ -587,7 +586,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             cur_platform.range_pop()  # FlagScale Add
             ##### FlagScale #####
-            print(f"f_layer_{i}.mhc_recompute_manager = {f_layer.layer_state.mhc_recompute_manager}")
             TransformerBlock._finalize_mhc_recompute_layer(
                 mhc_manager=f_layer.layer_state.mhc_recompute_manager,
                 hidden_states=f_input,
@@ -620,6 +618,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
+            ##### FlagScale Begin #####
             # If using hyper connections, the gradient accumulated through layers is
             # multi‑stream [s, b, n*C], but pre_process expects single‑stream [s, b, C].
             # We manually reduce it (sum over streams) to match the forward expand.
@@ -627,6 +626,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 n = b_schedule_plan.num_residual_streams
                 C = b_grad.shape[-1] // n
                 b_grad = b_grad.view(*b_grad.shape[:-1], n, C).sum(dim=-2)
+            ##### FlagScale End #####
             b_schedule_plan.pre_process.backward(b_grad)
 
         if f_schedule_plan:

@@ -1260,6 +1260,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             # Check tensor parallelism compatibility
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
             assert (
                 self.linear_num_key_heads % self.tensor_model_parallel_size == 0
             ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
