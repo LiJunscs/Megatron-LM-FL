@@ -1578,6 +1578,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -3186,6 +3187,7 @@ def train(
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
+            and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
             and iteration ==  start_iteration + 1
         ):
@@ -3193,9 +3195,9 @@ def train(
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
-                    pad_buf = getattr(model_chunk, "param_and_grad_buffer", None)
-                    if pad_buf is not None:
-                        pad_buf.manual_buffer_registration()
+                    param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+                    if param_and_grad_buffer is not None:
+                        param_and_grad_buffer.manual_buffer_registration()
 
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
