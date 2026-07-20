@@ -330,6 +330,7 @@ def _sparse_attn_bwd_kernel(
     stride_out_s, stride_out_h, stride_out_d,
     stride_lse_s, stride_lse_h,
     HAS_SINK: tl.constexpr,
+    BLOCK_K: tl.constexpr = 32,
 ):
     """Sparse attention backward kernel.
 
@@ -339,8 +340,11 @@ def _sparse_attn_bwd_kernel(
     - dV via P^T @ dO (atomic add)
     where dS = P * (dO @ V^T - D_i), D_i = rowsum(dO * O).
 
-    Atomic scatter for dK/dV is inherently per-position, so this kernel uses a
-    simple loop rather than tiling.
+    TopK is constexpr so that `range(0, TopK, BLOCK_K)` is fully resolved at
+    compile time.  Previous versions had TopK as a runtime parameter with a
+    two-level loop (`num_full_tiles = TopK // BLOCK_K`), but runtime integer
+    division and runtime loop bounds in Triton can produce undefined behavior
+    depending on the compiler version, leading to NaN gradients.
     """
     pid_q = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -368,35 +372,39 @@ def _sparse_attn_bwd_kernel(
     # Accumulate dQ
     dq_acc = tl.zeros([D], dtype=tl.float32)
 
-    # Process each TopK KV position
+    # Process TopK KV positions in tiles of BLOCK_K (both TopK and BLOCK_K are
+    # constexpr, so `range(0, TopK, BLOCK_K)` is fully resolved at compile time).
     idx_base = pid_q * stride_idx_s + pid_h * stride_idx_h
 
-    for k_pos in range(TopK):
-        kv_idx = tl.load(IDX_ptr + idx_base + k_pos * stride_idx_k)
+    for tile_start in range(0, TopK, BLOCK_K):
+        for k_off in range(BLOCK_K):
+            k_pos = tile_start + k_off
+            if k_pos < TopK:
+                kv_idx = tl.load(IDX_ptr + idx_base + k_pos * stride_idx_k)
 
-        is_valid = kv_idx >= 0
-        safe_idx = tl.where(is_valid, kv_idx, 0)
+                is_valid = kv_idx >= 0
+                safe_idx = tl.where(is_valid, kv_idx, 0)
 
-        kv_base = safe_idx * stride_kv_s
-        k_vec = tl.load(KV_ptr + kv_base + d_range * stride_kv_d, mask=d_range < D, other=0.0).to(tl.float32)
-        v_vec = tl.load(KV_ptr + kv_base + dv_range * stride_kv_d, mask=dv_range < DV, other=0.0).to(tl.float32)
+                kv_base = safe_idx * stride_kv_s
+                k_vec = tl.load(KV_ptr + kv_base + d_range * stride_kv_d, mask=d_range < D, other=0.0).to(tl.float32)
+                v_vec = tl.load(KV_ptr + kv_base + dv_range * stride_kv_d, mask=dv_range < DV, other=0.0).to(tl.float32)
 
-        # Recompute attention probability
-        s = tl.sum(q * k_vec) * softmax_scale
-        p = tl.where(is_valid, tl.exp(s - lse_val), 0.0)
+                # Recompute attention probability
+                s = tl.sum(q * k_vec) * softmax_scale
+                p = tl.where(is_valid, tl.exp(s - lse_val), 0.0)
 
-        # dS = P * (dO @ V^T - Di)
-        dov = tl.sum(dO * v_vec)
-        ds = p * (dov - Di) * softmax_scale
+                # dS = P * (dO @ V^T - Di)
+                dov = tl.sum(dO * v_vec)
+                ds = p * (dov - Di) * softmax_scale
 
-        # dQ += ds * K
-        dq_acc += ds * k_vec
+                # dQ += ds * K
+                dq_acc += ds * k_vec
 
-        # dK += ds * Q (atomic add to shared KV)
-        tl.atomic_add(DKV_ptr + kv_base + d_range * stride_kv_d, (ds * q).to(tl.bfloat16), mask=d_range < D)
+                # dK += ds * Q (atomic add to shared KV)
+                tl.atomic_add(DKV_ptr + kv_base + d_range * stride_kv_d, ds * q, mask=(d_range < D) & is_valid)
 
-        # dV += p * dO (atomic add)
-        tl.atomic_add(DKV_ptr + kv_base + dv_range * stride_kv_d, (p * dO).to(tl.bfloat16), mask=dv_range < DV)
+                # dV += p * dO (atomic add)
+                tl.atomic_add(DKV_ptr + kv_base + dv_range * stride_kv_d, p * dO, mask=(dv_range < DV) & is_valid)
 
     # Store dQ
     tl.store(DQ_ptr + q_offset + d_range * stride_q_d, dq_acc.to(tl.bfloat16), mask=d_range < D)
@@ -763,9 +771,27 @@ def triton_sparse_attn_bwd(
     D_full = kv.shape[-1] if kv.dim() > 1 else D
     TopK = topk_idxs.shape[-1]
 
-    # Allocate gradient outputs
+    # Ensure topk_idxs is contiguous — expanded tensors (stride=0 from
+    # .expand()) can cause illegal memory access in Triton kernels due to
+    # pointer arithmetic with zero strides.
+    if not topk_idxs.is_contiguous():
+        topk_idxs = topk_idxs.contiguous()
+
+    # Choose BLOCK_K: controls the inner-loop unroll factor.
+    # Smaller BLOCK_K reduces code size / register pressure at the cost of
+    # more outer-loop iterations (runtime overhead is negligible since the
+    # outer loop is a simple counter).
+    if TopK <= 32:
+        BLOCK_K = 16
+    elif TopK <= 128:
+        BLOCK_K = 32
+    else:
+        BLOCK_K = 64
+
+    # Allocate gradient outputs — use f32 for dkv to ensure atomic_add
+    # compatibility and avoid potential bf16 atomic issues.
     dq = torch.zeros_like(q)
-    dkv = torch.zeros((total_Skv, D_full), dtype=torch.bfloat16, device=q.device)
+    dkv = torch.zeros((total_Skv, D_full), dtype=torch.float32, device=q.device)
 
     grid = (total_Sq, H)
 
@@ -783,6 +809,7 @@ def triton_sparse_attn_bwd(
         out.stride(0), out.stride(1), out.stride(2),
         lse.stride(0), lse.stride(1),
         HAS_SINK=(attn_sink is not None),
+        BLOCK_K=BLOCK_K,
     )
 
     # Compute d_sink if needed (gradient w.r.t. bias-only sink)
@@ -800,7 +827,18 @@ def triton_sparse_attn_bwd(
         ds_sink = -p_sink * Di  # (total_Sq, H)
         d_sink = ds_sink.sum(0)  # (H,)
 
-    return {"dq": dq, "dkv": dkv, "d_sink": d_sink}
+    return {"dq": dq, "dkv": dkv.to(torch.bfloat16), "d_sink": d_sink}
+
+
+# ---------------------------------------------------------------------------
+# Fused backward utilities (Triton epilogue kernels for bf16 BMM path)
+# ---------------------------------------------------------------------------
+
+from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import (
+    fused_mask_scatter_add,
+    fused_exp_mask,
+    should_use_triton_bwd,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ Public API (identical to ``dsa_kernels.py``):
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional, Tuple
 
@@ -41,6 +42,9 @@ from megatron.plugin.dsa_kernel.triton_indexer_kernels import (
     fused_sparse_indexer_loss_and_backward,
     fused_dense_indexer_loss_and_backward,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +198,18 @@ def _indexer_topk_bshd(
 
 
 class _DSASparseAttnFunc(torch.autograd.Function):
-    """Differentiable sparse attention using Triton kernels."""
+    """Differentiable sparse attention using Triton kernels.
+
+    The backward path adapts to match the forward path's dot-product method:
+    - When forward used PyTorch BMM (TopK <= 512), backward also uses BMM to
+      ensure the recomputed scores are numerically consistent with the saved LSE.
+    - When forward used the Triton kernel (TopK > 512), backward uses the Triton
+      kernel which shares the same accumulation order.
+    """
+
+    # Mirror the forward dispatch thresholds from triton_sparse_attn.py
+    _PYTORCH_FWD_TOPK_THRESHOLD = 512
+    _PYTORCH_FWD_MAX_GATHER_ELEMENTS = 2 * 1024 * 1024
 
     @staticmethod
     def forward(
@@ -210,6 +225,27 @@ class _DSASparseAttnFunc(torch.autograd.Function):
             query, kv, topk_idxs, softmax_scale, d_v, attn_sink
         )
         ctx.has_attn_sink = attn_sink is not None
+
+        # Determine if the forward used the PyTorch BMM path (same logic as
+        # triton_sparse_attn_fwd dispatch).  If so, the backward must also use
+        # BMM to keep the score recomputation numerically consistent with LSE.
+        TopK = topk_idxs.shape[-1]
+        total_Sq, H = topk_idxs.shape[0], topk_idxs.shape[1]
+        shared = (topk_idxs.stride(1) == 0)
+        gather_elements = total_Sq * TopK if shared else total_Sq * H * TopK
+        ctx.used_pytorch_fwd = (
+            TopK <= _DSASparseAttnFunc._PYTORCH_FWD_TOPK_THRESHOLD
+            and gather_elements <= _DSASparseAttnFunc._PYTORCH_FWD_MAX_GATHER_ELEMENTS
+        )
+        ctx.shared_indices = shared
+
+        logger.debug(
+            "_DSASparseAttnFunc.forward: total_Sq=%d, H=%d, TopK=%d, shared=%s, "
+            "fwd_path=%s",
+            total_Sq, H, TopK, shared,
+            "pytorch_bmm" if ctx.used_pytorch_fwd else "triton",
+        )
+
         if attn_sink is not None:
             ctx.save_for_backward(query, kv, topk_idxs, out, lse, attn_sink)
         else:
@@ -225,12 +261,129 @@ class _DSASparseAttnFunc(torch.autograd.Function):
         else:
             query, kv, topk_idxs, out, lse = ctx.saved_tensors
             attn_sink = None
-        bwd_result = triton_sparse_attn_backward(
-            grad_out, query, kv, out, lse, topk_idxs,
-            ctx.softmax_scale, ctx.d_v, attn_sink
+
+        logger.debug(
+            "_DSASparseAttnFunc.backward: used_pytorch_fwd=%s, shared_indices=%s, "
+            "bwd_path=%s",
+            ctx.used_pytorch_fwd, ctx.shared_indices,
+            "bmm" if (ctx.used_pytorch_fwd and ctx.shared_indices) else "triton",
         )
-        dq, dkv, d_sink = bwd_result["dq"], bwd_result["dkv"], bwd_result["d_sink"]
+
+        if ctx.used_pytorch_fwd and ctx.shared_indices:
+            # --- BMM backward: matches the PyTorch BMM forward path ---
+            # Recomputes scores via cuBLAS BMM (same accumulation as forward)
+            # so that exp(scores - lse) is numerically consistent.
+            dq, dkv, d_sink = _DSASparseAttnFunc._bmm_backward(
+                grad_out, query, kv, topk_idxs, out, lse, attn_sink,
+                ctx.softmax_scale, ctx.d_v,
+            )
+        else:
+            # --- Triton backward: forward also used Triton kernel ---
+            # Both fwd and bwd use tl.sum(q * k) → same dot product, consistent.
+            bwd_result = triton_sparse_attn_backward(
+                grad_out, query, kv, out, lse, topk_idxs,
+                ctx.softmax_scale, ctx.d_v, attn_sink
+            )
+            dq, dkv, d_sink = bwd_result["dq"], bwd_result["dkv"], bwd_result["d_sink"]
+
         return dq, dkv, None, None, None, d_sink
+
+    @staticmethod
+    def _bmm_backward(
+        grad_out: Tensor,   # (total_Sq, H, d_v) bf16
+        query: Tensor,      # (total_Sq, H, D) bf16
+        kv: Tensor,         # (total_Skv, D_full) bf16
+        topk_idxs: Tensor,  # (total_Sq, H, TopK) int32, shared (stride(1)==0)
+        out: Tensor,        # (total_Sq, H, d_v) bf16
+        lse: Tensor,        # (total_Sq, H) f32
+        attn_sink: Optional[Tensor],  # (H,) f32 or None
+        softmax_scale: float,
+        d_v: int,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        """BMM-based backward for shared-index sparse attention.
+
+        Adapted from FusedIndexerSparseAttnFunc.backward (optimized path).
+        Uses cuBLAS BMM for score recomputation to match the forward's LSE.
+        """
+        total_Sq, H, D = query.shape
+        total_Skv = kv.shape[0]
+        D_full = kv.shape[-1] if kv.dim() > 1 else D
+        TopK = topk_idxs.shape[-1]
+
+        # Shared indices: (total_Sq, H, TopK) with stride(1)==0 → use head 0
+        idxs_shared = topk_idxs[:, 0, :]  # (total_Sq, TopK)
+        valid_shared = idxs_shared >= 0    # (total_Sq, TopK)
+        safe_shared = idxs_shared.clamp(min=0).long()
+
+        # Gather KV once in bf16 (cuBLAS bf16 BMM does f32 internal accumulation)
+        flat_idxs = safe_shared.reshape(-1)  # (total_Sq * TopK)
+        kv_gathered = kv[flat_idxs].reshape(total_Sq, TopK, D_full)  # bf16
+
+        kv_is_shared = (D == d_v == D_full)
+
+        # Di = sum(dO * O) per (query, head)
+        Di = (grad_out.float() * out.float()).sum(dim=-1)  # (total_Sq, H)
+
+        # Recompute scores via f32 BMM — must match _pytorch_sparse_attn_fwd
+        # which uses torch.bmm(q.float(), k.float().T) * scale.
+        # Using f32 inputs ensures identical accumulation and thus exp(s - lse) ≈ 1
+        # at the correct positions (no bf16 truncation mismatch).
+        scores = torch.bmm(
+            query.float(),  # (S, H, D) f32
+            kv_gathered[:, :, :D].float().transpose(1, 2)  # (S, D, TopK) f32
+        ) * softmax_scale  # f32
+
+        # P = exp(scores - lse) * valid_mask
+        P = fused_exp_mask(scores, lse, valid_shared, H)
+        del scores
+
+        # dov = dO @ V^T (f32 for precision in dS computation)
+        dov = torch.bmm(
+            grad_out.float(), kv_gathered[:, :, :d_v].float().transpose(1, 2)
+        )  # (S, H, TopK) f32
+
+        # dS = P * (dov - Di) * scale
+        dS = P * (dov - Di.unsqueeze(-1)) * softmax_scale
+        del dov
+
+        # dQ = dS @ K (f32 for precision)
+        dq = torch.bmm(dS, kv_gathered[:, :, :D].float())  # (S, H, D) f32
+
+        # dKV: dK = dS^T @ Q, dV = P^T @ dO
+        q_f32 = query.float()
+        dO_f32 = grad_out.float()
+
+        dkv_gathered = torch.bmm(dS.transpose(1, 2), q_f32)  # (S, TopK, D) f32
+        del dS
+        if kv_is_shared:
+            # dV = P^T @ dO: in-place add (dK + dV into same buffer)
+            torch.baddbmm(dkv_gathered, P.transpose(1, 2), dO_f32, out=dkv_gathered)
+        else:
+            dv = torch.bmm(P.transpose(1, 2), dO_f32)
+            dkv_tmp = torch.zeros(
+                total_Sq, TopK, D_full, dtype=torch.float32, device=query.device
+            )
+            dkv_tmp[:, :, :D] = dkv_gathered
+            dkv_tmp[:, :, :d_v] += dv
+            dkv_gathered = dkv_tmp
+        del P, q_f32, dO_f32
+
+        # Scatter dkv_gathered back to full KV positions
+        valid_flat = valid_shared.reshape(-1)
+        dkv = torch.zeros(total_Skv, D_full, dtype=torch.float32, device=query.device)
+        fused_mask_scatter_add(dkv_gathered, flat_idxs, valid_flat, dkv)
+
+        dq_out = dq.to(query.dtype)
+        dkv_out = dkv.to(kv.dtype)
+
+        # d_sink: gradient of the bias-only attention sink
+        d_sink = None
+        if attn_sink is not None:
+            p_sink = torch.exp(attn_sink.unsqueeze(0) - lse)  # (total_Sq, H)
+            ds_sink = -p_sink * Di  # (total_Sq, H)
+            d_sink = ds_sink.sum(0)  # (H,)
+
+        return dq_out, dkv_out, d_sink
 
 
 def dsa_sparse_attn(
@@ -425,6 +578,13 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         idx_nh, idx_hd = q_indexer.shape[2], q_indexer.shape[3]
 
         effective_topk = min(indexer_topk, n_comp)
+
+        logger.debug(
+            "FusedIndexerSparseAttnFunc.forward: sq=%d, b=%d, np=%d, d=%d, "
+            "skv=%d, n_comp=%d, effective_topk=%d, sparse_loss=%s, "
+            "loss_coeff=%.4g",
+            sq, b, np_, d, skv, n_comp, effective_topk, sparse_loss, loss_coeff,
+        )
 
         prof = _CudaProfiler(enabled=_DSA_PROFILE)
 
@@ -651,6 +811,13 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # Determine whether to use optimized bf16 BMM path or baseline f32 path.
         shared_indices = (global_idxs.stride(1) == 0)
         use_optimized_bwd = should_use_triton_bwd(total_Sq, TopK, d_kv, np_, shared_indices)
+
+        logger.debug(
+            "FusedIndexerSparseAttnFunc.backward: sq=%d, b=%d, np=%d, "
+            "TopK=%d, d_kv=%d, shared_indices=%s, bwd_path=%s",
+            sq, b, np_, TopK, d_kv, shared_indices,
+            "optimized_bf16_bmm" if use_optimized_bwd else "baseline_f32",
+        )
 
         if use_optimized_bwd:
             # --- Optimized path: bf16 BMM + Triton fused epilogues ---

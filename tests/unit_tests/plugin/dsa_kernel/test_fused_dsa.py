@@ -7,6 +7,11 @@ Validates that ``fused_indexer_sparse_attn`` from the Triton plugin produces
 numerically equivalent attention output to ``unfused_compressed_sparse_attn``
 from ``megatron.core.transformer.experimental_attention_variant.csa``.
 
+Test parameters are configured for training-realistic workloads:
+- Sequence length >= 2048 (typical training context)
+- TopK > 256 (large sparse attention windows)
+- Number of heads >= 32 (full-model multi-head attention)
+
 The fused path:
 1. Scores + top-K selection via indexer (q_indexer, k_indexer, weights)
 2. Combines compressed top-K indices with window indices
@@ -16,12 +21,13 @@ The fused path:
 The unfused path takes pre-computed indices and runs only the sparse attention.
 We compare the attention output (not the loss) between them.
 
-Run with: pytest tests/unit_tests/plugin/dsa_kernel/test_fused_indexer_sparse_attn.py -v -s
+Run with: pytest tests/unit_tests/plugin/dsa_kernel/test_fused_dsa.py -v -s
 Requires: CUDA GPU with Triton support.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from typing import Tuple
@@ -32,6 +38,13 @@ from torch import Tensor
 
 # Skip entire module if CUDA is not available
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+# ---------------------------------------------------------------------------
+# Logging setup — use `pytest -s --log-cli-level=INFO` for detailed output,
+# or `--log-cli-level=WARNING` to suppress per-test metric prints.
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Imports
@@ -229,29 +242,25 @@ class TestFusedIndexerSparseAttnAccuracy:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            # Small shapes — tighter tolerance
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
-            (32, 2, 4, 128, 32, 16, 2, 64, 16, 4),
-            # Medium shapes
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
-            (128, 1, 8, 128, 32, 16, 4, 64, 16, 4),
-            # Larger topk (closer to production)
-            (64, 1, 4, 128, 128, 32, 2, 64, 64, 4),
-            (128, 1, 4, 128, 256, 64, 2, 64, 128, 4),
+            # Training-scale shapes: seq>=2048, topk>256, heads>=32
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 2, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
+            (8192, 1, 32, 128, 2048, 256, 4, 64, 512, 4),
         ],
         ids=[
-            "small_B1",
-            "small_B2",
-            "medium_B2",
-            "medium_8heads",
-            "large_topk64",
-            "large_topk128",
+            "7B_B1_sq2048_topk256",
+            "7B_B2_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
+            "longctx_B1_sq8192_topk512",
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_output_accuracy(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, sparse_loss, device,
+        indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
         """Fused attention output matches unfused path (both with attn_sink)."""
         kv_offset = sq  # original tokens occupy [0, sq)
@@ -295,10 +304,15 @@ class TestFusedIndexerSparseAttnAccuracy:
         assert torch.isfinite(indexer_loss), f"Indexer loss is not finite: {indexer_loss.item()}"
         assert indexer_loss.item() >= 0, f"Indexer loss is negative: {indexer_loss.item()}"
 
+        dsa_metrics.record_accuracy(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
+            cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff,
+        )
+
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
         ],
     )
     def test_loss_nonzero(
@@ -326,7 +340,7 @@ class TestFusedIndexerSparseAttnAccuracy:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 2, 4, 128, 32, 16, 2, 64, 16, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
         ],
     )
     def test_deterministic(
@@ -349,7 +363,7 @@ class TestFusedIndexerSparseAttnAccuracy:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
         ],
     )
     def test_loss_coeff_scaling(
@@ -469,24 +483,22 @@ class TestFusedIndexerSparseAttnBackward:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
-            (32, 2, 4, 128, 32, 16, 2, 64, 16, 4),
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
-            (128, 1, 8, 128, 32, 16, 4, 64, 16, 4),
-            (64, 1, 4, 128, 128, 32, 2, 64, 64, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 2, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
         ],
         ids=[
-            "small_B1",
-            "small_B2",
-            "medium_B2",
-            "medium_8heads",
-            "large_topk64",
+            "7B_B1_sq2048_topk256",
+            "7B_B2_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_grad_query_accuracy(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, sparse_loss, device,
+        indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
         """Gradient w.r.t. query matches unfused reference."""
         kv_offset = sq
@@ -516,30 +528,34 @@ class TestFusedIndexerSparseAttnBackward:
             f"grad_query cosine similarity too low: {cos_sim:.6f} "
             f"(max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e})"
         )
-        print(
-            f"\n  grad_query: cos_sim={cos_sim:.6f}, "
-            f"max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        logger.info(f"grad_query: cos_sim={cos_sim:.6f}")
+        logger.debug(
+            f"grad_query detail: max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        )
+        dsa_metrics.record_accuracy(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
+            cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_query",
         )
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
-            (32, 2, 4, 128, 32, 16, 2, 64, 16, 4),
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
-            (128, 1, 8, 128, 32, 16, 4, 64, 16, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 2, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
         ],
         ids=[
-            "small_B1",
-            "small_B2",
-            "medium_B2",
-            "medium_8heads",
+            "7B_B1_sq2048_topk256",
+            "7B_B2_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_grad_kv_accuracy(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, sparse_loss, device,
+        indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
         """Gradient w.r.t. kv_full matches unfused reference."""
         kv_offset = sq
@@ -567,27 +583,31 @@ class TestFusedIndexerSparseAttnBackward:
             f"grad_kv_full cosine similarity too low: {cos_sim:.6f} "
             f"(max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e})"
         )
-        print(
-            f"\n  grad_kv_full: cos_sim={cos_sim:.6f}, "
-            f"max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        logger.info(f"grad_kv_full: cos_sim={cos_sim:.6f}")
+        logger.debug(
+            f"grad_kv_full detail: max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        )
+        dsa_metrics.record_accuracy(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
+            cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_kv",
         )
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
-            (128, 1, 8, 128, 32, 16, 4, 64, 16, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
         ],
         ids=[
-            "small_B1",
-            "medium_B2",
-            "medium_8heads",
+            "7B_B1_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
         ],
     )
     def test_grad_attn_sink_accuracy(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, device,
+        indexer_topk, ratio, device, dsa_metrics,
     ):
         """Gradient w.r.t. attn_sink matches unfused reference."""
         kv_offset = sq
@@ -616,18 +636,22 @@ class TestFusedIndexerSparseAttnBackward:
             f"grad_attn_sink cosine similarity too low: {cos_sim:.6f} "
             f"(max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e})"
         )
-        print(
-            f"\n  grad_attn_sink: cos_sim={cos_sim:.6f}, "
-            f"max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        logger.info(f"grad_attn_sink: cos_sim={cos_sim:.6f}")
+        logger.debug(
+            f"grad_attn_sink detail: max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}"
+        )
+        dsa_metrics.record_accuracy(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk},
+            cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_attn_sink",
         )
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (32, 1, 4, 128, 16, 8, 2, 64, 8, 4),
-            (64, 2, 4, 128, 64, 32, 2, 64, 32, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
         ],
-        ids=["small", "medium"],
+        ids=["7B_sq2048", "13B_sq4096"],
     )
     def test_backward_no_nan_inf(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
@@ -688,27 +712,25 @@ class TestFusedIndexerSparseAttnPerformance:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            # Production-scale shapes with large topk
-            (512, 1, 16, 128, 128, 64, 4, 64, 64, 4),
-            (512, 2, 16, 128, 256, 64, 4, 64, 128, 4),
-            (1024, 1, 16, 128, 256, 128, 4, 64, 128, 4),
-            (1024, 1, 16, 128, 512, 128, 4, 64, 256, 4),
-            (2048, 1, 8, 128, 512, 128, 4, 64, 256, 4),
-            (2048, 1, 8, 128, 512, 128, 4, 64, 512, 4),
+            # Training-scale shapes: seq>=2048, topk>256, heads>=32
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 2, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
+            (8192, 1, 32, 128, 2048, 256, 4, 64, 512, 4),
         ],
         ids=[
-            "sq512_b1_topk64",
-            "sq512_b2_topk128",
-            "sq1024_b1_topk128",
-            "sq1024_b1_topk256",
-            "sq2048_b1_topk256",
-            "sq2048_b1_topk512",
+            "7B_B1_sq2048_topk256",
+            "7B_B2_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
+            "longctx_B1_sq8192_topk512",
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_performance_forward(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, sparse_loss, device,
+        indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
         """Measure forward performance: fused Triton vs unfused CSA + indexer loss."""
         kv_offset = sq
@@ -835,13 +857,16 @@ class TestFusedIndexerSparseAttnPerformance:
 
         speedup = time_unfused / max(time_fused, 1e-6)
 
-        print(
-            f"\n  [sq={sq}, b={b}, np={np_}, topk={indexer_topk}, "
-            f"win={win_topk}, sparse_loss={sparse_loss}]"
+        logger.info(
+            f"[sq={sq}, b={b}, np={np_}, topk={indexer_topk}, win={win_topk}, "
+            f"sparse_loss={sparse_loss}] "
+            f"fused={time_fused:.3f}ms, unfused={time_unfused:.3f}ms, "
+            f"speedup={speedup:.2f}x"
         )
-        print(f"    Fused (Triton):  {time_fused:.3f} ms")
-        print(f"    Unfused (CSA):   {time_unfused:.3f} ms")
-        print(f"    Speedup:         {speedup:.2f}x")
+        dsa_metrics.record_performance(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
+            fused_ms=time_fused, unfused_ms=time_unfused, speedup=speedup, label="fwd",
+        )
 
         # The fused path should not be catastrophically slower
         # (it may be slower at very small shapes due to kernel launch overhead)
@@ -852,19 +877,19 @@ class TestFusedIndexerSparseAttnPerformance:
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (512, 1, 16, 128, 128, 64, 4, 64, 64, 4),
-            (1024, 1, 16, 128, 256, 128, 4, 64, 128, 4),
-            (2048, 1, 8, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
         ],
         ids=[
-            "sq512_topk64",
-            "sq1024_topk128",
-            "sq2048_topk256",
+            "7B_sq2048_topk256",
+            "13B_sq4096_topk384",
+            "70B_sq2048_topk512",
         ],
     )
     def test_performance_backward(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, device,
+        indexer_topk, ratio, device, dsa_metrics,
     ):
         """Measure backward pass performance for the fused path."""
         kv_offset = sq
@@ -893,20 +918,24 @@ class TestFusedIndexerSparseAttnPerformance:
 
         time_bwd = self._benchmark(run_fwd_bwd, warmup=5, iters=20)
 
-        print(
-            f"\n  [sq={sq}, b={b}, np={np_}, topk={indexer_topk}, win={win_topk}]"
+        logger.info(
+            f"[sq={sq}, b={b}, np={np_}, topk={indexer_topk}, win={win_topk}] "
+            f"fwd+bwd={time_bwd:.3f}ms"
         )
-        print(f"    Fwd+Bwd (Triton): {time_bwd:.3f} ms")
+        dsa_metrics.record_performance(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk},
+            fused_ms=time_bwd, unfused_ms=time_bwd, speedup=1.0, label="bwd",
+        )
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (1024, 1, 16, 128, 256, 128, 4, 64, 128, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
         ],
     )
     def test_peak_memory(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, device,
+        indexer_topk, ratio, device, dsa_metrics,
     ):
         """Measure peak GPU memory usage for fused vs unfused paths."""
         kv_offset = sq
@@ -932,31 +961,36 @@ class TestFusedIndexerSparseAttnPerformance:
         torch.cuda.synchronize()
         mem_unfused_peak = torch.cuda.max_memory_allocated(device) - mem_before
 
-        print(
-            f"\n  [sq={sq}, b={b}, np={np_}, topk={indexer_topk}]"
+        logger.info(
+            f"[sq={sq}, b={b}, np={np_}, topk={indexer_topk}] "
+            f"fused={mem_fused_peak / 1024**2:.1f}MB, "
+            f"unfused={mem_unfused_peak / 1024**2:.1f}MB"
         )
-        print(f"    Fused peak memory:   {mem_fused_peak / 1024**2:.1f} MB")
-        print(f"    Unfused peak memory: {mem_unfused_peak / 1024**2:.1f} MB")
+        dsa_metrics.record_memory(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk},
+            fused_mb=mem_fused_peak / 1024**2, unfused_mb=mem_unfused_peak / 1024**2,
+            ratio=mem_unfused_peak / max(mem_fused_peak, 1),
+        )
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
-            (512, 1, 16, 128, 128, 64, 4, 64, 64, 4),
-            (512, 2, 16, 128, 256, 64, 4, 64, 128, 4),
-            (1024, 1, 16, 128, 256, 128, 4, 64, 128, 4),
-            (2048, 1, 8, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 1, 32, 128, 512, 128, 4, 64, 256, 4),
+            (2048, 2, 32, 128, 512, 128, 4, 64, 256, 4),
+            (4096, 1, 32, 128, 1024, 256, 4, 64, 384, 4),
+            (2048, 1, 64, 128, 512, 128, 4, 64, 512, 4),
         ],
         ids=[
-            "sq512_b1_topk64",
-            "sq512_b2_topk128",
-            "sq1024_b1_topk128",
-            "sq2048_b1_topk256",
+            "7B_B1_sq2048_topk256",
+            "7B_B2_sq2048_topk256",
+            "13B_B1_sq4096_topk384",
+            "70B_B1_sq2048_topk512",
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_performance_end_to_end(
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
-        indexer_topk, ratio, sparse_loss, device,
+        indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
         """End-to-end (forward + backward) performance: fused Triton vs unfused CSA."""
         kv_offset = sq
@@ -1155,19 +1189,23 @@ class TestFusedIndexerSparseAttnPerformance:
         time_unfused = self._benchmark(run_unfused_e2e, warmup=5, iters=20)
         speedup = time_unfused / max(time_fused, 1e-6)
 
-        print(
-            f"\n  [sq={sq}, b={b}, np={np_}, topk={indexer_topk}, "
-            f"win={win_topk}, sparse_loss={sparse_loss}]"
+        logger.info(
+            f"[sq={sq}, b={b}, np={np_}, topk={indexer_topk}, win={win_topk}, "
+            f"sparse_loss={sparse_loss}] "
+            f"fused_e2e={time_fused:.3f}ms, unfused_e2e={time_unfused:.3f}ms, "
+            f"speedup={speedup:.2f}x"
         )
-        print(f"    Fused E2E (Triton):  {time_fused:.3f} ms")
-        print(f"    Unfused E2E (CSA):   {time_unfused:.3f} ms")
-        print(f"    E2E Speedup:         {speedup:.2f}x")
+        dsa_metrics.record_performance(
+            params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
+            fused_ms=time_fused, unfused_ms=time_unfused, speedup=speedup, label="e2e",
+        )
 
 
 # ---------------------------------------------------------------------------
 # Module-level tests: CompressedSparseAttention unfused vs fused (triton)
 # ---------------------------------------------------------------------------
 
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from megatron.core.transformer.experimental_attention_variant.csa import (
@@ -1179,7 +1217,57 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexerSubmodules,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+    dsa_sparse_attn as _triton_dsa_sparse_attn_raw,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+# ---------------------------------------------------------------------------
+# OOM guard — unfused path can OOM at large sequence lengths
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _oom_guard():
+    """Convert CUDA OOM into pytest.skip — unfused path is memory-hungry at 4k+."""
+    try:
+        yield
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        pytest.skip("CUDA OOM on unfused path at this sequence length")
+
+
+# ---------------------------------------------------------------------------
+# Triton dsa_sparse_attn wrapper (SBHD interface matching dsa_kernels.py)
+# ---------------------------------------------------------------------------
+
+
+def _triton_dsa_sparse_attn(
+    query, kv, attn_sink, topk_idxs, softmax_scale, topk_length=None, indexer_topk=0
+):
+    """SBHD wrapper around triton plugin's flat dsa_sparse_attn.
+
+    Matches the signature of ``dsa_kernels.dsa_sparse_attn`` so it can be
+    monkey-patched into csa.py for tests without FlashMLA/cuDNN.
+    """
+    sq, b, np_, d = query.shape
+    skv = kv.shape[0]
+    q_flat = query.reshape(sq * b, np_, d)
+    kv_flat = kv.reshape(skv * b, d)
+    # triton expects (total_Sq, H_kv, TopK); dsa_kernels produces (total_Sq, TopK)
+    if topk_idxs.dim() == 2:
+        topk_idxs = topk_idxs.unsqueeze(1)
+    out_flat, _lse, _ = _triton_dsa_sparse_attn_raw(
+        q_flat, kv_flat, topk_idxs, softmax_scale, d, attn_sink, topk_length, indexer_topk
+    )
+    d_v = out_flat.shape[-1]
+    return out_flat.reshape(sq, b, np_ * d_v)
+
+
+_PATCH_DSA_SPARSE_ATTN = (
+    'megatron.core.transformer.experimental_attention_variant.csa.dsa_sparse_attn'
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -1358,16 +1446,16 @@ class TestCSAFusedVsUnfusedAccuracy:
     @pytest.mark.parametrize(
         "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
         [
-            (64, 1, 8, 128, 16, 16),
-            (128, 1, 8, 128, 32, 32),
-            (256, 2, 8, 128, 64, 64),
+            (2048, 1, 32, 128, 128, 256),
+            (4096, 1, 32, 128, 256, 384),
+            (2048, 1, 64, 128, 128, 512),
         ],
-        ids=["sq64_topk16", "sq128_topk32", "sq256_topk64"],
+        ids=["7B_sq2048_topk256", "13B_sq4096_topk384", "70B_sq2048_topk512"],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_output_accuracy(
         self, sq, b, num_heads, v_head_dim, window_size, indexer_topk,
-        sparse_loss, device,
+        sparse_loss, device, dsa_metrics,
     ):
         """Fused (triton) output matches unfused CSA path at module level."""
         with _hadamard_patches():
@@ -1388,15 +1476,16 @@ class TestCSAFusedVsUnfusedAccuracy:
 
             # --- Unfused path ---
             csa.apply_dsa_kernel_fusion = False
-            torch.manual_seed(7)
-            out_unfused = csa(
-                query=inputs["query"].clone(),
-                key=inputs["key"].clone(),
-                value=inputs["value"].clone(),
-                attention_mask=None,
-                x=inputs["x"].clone(),
-                qr=inputs["qr"].clone(),
-            )
+            with _oom_guard():
+                torch.manual_seed(7)
+                out_unfused = csa(
+                    query=inputs["query"].clone(),
+                    key=inputs["key"].clone(),
+                    value=inputs["value"].clone(),
+                    attention_mask=None,
+                    x=inputs["x"].clone(),
+                    qr=inputs["qr"].clone(),
+                )
 
             # --- Fused path (triton) ---
             csa.apply_dsa_kernel_fusion = True
@@ -1424,26 +1513,30 @@ class TestCSAFusedVsUnfusedAccuracy:
             max_diff = abs_diff.max().item()
             mean_diff = abs_diff.mean().item()
 
-            print(
-                f"\n  [sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
-                f"sparse_loss={sparse_loss}]"
+            logger.info(
+                f"[sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
+                f"sparse_loss={sparse_loss}] cos_sim={cos_sim:.6f}"
             )
-            print(f"    cos_sim={cos_sim:.6f}, max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}")
+            logger.debug(f"  max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}")
 
             assert cos_sim > 0.95, (
                 f"Module-level output mismatch: cos_sim={cos_sim:.6f}"
+            )
+            dsa_metrics.record_accuracy(
+                params={"sq": sq, "b": b, "np": num_heads, "topk": indexer_topk, "sparse_loss": sparse_loss},
+                cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="module_output",
             )
 
     @pytest.mark.parametrize(
         "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
         [
-            (128, 1, 8, 128, 32, 32),
+            (2048, 1, 32, 128, 128, 256),
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_grad_accuracy(
         self, sq, b, num_heads, v_head_dim, window_size, indexer_topk,
-        sparse_loss, device,
+        sparse_loss, device, dsa_metrics,
     ):
         """Gradients from fused (triton) path match unfused CSA path."""
         with _hadamard_patches():
@@ -1466,11 +1559,12 @@ class TestCSAFusedVsUnfusedAccuracy:
             csa.apply_dsa_kernel_fusion = False
             query_u = inputs["query"].clone().requires_grad_(True)
             key_u = inputs["key"].clone().requires_grad_(True)
-            out_u = csa(
-                query=query_u, key=key_u, value=key_u.clone(),
-                attention_mask=None, x=inputs["x"].clone(), qr=inputs["qr"].clone(),
-            )
-            out_u.sum().backward()
+            with _oom_guard():
+                out_u = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"].clone(), qr=inputs["qr"].clone(),
+                )
+                out_u.sum().backward()
             grad_q_unfused = query_u.grad.float().clone()
             grad_k_unfused = key_u.grad.float().clone()
 
@@ -1500,13 +1594,19 @@ class TestCSAFusedVsUnfusedAccuracy:
                 grad_k_unfused.reshape(-1).unsqueeze(0),
             ).item()
 
-            print(
-                f"\n  grad_query cos_sim={cos_q:.6f}, "
-                f"grad_key cos_sim={cos_k:.6f}"
-            )
+            logger.info(f"grad_query cos_sim={cos_q:.6f}, grad_key cos_sim={cos_k:.6f}")
 
             assert cos_q > 0.90, f"grad_query cos_sim too low: {cos_q:.6f}"
             assert cos_k > 0.90, f"grad_key cos_sim too low: {cos_k:.6f}"
+
+            dsa_metrics.record_accuracy(
+                params={"sq": sq, "b": b, "np": num_heads, "topk": indexer_topk, "sparse_loss": sparse_loss},
+                cos_sim=cos_q, target="module_grad_query",
+            )
+            dsa_metrics.record_accuracy(
+                params={"sq": sq, "b": b, "np": num_heads, "topk": indexer_topk, "sparse_loss": sparse_loss},
+                cos_sim=cos_k, target="module_grad_key",
+            )
 
 
 class TestCSAFusedVsUnfusedPerformance:
@@ -1549,16 +1649,16 @@ class TestCSAFusedVsUnfusedPerformance:
     @pytest.mark.parametrize(
         "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
         [
-            (512, 1, 16, 128, 64, 64),
-            (1024, 1, 16, 128, 128, 128),
-            (2048, 1, 8, 128, 128, 256),
+            (2048, 1, 32, 128, 128, 256),
+            (4096, 1, 32, 128, 256, 384),
+            (2048, 1, 64, 128, 128, 512),
         ],
-        ids=["sq512_topk64", "sq1024_topk128", "sq2048_topk256"],
+        ids=["7B_sq2048_topk256", "13B_sq4096_topk384", "70B_sq2048_topk512"],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_e2e_performance(
         self, sq, b, num_heads, v_head_dim, window_size, indexer_topk,
-        sparse_loss, device,
+        sparse_loss, device, dsa_metrics,
     ):
         """End-to-end (forward + backward) module-level performance comparison."""
         with _hadamard_patches():
@@ -1593,7 +1693,8 @@ class TestCSAFusedVsUnfusedPerformance:
                 key_u.grad = None
                 csa.zero_grad()
 
-            time_unfused = self._benchmark(run_unfused)
+            with _oom_guard():
+                time_unfused = self._benchmark(run_unfused)
 
             # --- Fused benchmark (triton) ---
             csa.apply_dsa_kernel_fusion = True
@@ -1615,27 +1716,31 @@ class TestCSAFusedVsUnfusedPerformance:
 
             speedup = time_unfused / max(time_fused, 1e-6)
 
-            print(
-                f"\n  [sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
-                f"win={window_size}, sparse_loss={sparse_loss}]"
+            logger.info(
+                f"[sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
+                f"win={window_size}, sparse_loss={sparse_loss}] "
+                f"unfused={time_unfused:.3f}ms, fused={time_fused:.3f}ms, "
+                f"speedup={speedup:.2f}x"
             )
-            print(f"    Unfused CSA E2E:    {time_unfused:.3f} ms")
-            print(f"    Fused Triton E2E:   {time_fused:.3f} ms")
-            print(f"    Speedup:            {speedup:.2f}x")
+
+            dsa_metrics.record_performance(
+                params={"sq": sq, "b": b, "np": num_heads, "topk": indexer_topk, "win": window_size, "sparse_loss": sparse_loss},
+                fused_ms=time_fused, unfused_ms=time_unfused, speedup=speedup, label="module_e2e",
+            )
 
     @pytest.mark.parametrize(
         "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
         [
-            (512, 1, 16, 128, 64, 64),
-            (1024, 1, 16, 128, 128, 128),
-            (2048, 1, 8, 128, 128, 256),
+            (2048, 1, 32, 128, 128, 256),
+            (4096, 1, 32, 128, 256, 384),
+            (2048, 1, 64, 128, 128, 512),
         ],
-        ids=["sq512_topk64", "sq1024_topk128", "sq2048_topk256"],
+        ids=["7B_sq2048_topk256", "13B_sq4096_topk384", "70B_sq2048_topk512"],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
     def test_e2e_memory(
         self, sq, b, num_heads, v_head_dim, window_size, indexer_topk,
-        sparse_loss, device,
+        sparse_loss, device, dsa_metrics,
     ):
         """Peak GPU memory comparison: fused vs unfused E2E (forward + backward)."""
         with _hadamard_patches():
@@ -1660,28 +1765,29 @@ class TestCSAFusedVsUnfusedPerformance:
             query_u = inputs["query"].clone().requires_grad_(True)
             key_u = inputs["key"].clone().requires_grad_(True)
 
-            # Warmup
-            out = csa(
-                query=query_u, key=key_u, value=key_u.clone(),
-                attention_mask=None, x=inputs["x"], qr=inputs["qr"],
-            )
-            out.sum().backward()
-            query_u.grad = None
-            key_u.grad = None
-            csa.zero_grad()
-            torch.cuda.synchronize()
+            with _oom_guard():
+                # Warmup
+                out = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                query_u.grad = None
+                key_u.grad = None
+                csa.zero_grad()
+                torch.cuda.synchronize()
 
-            torch.cuda.reset_peak_memory_stats(device)
-            torch.cuda.synchronize()
-            mem_before_unfused = torch.cuda.memory_allocated(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize()
+                mem_before_unfused = torch.cuda.memory_allocated(device)
 
-            out = csa(
-                query=query_u, key=key_u, value=key_u.clone(),
-                attention_mask=None, x=inputs["x"], qr=inputs["qr"],
-            )
-            out.sum().backward()
-            torch.cuda.synchronize()
-            mem_unfused_peak = torch.cuda.max_memory_allocated(device) - mem_before_unfused
+                out = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                torch.cuda.synchronize()
+                mem_unfused_peak = torch.cuda.max_memory_allocated(device) - mem_before_unfused
 
             query_u.grad = None
             key_u.grad = None
@@ -1720,10 +1826,652 @@ class TestCSAFusedVsUnfusedPerformance:
 
             ratio = mem_unfused_peak / max(mem_fused_peak, 1)
 
-            print(
-                f"\n  [sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
-                f"win={window_size}, sparse_loss={sparse_loss}]"
+            logger.info(
+                f"[sq={sq}, b={b}, np={num_heads}, topk={indexer_topk}, "
+                f"win={window_size}, sparse_loss={sparse_loss}] "
+                f"unfused={mem_unfused_peak / 1024**2:.1f}MB, "
+                f"fused={mem_fused_peak / 1024**2:.1f}MB, ratio={ratio:.2f}x"
             )
-            print(f"    Unfused peak memory: {mem_unfused_peak / 1024**2:.1f} MB")
-            print(f"    Fused peak memory:   {mem_fused_peak / 1024**2:.1f} MB")
-            print(f"    Memory ratio:        {ratio:.2f}x")
+
+            dsa_metrics.record_memory(
+                params={"sq": sq, "b": b, "np": num_heads, "topk": indexer_topk, "win": window_size, "sparse_loss": sparse_loss},
+                fused_mb=mem_fused_peak / 1024**2, unfused_mb=mem_unfused_peak / 1024**2, ratio=ratio,
+            )
+
+
+# ---------------------------------------------------------------------------
+# No-indexer tests: compress_ratio=0 (window-only) and compress_ratio=128
+# ---------------------------------------------------------------------------
+
+
+class TestCSANoIndexerFusedVsUnfused:
+    """E2E accuracy: CompressedSparseAttention with no indexer (ratio=0 or ratio=128).
+
+    Tests the _forward_fused_no_indexer path vs _forward_unfused_csa.
+    - ratio=0:   window-only attention, no compressor, no indexer.
+    - ratio=128: attend-all-compressed, compressor built but no indexer.
+
+    Both paths rely on dsa_sparse_attn (patched with triton) for the fused side
+    and unfused_compressed_sparse_attn for the unfused side.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_class(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def device(self):
+        return torch.device("cuda:0")
+
+    @pytest.mark.parametrize(
+        "compress_ratio,sq,b,num_heads,v_head_dim,window_size",
+        [
+            (0,   2048, 1, 32, 128, 128),
+            (0,   4096, 1, 32, 128, 256),
+            (128, 2048, 1, 32, 128, 128),
+            (128, 4096, 1, 32, 128, 256),
+        ],
+        ids=["win_only_2k", "win_only_4k", "ratio128_2k", "ratio128_4k"],
+    )
+    def test_output_accuracy_no_indexer(
+        self, compress_ratio, sq, b, num_heads, v_head_dim, window_size, device, dsa_metrics,
+    ):
+        """Fused (triton) output matches unfused CSA path for no-indexer configs."""
+        with _hadamard_patches():
+            config = _make_test_mla_config(
+                num_attention_heads=num_heads,
+                v_head_dim=v_head_dim,
+                csa_window_size=window_size,
+                dsa_indexer_topk=64,
+                dsa_indexer_loss_coeff=0.0,
+            )
+
+            torch.manual_seed(42)
+            csa = _build_csa_module(config, compress_ratio=compress_ratio)
+            csa.train()
+
+            inputs = _make_csa_inputs(sq, b, config, device)
+
+            # --- Unfused path ---
+            csa.apply_dsa_kernel_fusion = False
+            with _oom_guard():
+                torch.manual_seed(7)
+                out_unfused = csa(
+                    query=inputs["query"].clone(),
+                    key=inputs["key"].clone(),
+                    value=inputs["value"].clone(),
+                    attention_mask=None,
+                    x=inputs["x"].clone(),
+                    qr=inputs["qr"].clone(),
+                )
+
+            # --- Fused path (triton dsa_sparse_attn) ---
+            csa.apply_dsa_kernel_fusion = True
+            with patch(_PATCH_DSA_SPARSE_ATTN, _triton_dsa_sparse_attn):
+                torch.manual_seed(7)
+                out_fused = csa(
+                    query=inputs["query"].clone(),
+                    key=inputs["key"].clone(),
+                    value=inputs["value"].clone(),
+                    attention_mask=None,
+                    x=inputs["x"].clone(),
+                    qr=inputs["qr"].clone(),
+                )
+
+            # Compare
+            out_f = out_fused.float()
+            out_u = out_unfused.float()
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                out_f.reshape(-1).unsqueeze(0),
+                out_u.reshape(-1).unsqueeze(0),
+            ).item()
+
+            abs_diff = (out_f - out_u).abs()
+            max_diff = abs_diff.max().item()
+            mean_diff = abs_diff.mean().item()
+
+            logger.info(
+                f"[ratio={compress_ratio}, sq={sq}, b={b}, np={num_heads}, "
+                f"win={window_size}] cos_sim={cos_sim:.6f}"
+            )
+            logger.debug(f"  max_diff={max_diff:.4e}, mean_diff={mean_diff:.4e}")
+
+            assert cos_sim > 0.95, (
+                f"No-indexer output mismatch: cos_sim={cos_sim:.6f}"
+            )
+
+            dsa_metrics.record_accuracy(
+                params={"ratio": compress_ratio, "sq": sq, "b": b, "np": num_heads, "win": window_size},
+                cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="no_indexer_output",
+            )
+
+    @pytest.mark.parametrize(
+        "compress_ratio,sq,b,num_heads,v_head_dim,window_size",
+        [
+            (0,   2048, 1, 32, 128, 128),
+            (0,   4096, 1, 32, 128, 256),
+            (128, 2048, 1, 32, 128, 128),
+            (128, 4096, 1, 32, 128, 256),
+        ],
+        ids=["win_only_2k", "win_only_4k", "ratio128_2k", "ratio128_4k"],
+    )
+    def test_grad_accuracy_no_indexer(
+        self, compress_ratio, sq, b, num_heads, v_head_dim, window_size, device, dsa_metrics,
+    ):
+        """Gradients from fused (triton) path match unfused CSA path for no-indexer configs."""
+        with _hadamard_patches():
+            config = _make_test_mla_config(
+                num_attention_heads=num_heads,
+                v_head_dim=v_head_dim,
+                csa_window_size=window_size,
+                dsa_indexer_topk=64,
+                dsa_indexer_loss_coeff=0.0,
+            )
+
+            torch.manual_seed(42)
+            csa = _build_csa_module(config, compress_ratio=compress_ratio)
+            csa.train()
+
+            inputs = _make_csa_inputs(sq, b, config, device)
+
+            # --- Unfused path with grad ---
+            csa.apply_dsa_kernel_fusion = False
+            query_u = inputs["query"].clone().requires_grad_(True)
+            key_u = inputs["key"].clone().requires_grad_(True)
+            with _oom_guard():
+                out_u = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"].clone(), qr=inputs["qr"].clone(),
+                )
+                out_u.sum().backward()
+            grad_q_unfused = query_u.grad.float().clone()
+            grad_k_unfused = key_u.grad.float().clone()
+
+            csa.zero_grad()
+
+            # --- Fused path with grad (triton dsa_sparse_attn) ---
+            csa.apply_dsa_kernel_fusion = True
+            query_f = inputs["query"].clone().requires_grad_(True)
+            key_f = inputs["key"].clone().requires_grad_(True)
+            with patch(_PATCH_DSA_SPARSE_ATTN, _triton_dsa_sparse_attn):
+                out_f = csa(
+                    query=query_f, key=key_f, value=key_f.clone(),
+                    attention_mask=None, x=inputs["x"].clone(), qr=inputs["qr"].clone(),
+                )
+                torch.cuda.synchronize()
+                out_f.sum().backward()
+                torch.cuda.synchronize()
+            grad_q_fused = query_f.grad.float().clone()
+            grad_k_fused = key_f.grad.float().clone()
+
+            # Debug: check for NaN/Inf/zero in fused gradients
+            logger.debug(f"grad_q_fused: nan={torch.isnan(grad_q_fused).any().item()}, "
+                  f"inf={torch.isinf(grad_q_fused).any().item()}, "
+                  f"all_zero={(grad_q_fused == 0).all().item()}, "
+                  f"norm={grad_q_fused.norm().item():.4e}")
+            logger.debug(f"grad_k_fused: nan={torch.isnan(grad_k_fused).any().item()}, "
+                  f"inf={torch.isinf(grad_k_fused).any().item()}, "
+                  f"all_zero={(grad_k_fused == 0).all().item()}, "
+                  f"norm={grad_k_fused.norm().item():.4e}")
+            logger.debug(f"grad_q_unfused: norm={grad_q_unfused.norm().item():.4e}")
+            logger.debug(f"grad_k_unfused: norm={grad_k_unfused.norm().item():.4e}")
+
+            # Compare grad_query
+            cos_q = torch.nn.functional.cosine_similarity(
+                grad_q_fused.reshape(-1).unsqueeze(0),
+                grad_q_unfused.reshape(-1).unsqueeze(0),
+            ).item()
+            # Compare grad_key
+            cos_k = torch.nn.functional.cosine_similarity(
+                grad_k_fused.reshape(-1).unsqueeze(0),
+                grad_k_unfused.reshape(-1).unsqueeze(0),
+            ).item()
+
+            logger.info(
+                f"[ratio={compress_ratio}, sq={sq}, np={num_heads}, win={window_size}] "
+                f"grad_query cos_sim={cos_q:.6f}, grad_key cos_sim={cos_k:.6f}"
+            )
+
+            assert cos_q > 0.90, f"grad_query cos_sim too low: {cos_q:.6f}"
+            assert cos_k > 0.90, f"grad_key cos_sim too low: {cos_k:.6f}"
+
+            dsa_metrics.record_accuracy(
+                params={"ratio": compress_ratio, "sq": sq, "np": num_heads, "win": window_size},
+                cos_sim=cos_q, target="no_indexer_grad_query",
+            )
+            dsa_metrics.record_accuracy(
+                params={"ratio": compress_ratio, "sq": sq, "np": num_heads, "win": window_size},
+                cos_sim=cos_k, target="no_indexer_grad_key",
+            )
+
+
+# ---------------------------------------------------------------------------
+# No-indexer end-to-end performance tests
+# ---------------------------------------------------------------------------
+
+
+class TestCSANoIndexerPerformance:
+    """E2E performance: CompressedSparseAttention no-indexer path.
+
+    Measures forward+backward timing for the fused (triton dsa_sparse_attn)
+    path vs the unfused CSA path when no indexer is used (ratio=0 or ratio=128).
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_class(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def device(self):
+        return torch.device("cuda:0")
+
+    @staticmethod
+    def _benchmark(fn, warmup: int = 5, iters: int = 20) -> float:
+        """Benchmark a CUDA function. Returns median elapsed ms."""
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
+
+        times.sort()
+        return times[len(times) // 2]
+
+    @pytest.mark.parametrize(
+        "compress_ratio,sq,b,num_heads,v_head_dim,window_size",
+        [
+            (0,   2048, 1, 32, 128, 128),
+            (0,   4096, 1, 32, 128, 256),
+            (128, 2048, 1, 32, 128, 128),
+            (128, 4096, 1, 32, 128, 256),
+        ],
+        ids=["win_only_2k", "win_only_4k", "ratio128_2k", "ratio128_4k"],
+    )
+    def test_e2e_performance_no_indexer(
+        self, compress_ratio, sq, b, num_heads, v_head_dim, window_size, device, dsa_metrics,
+    ):
+        """Forward+backward performance: fused triton vs unfused CSA (no indexer)."""
+        with _hadamard_patches():
+            config = _make_test_mla_config(
+                num_attention_heads=num_heads,
+                v_head_dim=v_head_dim,
+                csa_window_size=window_size,
+                dsa_indexer_topk=64,
+                dsa_indexer_loss_coeff=0.0,
+            )
+
+            torch.manual_seed(42)
+            csa = _build_csa_module(config, compress_ratio=compress_ratio)
+            csa.train()
+
+            inputs = _make_csa_inputs(sq, b, config, device)
+
+            # --- Unfused benchmark ---
+            csa.apply_dsa_kernel_fusion = False
+            query_u = inputs["query"].clone().requires_grad_(True)
+            key_u = inputs["key"].clone().requires_grad_(True)
+
+            def run_unfused():
+                out = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                query_u.grad = None
+                key_u.grad = None
+                csa.zero_grad()
+
+            with _oom_guard():
+                time_unfused = self._benchmark(run_unfused)
+
+            # --- Fused benchmark (triton dsa_sparse_attn) ---
+            csa.apply_dsa_kernel_fusion = True
+            query_f = inputs["query"].clone().requires_grad_(True)
+            key_f = inputs["key"].clone().requires_grad_(True)
+
+            def run_fused():
+                out = csa(
+                    query=query_f, key=key_f, value=key_f.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                query_f.grad = None
+                key_f.grad = None
+                csa.zero_grad()
+
+            with patch(_PATCH_DSA_SPARSE_ATTN, _triton_dsa_sparse_attn):
+                time_fused = self._benchmark(run_fused)
+
+            speedup = time_unfused / max(time_fused, 1e-6)
+
+            logger.info(
+                f"[ratio={compress_ratio}, sq={sq}, b={b}, np={num_heads}, "
+                f"win={window_size}] "
+                f"unfused={time_unfused:.3f}ms, fused={time_fused:.3f}ms, "
+                f"speedup={speedup:.2f}x"
+            )
+
+            dsa_metrics.record_performance(
+                params={"ratio": compress_ratio, "sq": sq, "b": b, "np": num_heads, "win": window_size},
+                fused_ms=time_fused, unfused_ms=time_unfused, speedup=speedup, label="no_indexer_e2e",
+            )
+
+    @pytest.mark.parametrize(
+        "compress_ratio,sq,b,num_heads,v_head_dim,window_size",
+        [
+            (0,   2048, 1, 32, 128, 128),
+            (0,   4096, 1, 32, 128, 256),
+            (128, 2048, 1, 32, 128, 128),
+            (128, 4096, 1, 32, 128, 256),
+        ],
+        ids=["win_only_2k", "win_only_4k", "ratio128_2k", "ratio128_4k"],
+    )
+    def test_e2e_memory_no_indexer(
+        self, compress_ratio, sq, b, num_heads, v_head_dim, window_size, device, dsa_metrics,
+    ):
+        """Peak GPU memory: fused triton vs unfused CSA (no indexer)."""
+        with _hadamard_patches():
+            config = _make_test_mla_config(
+                num_attention_heads=num_heads,
+                v_head_dim=v_head_dim,
+                csa_window_size=window_size,
+                dsa_indexer_topk=64,
+                dsa_indexer_loss_coeff=0.0,
+            )
+
+            torch.manual_seed(42)
+            csa = _build_csa_module(config, compress_ratio=compress_ratio)
+            csa.train()
+
+            inputs = _make_csa_inputs(sq, b, config, device)
+
+            # --- Unfused memory measurement ---
+            csa.apply_dsa_kernel_fusion = False
+            query_u = inputs["query"].clone().requires_grad_(True)
+            key_u = inputs["key"].clone().requires_grad_(True)
+
+            with _oom_guard():
+                # Warmup
+                out = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                query_u.grad = None
+                key_u.grad = None
+                csa.zero_grad()
+                torch.cuda.synchronize()
+
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize()
+                mem_before = torch.cuda.memory_allocated(device)
+
+                out = csa(
+                    query=query_u, key=key_u, value=key_u.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+                torch.cuda.synchronize()
+                mem_unfused_peak = torch.cuda.max_memory_allocated(device) - mem_before
+
+            query_u.grad = None
+            key_u.grad = None
+            csa.zero_grad()
+            torch.cuda.empty_cache()
+
+            # --- Fused memory measurement ---
+            csa.apply_dsa_kernel_fusion = True
+            query_f = inputs["query"].clone().requires_grad_(True)
+            key_f = inputs["key"].clone().requires_grad_(True)
+
+            # Warmup
+            with patch(_PATCH_DSA_SPARSE_ATTN, _triton_dsa_sparse_attn):
+                out = csa(
+                    query=query_f, key=key_f, value=key_f.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+            query_f.grad = None
+            key_f.grad = None
+            csa.zero_grad()
+            torch.cuda.synchronize()
+
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize()
+            mem_before = torch.cuda.memory_allocated(device)
+
+            with patch(_PATCH_DSA_SPARSE_ATTN, _triton_dsa_sparse_attn):
+                out = csa(
+                    query=query_f, key=key_f, value=key_f.clone(),
+                    attention_mask=None, x=inputs["x"], qr=inputs["qr"],
+                )
+                out.sum().backward()
+            torch.cuda.synchronize()
+            mem_fused_peak = torch.cuda.max_memory_allocated(device) - mem_before
+
+            ratio = mem_unfused_peak / max(mem_fused_peak, 1)
+
+            logger.info(
+                f"[ratio={compress_ratio}, sq={sq}, b={b}, np={num_heads}, "
+                f"win={window_size}] "
+                f"unfused={mem_unfused_peak / 1024**2:.1f}MB, "
+                f"fused={mem_fused_peak / 1024**2:.1f}MB, ratio={ratio:.2f}x"
+            )
+
+            dsa_metrics.record_memory(
+                params={"ratio": compress_ratio, "sq": sq, "b": b, "np": num_heads, "win": window_size},
+                fused_mb=mem_fused_peak / 1024**2, unfused_mb=mem_unfused_peak / 1024**2, ratio=ratio,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Kernel-level backward accuracy: _DSASparseAttnFunc (dsa_sparse_attn)
+# ---------------------------------------------------------------------------
+
+
+class TestDSASparseAttnBackward:
+    """Kernel-level backward accuracy for dsa_sparse_attn (_DSASparseAttnFunc).
+
+    Verifies gradient correctness for both backward dispatch paths:
+    - BMM backward: triggered when TopK <= 512 (forward used PyTorch BMM)
+    - Triton backward: triggered when TopK > 512 (forward used Triton kernel)
+
+    Reference: unfused_compressed_sparse_attn (fully materialized PyTorch autograd).
+    """
+
+    @pytest.fixture
+    def device(self):
+        return torch.device("cuda:0")
+
+    @staticmethod
+    def _make_inputs(
+        total_sq: int, total_skv: int, np_: int, d: int, topk: int,
+        device: torch.device, seed: int = 42,
+    ) -> dict:
+        """Generate random inputs for direct dsa_sparse_attn testing."""
+        torch.manual_seed(seed)
+
+        query = torch.randn(total_sq, np_, d, device=device, dtype=torch.bfloat16)
+        kv = torch.randn(total_skv, d, device=device, dtype=torch.bfloat16)
+        attn_sink = torch.randn(np_, device=device, dtype=torch.float32) * 0.1
+        softmax_scale = 1.0 / math.sqrt(d)
+
+        # Generate random valid indices in [0, total_skv), with some -1 for
+        # early positions (simulating causal masking)
+        topk_idxs = torch.randint(0, total_skv, (total_sq, topk), device=device, dtype=torch.int32)
+        # Mark ~10% as invalid
+        invalid_mask = torch.rand(total_sq, topk, device=device) < 0.1
+        topk_idxs[invalid_mask] = -1
+        # First row: only 1 valid position (stress test for edge cases)
+        topk_idxs[0, 1:] = -1
+
+        return {
+            "query": query,
+            "kv": kv,
+            "attn_sink": attn_sink,
+            "softmax_scale": softmax_scale,
+            "topk_idxs": topk_idxs,
+        }
+
+    @staticmethod
+    def _run_fused(inputs: dict) -> dict:
+        """Run dsa_sparse_attn (fused kernel) with grad."""
+        query = inputs["query"].clone().detach().requires_grad_(True)
+        kv = inputs["kv"].clone().detach().requires_grad_(True)
+        attn_sink = inputs["attn_sink"].clone().detach().requires_grad_(True)
+
+        # topk_idxs is (total_sq, topk) → unsqueeze to (total_sq, 1, topk)
+        topk_idxs = inputs["topk_idxs"].unsqueeze(1)
+
+        out, lse, _ = _triton_dsa_sparse_attn_raw(
+            query, kv, topk_idxs, inputs["softmax_scale"],
+            d_v=query.shape[-1], attn_sink=attn_sink,
+        )
+        out.float().sum().backward()
+
+        return {
+            "output": out,
+            "grad_query": query.grad,
+            "grad_kv": kv.grad,
+            "grad_attn_sink": attn_sink.grad,
+        }
+
+    @staticmethod
+    def _run_unfused(inputs: dict) -> dict:
+        """Run unfused_compressed_sparse_attn (reference) with grad."""
+        total_sq, np_, d = inputs["query"].shape
+        total_skv = inputs["kv"].shape[0]
+
+        # unfused expects: query (sq, b, np, d), kv_full (n_kv, b, d), indices (b, sq, topk)
+        # Our inputs have b=1 implicit, so unsqueeze the batch dim.
+        query = inputs["query"].unsqueeze(1).clone().detach().requires_grad_(True)  # (sq, 1, np, d)
+        kv = inputs["kv"].unsqueeze(1).clone().detach().requires_grad_(True)  # (skv, 1, d)
+        attn_sink = inputs["attn_sink"].clone().detach().requires_grad_(True)
+
+        # topk_idxs: (total_sq, topk) → (b=1, sq, topk)
+        topk_idxs = inputs["topk_idxs"].unsqueeze(0)
+
+        out = unfused_compressed_sparse_attn(
+            query, kv, attn_sink, topk_idxs, inputs["softmax_scale"],
+        )
+        out.float().sum().backward()
+
+        return {
+            "output": out,
+            "grad_query": query.grad.squeeze(1),  # (sq, np, d)
+            "grad_kv": kv.grad.squeeze(1),  # (skv, d)
+            "grad_attn_sink": attn_sink.grad,
+        }
+
+    @pytest.mark.parametrize(
+        "total_sq,total_skv,np_,d,topk",
+        [
+            # BMM backward path: TopK <= 512
+            (2048, 2048, 32, 128, 128),
+            (2048, 2048, 32, 128, 256),
+            (4096, 4096, 32, 128, 256),
+            (2048, 2048, 64, 128, 128),
+            # Triton backward path: TopK > 512
+            (2048, 2048, 32, 128, 640),
+            (2048, 4096, 32, 128, 768),
+        ],
+        ids=[
+            "bmm_bwd_topk128",
+            "bmm_bwd_topk256",
+            "bmm_bwd_topk256_sq4k",
+            "bmm_bwd_topk128_np64",
+            "triton_bwd_topk640",
+            "triton_bwd_topk768",
+        ],
+    )
+    def test_grad_query_accuracy(self, total_sq, total_skv, np_, d, topk, device, dsa_metrics):
+        """Gradient w.r.t. query matches unfused reference for both bwd paths."""
+        inputs = self._make_inputs(total_sq, total_skv, np_, d, topk, device)
+
+        fused_res = self._run_fused(inputs)
+        unfused_res = self._run_unfused(inputs)
+
+        g_fused = fused_res["grad_query"].float()
+        g_unfused = unfused_res["grad_query"].float()
+
+        # Check no NaN/Inf
+        assert not torch.isnan(g_fused).any(), "grad_query has NaN"
+        assert not torch.isinf(g_fused).any(), "grad_query has Inf"
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            g_fused.reshape(-1).unsqueeze(0),
+            g_unfused.reshape(-1).unsqueeze(0),
+        ).item()
+
+        logger.info(
+            f"[sq={total_sq}, skv={total_skv}, np={np_}, topk={topk}] "
+            f"grad_query cos_sim={cos_sim:.6f}"
+        )
+        assert cos_sim > 0.95, f"grad_query cosine similarity too low: {cos_sim:.6f}"
+
+        dsa_metrics.record_accuracy(
+            params={"sq": total_sq, "skv": total_skv, "np": np_, "topk": topk},
+            cos_sim=cos_sim, target="kernel_grad_query",
+        )
+
+    @pytest.mark.parametrize(
+        "total_sq,total_skv,np_,d,topk",
+        [
+            # BMM backward path: TopK <= 512
+            (2048, 2048, 32, 128, 128),
+            (2048, 2048, 32, 128, 256),
+            # Triton backward path: TopK > 512
+            (2048, 2048, 32, 128, 640),
+        ],
+        ids=[
+            "bmm_bwd_topk128",
+            "bmm_bwd_topk256",
+            "triton_bwd_topk640",
+        ],
+    )
+    def test_grad_kv_accuracy(self, total_sq, total_skv, np_, d, topk, device, dsa_metrics):
+        """Gradient w.r.t. kv matches unfused reference for both bwd paths."""
+        inputs = self._make_inputs(total_sq, total_skv, np_, d, topk, device)
+
+        fused_res = self._run_fused(inputs)
+        unfused_res = self._run_unfused(inputs)
+
+        g_fused = fused_res["grad_kv"].float()
+        g_unfused = unfused_res["grad_kv"].float()
+
+        # Check no NaN/Inf
+        assert not torch.isnan(g_fused).any(), "grad_kv has NaN"
+        assert not torch.isinf(g_fused).any(), "grad_kv has Inf"
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            g_fused.reshape(-1).unsqueeze(0),
+            g_unfused.reshape(-1).unsqueeze(0),
+        ).item()
+
+        logger.info(
+            f"[sq={total_sq}, skv={total_skv}, np={np_}, topk={topk}] "
+            f"grad_kv cos_sim={cos_sim:.6f}"
+        )
+        assert cos_sim > 0.95, f"grad_kv cosine similarity too low: {cos_sim:.6f}"
+
+        dsa_metrics.record_accuracy(
+            params={"sq": total_sq, "skv": total_skv, "np": np_, "topk": topk},
+            cos_sim=cos_sim, target="kernel_grad_kv",
+        )
+
