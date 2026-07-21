@@ -719,13 +719,13 @@ class TestKLLossAccuracy:
             q_idx_bshd, k_idx_bsd, w_bsh_scaled, effective_topk, ratio
         )
 
-        print(f"\n[DEBUG] ===== STEP-BY-STEP DIAGNOSIS =====")
-        print(f"[DEBUG] shapes: sq={sq}, b={b}, np={np_}, hn={hn}, n_comp={n_comp}, "
+        logger.debug(f"===== STEP-BY-STEP DIAGNOSIS =====")
+        logger.debug(f"shapes: sq={sq}, b={b}, np={np_}, hn={hn}, n_comp={n_comp}, "
               f"effective_topk={effective_topk}, kv_offset={kv_offset}, ratio={ratio}")
-        print(f"[DEBUG] topk_indices_cmp: shape={topk_indices_cmp.shape}, "
+        logger.debug(f"topk_indices_cmp: shape={topk_indices_cmp.shape}, "
               f"min={topk_indices_cmp.min().item()}, max={topk_indices_cmp.max().item()}")
         n_invalid = (topk_indices_cmp < 0).sum().item()
-        print(f"[DEBUG] invalid indices (< 0): {n_invalid} / {topk_indices_cmp.numel()}")
+        logger.debug(f"invalid indices (< 0): {n_invalid} / {topk_indices_cmp.numel()}")
 
         # ----- STEP A: Compare fused vs reference indexer scores -----
         causal_mask = compute_ratio_causal_mask(
@@ -737,14 +737,14 @@ class TestKLLossAccuracy:
         ref_index_scores = _compute_index_scores(
             inputs["q_indexer"], w_idx_ref, inputs["k_indexer"]
         )  # (b, sq, n_comp)
-        print(f"[DEBUG] ref_index_scores: shape={ref_index_scores.shape}, "
+        logger.debug(f"ref_index_scores: shape={ref_index_scores.shape}, "
               f"min={ref_index_scores.min().item():.6e}, max={ref_index_scores.max().item():.6e}")
-        print(f"[DEBUG] full_scores_fused: shape={full_scores_fused.shape}, "
+        logger.debug(f"full_scores_fused: shape={full_scores_fused.shape}, "
               f"min={full_scores_fused.min().item():.6e}, max={full_scores_fused.max().item():.6e}")
 
         # Compare the two score computations
         score_diff = (full_scores_fused - ref_index_scores).abs()
-        print(f"[DEBUG] indexer score diff (fused vs ref): "
+        logger.debug(f"indexer score diff (fused vs ref): "
               f"max={score_diff.max().item():.6e}, mean={score_diff.mean().item():.6e}")
 
         # ----- STEP B: Predict distribution comparison -----
@@ -790,11 +790,11 @@ class TestKLLossAccuracy:
         predict_ref_at_topk[~valid_topk_mask] = 0.0
 
         predict_diff = (predict_fused - predict_ref_at_topk).abs()
-        print(f"[DEBUG] PREDICT fused: sum_per_row_mean={predict_fused.sum(-1).mean().item():.6f}, "
+        logger.debug(f"PREDICT fused: sum_per_row_mean={predict_fused.sum(-1).mean().item():.6f}, "
               f"max={predict_fused.max().item():.6e}")
-        print(f"[DEBUG] PREDICT ref_at_topk: sum_per_row_mean={predict_ref_at_topk.sum(-1).mean().item():.6f}, "
+        logger.debug(f"PREDICT ref_at_topk: sum_per_row_mean={predict_ref_at_topk.sum(-1).mean().item():.6f}, "
               f"max={predict_ref_at_topk.max().item():.6e}")
-        print(f"[DEBUG] PREDICT diff: max={predict_diff.max().item():.6e}, "
+        logger.debug(f"PREDICT diff: max={predict_diff.max().item():.6e}, "
               f"mean={predict_diff.mean().item():.6e}")
 
         # ----- STEP C: Target distribution comparison -----
@@ -869,11 +869,11 @@ class TestKLLossAccuracy:
         target_ref_at_topk[~valid_topk_mask] = 0.0
 
         target_diff = (target_fused - target_ref_at_topk).abs()
-        print(f"[DEBUG] TARGET fused: sum_per_row_mean={target_fused.sum(-1).mean().item():.6f}, "
+        logger.debug(f"TARGET fused: sum_per_row_mean={target_fused.sum(-1).mean().item():.6f}, "
               f"max={target_fused.max().item():.6e}")
-        print(f"[DEBUG] TARGET ref_at_topk: sum_per_row_mean={target_ref_at_topk.sum(-1).mean().item():.6f}, "
+        logger.debug(f"TARGET ref_at_topk: sum_per_row_mean={target_ref_at_topk.sum(-1).mean().item():.6f}, "
               f"max={target_ref_at_topk.max().item():.6e}")
-        print(f"[DEBUG] TARGET diff: max={target_diff.max().item():.6e}, "
+        logger.debug(f"TARGET diff: max={target_diff.max().item():.6e}, "
               f"mean={target_diff.mean().item():.6e}, "
               f"rel_max={target_diff.max().item() / max(target_ref_at_topk.abs().max().item(), 1e-10):.4e}")
 
@@ -897,19 +897,19 @@ class TestKLLossAccuracy:
         lse_direct_f32 = torch.logsumexp(scores_at_topk_masked, dim=-1)  # (b, sq, np)
         # Compare with lse_indexer from triton forward
         lse_diff = (lse_indexer_bsh - lse_direct_f32).abs()
-        print(f"[DEBUG] LSE comparison (triton_fwd vs direct_f32):")
-        print(f"[DEBUG]   lse_indexer: mean={lse_indexer_bsh.mean().item():.4f}, "
+        logger.debug(f"LSE comparison (triton_fwd vs direct_f32):")
+        logger.debug(f"  lse_indexer: mean={lse_indexer_bsh.mean().item():.4f}, "
               f"min={lse_indexer_bsh.min().item():.4f}, max={lse_indexer_bsh.max().item():.4f}")
-        print(f"[DEBUG]   lse_direct:  mean={lse_direct_f32.mean().item():.4f}, "
+        logger.debug(f"  lse_direct:  mean={lse_direct_f32.mean().item():.4f}, "
               f"min={lse_direct_f32.min().item():.4f}, max={lse_direct_f32.max().item():.4f}")
-        print(f"[DEBUG]   diff: max={lse_diff.max().item():.6e}, mean={lse_diff.mean().item():.6e}")
+        logger.debug(f"  diff: max={lse_diff.max().item():.6e}, mean={lse_diff.mean().item():.6e}")
 
         # Check what softmax probs look like from each LSE
         probs_from_triton_lse = torch.exp(scores_at_topk_masked - lse_indexer_bsh.unsqueeze(-1))
         probs_from_direct_lse = torch.exp(scores_at_topk_masked - lse_direct_f32.unsqueeze(-1))
-        print(f"[DEBUG] probs_from_triton_lse: max={probs_from_triton_lse.max().item():.6e}, "
+        logger.debug(f"probs_from_triton_lse: max={probs_from_triton_lse.max().item():.6e}, "
               f"sum_per_row_mean={probs_from_triton_lse.sum(-1).mean().item():.6f}")
-        print(f"[DEBUG] probs_from_direct_lse: max={probs_from_direct_lse.max().item():.6e}, "
+        logger.debug(f"probs_from_direct_lse: max={probs_from_direct_lse.max().item():.6e}, "
               f"sum_per_row_mean={probs_from_direct_lse.sum(-1).mean().item():.6f}")
 
         # ----- STEP E: Compute KL from both paths for final comparison -----
@@ -929,34 +929,34 @@ class TestKLLossAccuracy:
         kl_ref_rows = torch.where(row_valid_fused, kl_ref_rows, torch.zeros_like(kl_ref_rows))
         manual_ref_loss = kl_ref_rows.mean() * loss_coeff
 
-        print(f"[DEBUG] ----- KL DECOMPOSITION -----")
-        print(f"[DEBUG] manual_loss (fused target+predict): {manual_loss.item():.6e}")
-        print(f"[DEBUG] manual_ref_loss (ref target+predict): {manual_ref_loss.item():.6e}")
+        logger.debug(f"----- KL DECOMPOSITION -----")
+        logger.debug(f"manual_loss (fused target+predict): {manual_loss.item():.6e}")
+        logger.debug(f"manual_ref_loss (ref target+predict): {manual_ref_loss.item():.6e}")
 
         # Cross KL: fused target with ref predict
         kl_cross1 = (t_f * (torch.log(t_f) - torch.log(p_r))).sum(dim=-1)
         kl_cross1 = torch.where(row_valid_fused, kl_cross1, torch.zeros_like(kl_cross1))
-        print(f"[DEBUG] KL(fused_target || ref_predict): {kl_cross1.mean().item() * loss_coeff:.6e}")
+        logger.debug(f"KL(fused_target || ref_predict): {kl_cross1.mean().item() * loss_coeff:.6e}")
         # Cross KL: ref target with fused predict
         kl_cross2 = (t_r * (torch.log(t_r) - torch.log(p_f))).sum(dim=-1)
         kl_cross2 = torch.where(row_valid_fused, kl_cross2, torch.zeros_like(kl_cross2))
-        print(f"[DEBUG] KL(ref_target || fused_predict): {kl_cross2.mean().item() * loss_coeff:.6e}")
+        logger.debug(f"KL(ref_target || fused_predict): {kl_cross2.mean().item() * loss_coeff:.6e}")
 
         # Show worst rows
         kl_diff_per_row = (kl_fused_rows - kl_ref_rows).abs()
         worst_flat = kl_diff_per_row.reshape(-1).topk(5)
-        print(f"[DEBUG] top-5 worst row KL diffs: {worst_flat.values.tolist()}")
+        logger.debug(f"top-5 worst row KL diffs: {worst_flat.values.tolist()}")
         for idx in worst_flat.indices[:3]:
             bi = idx.item() // sq
             si = idx.item() % sq
-            print(f"[DEBUG]   row [{bi},{si}]: "
+            logger.debug(f"  row [{bi},{si}]: "
                   f"fused_target={target_fused[bi,si,:8].tolist()}, "
                   f"ref_target={target_ref_at_topk[bi,si,:8].tolist()}")
-            print(f"[DEBUG]            "
+            logger.debug(f"           "
                   f"fused_predict={predict_fused[bi,si,:8].tolist()}, "
                   f"ref_predict={predict_ref_at_topk[bi,si,:8].tolist()}")
 
-        print(f"[DEBUG] fused loss will be printed after call below...")
+        logger.debug(f"fused loss will be printed after call below...")
         # ===== END DEBUG =====
 
         # Fused path
@@ -980,10 +980,10 @@ class TestKLLossAccuracy:
         ref_val = loss_ref.item()
         rel_err = abs(fused_val - ref_val) / max(abs(ref_val), 1e-8)
 
-        print(f"[DEBUG] === FINAL COMPARISON ===")
-        print(f"[DEBUG] loss_fused={fused_val:.6e}, loss_ref={ref_val:.6e}, manual_loss={manual_loss.item():.6e}")
-        print(f"[DEBUG] fused vs manual rel_err={abs(fused_val - manual_loss.item()) / max(abs(manual_loss.item()), 1e-8):.4e}")
-        print(f"[DEBUG] manual vs ref rel_err={abs(manual_loss.item() - ref_val) / max(abs(ref_val), 1e-8):.4e}")
+        logger.debug(f"=== FINAL COMPARISON ===")
+        logger.debug(f"loss_fused={fused_val:.6e}, loss_ref={ref_val:.6e}, manual_loss={manual_loss.item():.6e}")
+        logger.debug(f"fused vs manual rel_err={abs(fused_val - manual_loss.item()) / max(abs(manual_loss.item()), 1e-8):.4e}")
+        logger.debug(f"manual vs ref rel_err={abs(manual_loss.item() - ref_val) / max(abs(ref_val), 1e-8):.4e}")
 
         logger.info(
             f"[sq={sq}, b={b}, per_token={calculate_per_token_loss}] "
@@ -1408,6 +1408,7 @@ class TestFusedIndexerSparseAttnBackward:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.perf
 class TestFusedIndexerSparseAttnPerformance:
     """Performance benchmarks: Fused Triton path vs unfused PyTorch CSA path.
 
@@ -2342,6 +2343,214 @@ class TestCSAFusedVsUnfusedAccuracy:
 
 
 @_skip_unless_sm90
+class TestDSAIndexerLossAutoScaler:
+    """Verify DSAIndexerLossAutoScaler correctly propagates gradients in training.
+
+    DSAIndexerLossAutoScaler attaches the indexer KL loss to the attention output
+    without altering the forward value. In backward:
+    - grad w.r.t. output passes through unchanged.
+    - grad w.r.t. indexer_loss = ones_like(loss) * main_loss_backward_scale.
+
+    This test validates the complete gradient flow through the CSA module when
+    the AutoScaler is active (indexer_loss_coeff > 0, training mode).
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_class(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def device(self):
+        return torch.device("cuda:0")
+
+    def test_forward_identity(self, device):
+        """AutoScaler does not modify the forward output value."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        output = torch.randn(128, 2, 4096, dtype=torch.bfloat16, device=device)
+        loss = torch.tensor(0.05, device=device, requires_grad=True)
+        output.requires_grad_(True)
+
+        result = DSAIndexerLossAutoScaler.apply(output, loss)
+
+        assert torch.equal(result, output), "AutoScaler altered forward output"
+
+    def test_grad_output_passthrough(self, device):
+        """Gradient w.r.t. output passes through unchanged."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        output = torch.randn(64, 1, 2048, dtype=torch.float32, device=device, requires_grad=True)
+        loss = torch.tensor(0.1, device=device, requires_grad=True)
+
+        result = DSAIndexerLossAutoScaler.apply(output, loss)
+        grad_upstream = torch.randn_like(result)
+        result.backward(grad_upstream)
+
+        assert torch.equal(output.grad, grad_upstream), (
+            "AutoScaler modified grad w.r.t. output"
+        )
+
+    def test_grad_loss_scaled(self, device):
+        """Gradient w.r.t. indexer_loss equals ones * main_loss_backward_scale."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        output = torch.randn(64, 1, 2048, dtype=torch.float32, device=device, requires_grad=True)
+        loss = torch.tensor(0.1, device=device, requires_grad=True)
+
+        # Set a known scale
+        scale = torch.tensor(2.5, device=device)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale)
+
+        result = DSAIndexerLossAutoScaler.apply(output, loss)
+        grad_upstream = torch.randn_like(result)
+        result.backward(grad_upstream)
+
+        expected_loss_grad = torch.ones_like(loss) * 2.5
+        assert torch.allclose(loss.grad, expected_loss_grad), (
+            f"Loss grad mismatch: got {loss.grad.item()}, expected {expected_loss_grad.item()}"
+        )
+
+        # Reset to default for other tests
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+
+    @pytest.mark.parametrize(
+        "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
+        [
+            (2048, 1, 32, 128, 128, 256),
+        ],
+    )
+    @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
+    def test_e2e_grad_with_autoscaler(
+        self, sq, b, num_heads, v_head_dim, window_size, indexer_topk,
+        sparse_loss, device, dsa_metrics,
+    ):
+        """End-to-end: AutoScaler in CSA module allows indexer params to receive gradients.
+
+        Verifies that:
+        1. CSA output has gradients flowing back to query (attention path).
+        2. Indexer parameters receive non-zero gradients (loss path via AutoScaler).
+        3. Fused and unfused paths produce consistent gradient magnitudes.
+        """
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        with _hadamard_patches():
+            config = _make_test_mla_config(
+                num_attention_heads=num_heads,
+                v_head_dim=v_head_dim,
+                csa_window_size=window_size,
+                dsa_indexer_topk=indexer_topk,
+                dsa_indexer_loss_coeff=0.1,
+                dsa_indexer_use_sparse_loss=sparse_loss,
+            )
+
+            torch.manual_seed(42)
+            csa = _build_csa_module(config, compress_ratio=4)
+            csa.train()
+
+            # Set a known scale for deterministic gradient checking
+            DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(1.0, device=device))
+
+            inputs = _make_csa_inputs(sq, b, config, device)
+
+            # --- Fused path ---
+            csa.apply_dsa_kernel_fusion = True
+            query_fused = inputs["query"].clone().requires_grad_(True)
+            torch.manual_seed(7)
+            out_fused = csa(
+                query=query_fused,
+                key=inputs["key"].clone(),
+                value=inputs["value"].clone(),
+                attention_mask=None,
+                x=inputs["x"].clone(),
+                qr=inputs["qr"].clone(),
+            )
+            grad_out = torch.randn_like(out_fused)
+            out_fused.backward(grad_out)
+
+            # Attention path: query should receive gradient
+            assert query_fused.grad is not None, "query has no gradient (fused)"
+            assert not torch.isnan(query_fused.grad).any(), "query grad has NaN (fused)"
+            grad_query_fused_norm = query_fused.grad.float().norm().item()
+
+            # Indexer path: indexer params should receive gradient via AutoScaler
+            indexer_grads_fused = {}
+            for name, p in csa.indexer.named_parameters():
+                if p.grad is not None:
+                    indexer_grads_fused[name] = p.grad.float().norm().item()
+            assert len(indexer_grads_fused) > 0, (
+                "No indexer parameter received gradient (fused). "
+                "AutoScaler may not be propagating loss backward."
+            )
+
+            # --- Unfused path ---
+            csa.zero_grad()
+            csa.apply_dsa_kernel_fusion = False
+            query_unfused = inputs["query"].clone().requires_grad_(True)
+            with _oom_guard():
+                torch.manual_seed(7)
+                out_unfused = csa(
+                    query=query_unfused,
+                    key=inputs["key"].clone(),
+                    value=inputs["value"].clone(),
+                    attention_mask=None,
+                    x=inputs["x"].clone(),
+                    qr=inputs["qr"].clone(),
+                )
+                out_unfused.backward(grad_out)
+
+            assert query_unfused.grad is not None, "query has no gradient (unfused)"
+            grad_query_unfused_norm = query_unfused.grad.float().norm().item()
+
+            indexer_grads_unfused = {}
+            for name, p in csa.indexer.named_parameters():
+                if p.grad is not None:
+                    indexer_grads_unfused[name] = p.grad.float().norm().item()
+            assert len(indexer_grads_unfused) > 0, (
+                "No indexer parameter received gradient (unfused). "
+            )
+
+            # Gradient magnitude should be in the same ballpark
+            ratio_q = grad_query_fused_norm / max(grad_query_unfused_norm, 1e-12)
+            logger.info(
+                f"[sparse_loss={sparse_loss}] query grad norm ratio "
+                f"(fused/unfused) = {ratio_q:.4f}"
+            )
+            assert 0.5 < ratio_q < 2.0, (
+                f"Query grad norm diverged: fused={grad_query_fused_norm:.4e}, "
+                f"unfused={grad_query_unfused_norm:.4e}"
+            )
+
+            # Indexer grad norms should both be non-trivial
+            for name in indexer_grads_fused:
+                if name in indexer_grads_unfused:
+                    logger.info(
+                        f"  indexer.{name}: fused={indexer_grads_fused[name]:.4e}, "
+                        f"unfused={indexer_grads_unfused[name]:.4e}"
+                    )
+
+            dsa_metrics.record_accuracy(
+                params={"sq": sq, "np": num_heads, "topk": indexer_topk, "sparse_loss": sparse_loss},
+                cos_sim=ratio_q, target="autoscaler_grad_ratio",
+            )
+
+            # Cleanup
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+
+
+@_skip_unless_sm90
+@pytest.mark.perf
 class TestCSAFusedVsUnfusedPerformance:
     """Module-level performance: CompressedSparseAttention unfused vs fused (triton).
 
@@ -2785,6 +2994,7 @@ class TestCSANoIndexerFusedVsUnfused:
 
 
 @_skip_unless_sm90
+@pytest.mark.perf
 class TestCSANoIndexerPerformance:
     """E2E performance: CompressedSparseAttention no-indexer path.
 

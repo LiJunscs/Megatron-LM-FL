@@ -178,6 +178,25 @@ def pytest_addoption(parser):
         help="Enable DSA test report generation. Pass a path (relative to test dir) "
              "to write the markdown report. Omit to skip report generation (CI default).",
     )
+    parser.addoption(
+        "--run-perf",
+        action="store_true",
+        default=False,
+        help="Run performance benchmark tests (skipped by default).",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "perf: mark test as performance benchmark (skipped unless --run-perf)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-perf"):
+        return
+    skip_perf = pytest.mark.skip(reason="Performance test skipped. Use --run-perf to enable.")
+    for item in items:
+        if "perf" in item.keywords:
+            item.add_marker(skip_perf)
 
 
 @pytest.fixture
