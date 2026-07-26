@@ -749,6 +749,10 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 precomputed_grad_q_indexer = precomputed_grad_q_indexer.permute(1, 0, 2, 3).contiguous()
                 precomputed_grad_k_indexer = precomputed_grad_k_indexer.permute(1, 0, 2).contiguous()
                 precomputed_grad_weights = precomputed_grad_weights.permute(1, 0, 2).contiguous()
+                # Chain rule: w_scaled = w_raw * indexer_softmax_scale (done in
+                # _sbhd_to_bshd_indexer_inputs). The fused function returns
+                # ∂L/∂w_scaled; convert to ∂L/∂w_raw for the autograd Function.
+                precomputed_grad_weights = precomputed_grad_weights * indexer_softmax_scale
             else:
                 # Inference: only compute loss, no backward
                 predict_result = sparse_indexer_score_recompute(
@@ -779,7 +783,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 # Fused: loss + backward in one pass
                 indexer_loss, precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights = (
                     fused_dense_indexer_loss_and_backward(
-                        q_idx_bshd, k_idx_bsd, w_bsh,
+                        q_idx_bshd, k_idx_bsd, w_bsh_scaled,
                         topk_indices_cmp,
                         q_attn_bshd, k_attn_bsd, lse_bsh,
                         indexer_softmax_scale=indexer_softmax_scale,
@@ -794,6 +798,8 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 precomputed_grad_q_indexer = precomputed_grad_q_indexer.permute(1, 0, 2, 3).contiguous()
                 precomputed_grad_k_indexer = precomputed_grad_k_indexer.permute(1, 0, 2).contiguous()
                 precomputed_grad_weights = precomputed_grad_weights.permute(1, 0, 2).contiguous()
+                # Chain rule: same as sparse path
+                precomputed_grad_weights = precomputed_grad_weights * indexer_softmax_scale
             else:
                 # Inference: only compute loss
                 dense_idx_result = dense_indexer_score_recompute(

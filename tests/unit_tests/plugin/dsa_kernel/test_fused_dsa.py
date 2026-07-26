@@ -545,6 +545,15 @@ class TestFusedIndexerSparseAttnBackward:
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_query",
         )
 
+        # Grad norm check
+        norm_fused = g_fused.norm().item()
+        norm_unfused = g_unfused.norm().item()
+        norm_ratio = norm_fused / max(norm_unfused, 1e-12)
+        assert 0.8 < norm_ratio < 1.2, (
+            f"grad_query norm ratio out of range: fused={norm_fused:.4e}, "
+            f"unfused={norm_unfused:.4e}, ratio={norm_ratio:.4f}"
+        )
+
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
@@ -600,6 +609,15 @@ class TestFusedIndexerSparseAttnBackward:
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_kv",
         )
 
+        # Grad norm check
+        norm_fused = g_fused.norm().item()
+        norm_unfused = g_unfused.norm().item()
+        norm_ratio = norm_fused / max(norm_unfused, 1e-12)
+        assert 0.8 < norm_ratio < 1.2, (
+            f"grad_kv_full norm ratio out of range: fused={norm_fused:.4e}, "
+            f"unfused={norm_unfused:.4e}, ratio={norm_ratio:.4f}"
+        )
+
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
         [
@@ -651,6 +669,15 @@ class TestFusedIndexerSparseAttnBackward:
         dsa_metrics.record_accuracy(
             params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk},
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_attn_sink",
+        )
+
+        # Grad norm check
+        norm_fused = g_fused.norm().item()
+        norm_unfused = g_unfused.norm().item()
+        norm_ratio = norm_fused / max(norm_unfused, 1e-12)
+        assert 0.5 < norm_ratio < 2.0, (
+            f"grad_attn_sink norm ratio out of range: fused={norm_fused:.4e}, "
+            f"unfused={norm_unfused:.4e}, ratio={norm_ratio:.4f}"
         )
 
     @pytest.mark.parametrize(
@@ -738,6 +765,7 @@ class TestFusedIndexerSparseAttnPerformance:
             "13B_B1_sq4096_topk512",
             "13B_B1_sq4096_topk1024",
             "longctx_B1_sq8192_topk512",
+            
         ],
     )
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
@@ -2647,6 +2675,15 @@ class TestDSASparseAttnBackward:
         )
         assert cos_sim > 0.95, f"grad_query cosine similarity too low: {cos_sim:.6f}"
 
+        # Grad norm check
+        norm_fused = g_fused.norm().item()
+        norm_unfused = g_unfused.norm().item()
+        norm_ratio = norm_fused / max(norm_unfused, 1e-12)
+        assert 0.8 < norm_ratio < 1.2, (
+            f"kernel grad_query norm ratio out of range: fused={norm_fused:.4e}, "
+            f"unfused={norm_unfused:.4e}, ratio={norm_ratio:.4f}"
+        )
+
         dsa_metrics.record_accuracy(
             params={"sq": total_sq, "skv": total_skv, "np": np_, "topk": topk},
             cos_sim=cos_sim, target="kernel_grad_query",
@@ -2691,6 +2728,15 @@ class TestDSASparseAttnBackward:
             f"grad_kv cos_sim={cos_sim:.6f}"
         )
         assert cos_sim > 0.95, f"grad_kv cosine similarity too low: {cos_sim:.6f}"
+
+        # Grad norm check
+        norm_fused = g_fused.norm().item()
+        norm_unfused = g_unfused.norm().item()
+        norm_ratio = norm_fused / max(norm_unfused, 1e-12)
+        assert 0.8 < norm_ratio < 1.2, (
+            f"kernel grad_kv norm ratio out of range: fused={norm_fused:.4e}, "
+            f"unfused={norm_unfused:.4e}, ratio={norm_ratio:.4f}"
+        )
 
         dsa_metrics.record_accuracy(
             params={"sq": total_sq, "skv": total_skv, "np": np_, "topk": topk},
@@ -2753,6 +2799,9 @@ class TestIndexerGradAccuracy:
             "grad_q_indexer": q_indexer.grad,
             "grad_k_indexer": k_indexer.grad,
             "grad_weights": weights.grad,
+            "grad_q_norm": q_indexer.grad.norm().item() if q_indexer.grad is not None else None,
+            "grad_k_norm": k_indexer.grad.norm().item() if k_indexer.grad is not None else None,
+            "grad_w_norm": weights.grad.norm().item() if weights.grad is not None else None,
         }
 
     @staticmethod
@@ -2830,6 +2879,9 @@ class TestIndexerGradAccuracy:
             "grad_q_indexer": q_indexer.grad,
             "grad_k_indexer": k_indexer.grad,
             "grad_weights": weights_for_unfused.grad,
+            "grad_q_norm": q_indexer.grad.norm().item() if q_indexer.grad is not None else None,
+            "grad_k_norm": k_indexer.grad.norm().item() if k_indexer.grad is not None else None,
+            "grad_w_norm": weights_for_unfused.grad.norm().item() if weights_for_unfused.grad is not None else None,
         }
 
     @pytest.mark.parametrize(
@@ -2864,6 +2916,8 @@ class TestIndexerGradAccuracy:
 
         g_fused = fused_res["grad_q_indexer"].float()
         g_unfused = unfused_res["grad_q_indexer"].float()
+        q_grad_norm_fused = g_fused.norm().item()
+        q_grad_norm_unfused = g_unfused.norm().item()
 
         cos_sim = torch.nn.functional.cosine_similarity(
             g_fused.reshape(-1).unsqueeze(0),
@@ -2886,6 +2940,15 @@ class TestIndexerGradAccuracy:
         dsa_metrics.record_accuracy(
             params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_q_indexer",
+        )
+
+        grad_norm_diff = abs(q_grad_norm_fused - q_grad_norm_unfused)
+        assert grad_norm_diff < 1e-3, (
+            f"grad_q_indexer norm mismatch: fused={q_grad_norm_fused:.6f}, unfused={q_grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
+        )
+        logger.info(
+            f"[sq={sq}, b={b}, topk={indexer_topk}, sparse_loss={sparse_loss}] "
+            f"grad_q_indexer norm: fused={q_grad_norm_fused:.6f}, unfused={q_grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
         )
 
     @pytest.mark.parametrize(
@@ -2920,6 +2983,8 @@ class TestIndexerGradAccuracy:
 
         g_fused = fused_res["grad_k_indexer"].float()
         g_unfused = unfused_res["grad_k_indexer"].float()
+        k_grad_norm_fused = g_fused.norm().item()
+        k_grad_norm_unfused = g_unfused.norm().item()
 
         cos_sim = torch.nn.functional.cosine_similarity(
             g_fused.reshape(-1).unsqueeze(0),
@@ -2942,6 +3007,15 @@ class TestIndexerGradAccuracy:
         dsa_metrics.record_accuracy(
             params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_k_indexer",
+        )
+
+        grad_norm_diff = abs(k_grad_norm_fused - k_grad_norm_unfused)
+        assert grad_norm_diff < 1e-3, (
+            f"grad_k_indexer norm mismatch: fused={k_grad_norm_fused:.6f}, unfused={k_grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
+        )
+        logger.info(
+            f"[sq={sq}, b={b}, topk={indexer_topk}, sparse_loss={sparse_loss}] "
+            f"grad_k_indexer norm: fused={k_grad_norm_fused:.6f}, unfused={k_grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
         )
 
     @pytest.mark.parametrize(
@@ -2982,6 +3056,16 @@ class TestIndexerGradAccuracy:
 
         g_fused = fused_res["grad_weights"].float()
         g_unfused = unfused_res["grad_weights"].float()
+        grad_norm_fused = fused_res["grad_w_norm"]
+        grad_norm_unfused = unfused_res["grad_w_norm"]
+
+        # The fused path computes ∂L/∂w_raw (scale applied to Q@K scores),
+        # while the unfused reference computes ∂L/∂w_scaled (scale embedded in weights).
+        # Convert unfused to the same parameterization for comparison:
+        # ∂L/∂w_raw = ∂L/∂w_scaled * indexer_softmax_scale
+        scale = inputs["indexer_softmax_scale"]
+        g_unfused = g_unfused * scale
+        grad_norm_unfused = g_unfused.norm().item()
 
         cos_sim = torch.nn.functional.cosine_similarity(
             g_fused.reshape(-1).unsqueeze(0),
@@ -3004,6 +3088,17 @@ class TestIndexerGradAccuracy:
         dsa_metrics.record_accuracy(
             params={"sq": sq, "b": b, "np": np_, "topk": indexer_topk, "sparse_loss": sparse_loss},
             cos_sim=cos_sim, max_diff=max_diff, mean_diff=mean_diff, target="grad_weights",
+        )
+
+        # After accounting for parameterization, norms should be close
+        grad_norm_diff = abs(grad_norm_fused - grad_norm_unfused)
+        assert grad_norm_diff < 1e-3, (
+            f"grad_weights norm mismatch: fused={grad_norm_fused:.6f}, "
+            f"unfused(adjusted)={grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
+        )
+        logger.info(
+            f"[sq={sq}, b={b}, topk={indexer_topk}, sparse_loss={sparse_loss}] "
+            f"grad_weights norm: fused={grad_norm_fused:.6f}, unfused(adj)={grad_norm_unfused:.6f}, diff={grad_norm_diff:.4e}"
         )
 
 

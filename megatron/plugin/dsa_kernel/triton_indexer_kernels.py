@@ -59,7 +59,7 @@ def sparse_indexer_score_recompute(
     Args:
         q_indexer: ``(B, S_q, H_q, D)`` bf16.
         k_indexer: ``(B, S_k, D)`` bf16.
-        weights:   ``(B, S_q, H_q)`` bf16.
+        weights:   ``(B, S_q, H_q)`` bf16 — scaled weights (w_raw * indexer_softmax_scale).
         topk_indices: ``(B, S_q, topk)`` int32.
         qhead_per_kv_head: number of Q heads per KV head (MQA ratio).
 
@@ -78,8 +78,8 @@ def sparse_indexer_score_recompute(
     batch_idx = torch.arange(B, device=k_indexer.device)[:, None, None]  # (B, 1, 1)
     k_gathered = k_indexer.float()[batch_idx, idx_expanded]  # (B, S_q, topk, D)
 
-    # Compute scores: (B, S_q, H_q, topk) = Q @ K^T
-    scores = torch.einsum("bqhd,bqtd->bqht", q, k_gathered)  # (B, S_q, H_q, topk)
+    # Compute scores: (B, S_q, H_q, topk) = Q @ K^T (no scale — embedded in weights)
+    scores = torch.einsum("bqhd,bqtd->bqht", q, k_gathered)
 
     # ReLU activation
     scores = torch.relu(scores)
@@ -598,7 +598,7 @@ def fused_sparse_indexer_loss_and_backward(
     Args:
         q_idx_bshd: ``(B, S_q, H_q, D_idx)`` bf16 — indexer queries.
         k_idx_bsd: ``(B, S_k, D_idx)`` bf16 — indexer keys.
-        w_bsh: ``(B, S_q, H_q)`` bf16 — raw (unscaled) weights.
+        w_bsh: ``(B, S_q, H_q)`` bf16 — scaled weights (w_raw * indexer_softmax_scale).
         topk_indices_cmp: ``(B, S_q, topk)`` int32 — indices into [0, n_comp).
         q_attn_bshd: ``(B, S_q, np, D_attn)`` bf16 — attention queries.
         k_attn_bsd: ``(B, S_kv, D_attn)`` bf16 — attention keys (full KV buffer).
@@ -677,7 +677,7 @@ def fused_sparse_indexer_loss_and_backward(
     # Grad through ReLU
     grad_pre_relu = grad_relu_scores * relu_mask.float()
 
-    # Grad through Q @ K^T
+    # Grad through Q @ K^T (no scale on scores, matching unfused)
     grad_q = torch.einsum("bqht,bqtd->bqhd", grad_pre_relu, k_idx_gathered)
     grad_k_gathered = torch.einsum("bqht,bqhd->bqtd", grad_pre_relu, q_idx)
 
@@ -709,7 +709,7 @@ def fused_dense_indexer_loss_and_backward(
     q_attn_bshd: Tensor,
     k_attn_bsd: Tensor,
     lse_bsh: Tensor,  # noqa: ARG001 — kept for API compat; dense uses self-contained softmax
-    indexer_softmax_scale: float,
+    indexer_softmax_scale: float,  # noqa: ARG001 — scale is embedded in w_bsh; kept for API compat
     softmax_scale: float,
     loss_coeff: float,
     ratio: int = 1,
@@ -775,7 +775,7 @@ def fused_dense_indexer_loss_and_backward(
         row_valid_block = row_valid[:, q_start:q_end]  # (B, block)
 
         # --- Indexer scores (predict) ---
-        per_head_scores = torch.einsum("bqhd,bkd->bqhk", q_idx_block, k_idx) * indexer_softmax_scale
+        per_head_scores = torch.einsum("bqhd,bkd->bqhk", q_idx_block, k_idx)
         relu_mask = per_head_scores > 0
         per_head_scores_relu = torch.relu(per_head_scores)  # (B, block, H_q, S_k)
         combined = (per_head_scores_relu * w_block.unsqueeze(-1)).sum(dim=2)  # (B, block, S_k)
@@ -836,10 +836,9 @@ def fused_dense_indexer_loss_and_backward(
         # Grad through ReLU
         grad_pre_relu = grad_relu * relu_mask.float()
 
-        # Grad through matmul: score = Q@K * scale, so d/dQ = grad * K * scale
-        grad_pre_relu_scaled = grad_pre_relu * indexer_softmax_scale
-        grad_q[:, q_start:q_end] = torch.einsum("bqhk,bkd->bqhd", grad_pre_relu_scaled, k_idx)
-        grad_k += torch.einsum("bqhk,bqhd->bkd", grad_pre_relu_scaled, q_idx_block)
+        # Grad through matmul: score = Q@K (no scale — embedded in weights)
+        grad_q[:, q_start:q_end] = torch.einsum("bqhk,bkd->bqhd", grad_pre_relu, k_idx)
+        grad_k += torch.einsum("bqhk,bqhd->bkd", grad_pre_relu, q_idx_block)
 
     # Final loss
     loss = kl_acc.sum() if calculate_per_token_loss else kl_acc.mean()
