@@ -260,10 +260,14 @@ class _DSASparseAttnFunc(torch.autograd.Function):
             "hp_wgmma" if ctx.used_hp_fwd else "triton_2d",
         )
 
+        # Downstream fused inverse-RoPE mutates the returned output in-place.
+        # Backward needs the original attention result for Di = sum(dO * O),
+        # so retain an independent copy inside the DSA kernel boundary.
+        out_for_backward = out.clone()
         if attn_sink is not None:
-            ctx.save_for_backward(query, kv, topk_idxs, out, lse, attn_sink)
+            ctx.save_for_backward(query, kv, topk_idxs, out_for_backward, lse, attn_sink)
         else:
-            ctx.save_for_backward(query, kv, topk_idxs, out, lse)
+            ctx.save_for_backward(query, kv, topk_idxs, out_for_backward, lse)
         ctx.softmax_scale = softmax_scale
         ctx.d_v = d_v
         return out, lse
@@ -526,6 +530,7 @@ def indexer_topk(
 
 
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
+_SPARSE_KL_EPS = 1e-10
 
 
 def _kl_loss_from_target_predict(
@@ -536,10 +541,14 @@ def _kl_loss_from_target_predict(
     calculate_per_token_loss: bool = False,
 ) -> Tensor:
     """KL(target || predict) reduced and scaled by loss_coeff."""
-    eps = _CLIP_PROB_MIN
-    t = target.clamp(min=eps)
-    p = predict.clamp(min=eps)
-    kl_per_row = (t * (torch.log(t) - torch.log(p))).sum(dim=-1)  # (B, S_q)
+    # Keep inference/no-grad loss reporting identical to compute_dsa_indexer_loss.
+    kl_per_row = (
+        target
+        * (
+            torch.log(target + _SPARSE_KL_EPS)
+            - torch.log(predict + _SPARSE_KL_EPS)
+        )
+    ).sum(dim=-1)
 
     row_valid = (topk_indices >= 0).any(dim=-1)  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
@@ -688,7 +697,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             indexer_topk=_indexer_topk_for_lse,
         )
         prof.stop()
-
         # 6. Compute indexer loss
         # P3 optimization: skip step 6+7 entirely when loss_coeff == 0
         if loss_coeff == 0:
@@ -699,7 +707,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
             # Save for backward
             ctx.save_for_backward(
-                q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse,
+                q_flat, kv_flat, attn_sink, global_idxs, out_flat.clone(), lse,
                 precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights,
             )
             ctx.softmax_scale = softmax_scale
@@ -826,7 +834,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # Save for backward
         prof.stop()
         ctx.save_for_backward(
-            q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse,
+            q_flat, kv_flat, attn_sink, global_idxs, out_flat.clone(), lse,
             precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
@@ -839,7 +847,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # Return
         d_v = out_flat.shape[-1]
         output = out_flat.reshape(sq, b, np_, d_v).reshape(sq, b, np_ * d_v)
-
         prof.report(f"  [sq={sq}, b={b}, np={np_}, topk={total_topk}] ")
         return output, indexer_loss
 

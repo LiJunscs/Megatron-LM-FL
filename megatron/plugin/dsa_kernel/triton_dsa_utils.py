@@ -65,10 +65,11 @@ def compute_ratio_causal_mask(
 ) -> torch.Tensor:
     """Generate a ratio-based causal mask.
 
-    In DSA, compressed KV positions use a coarser causal constraint:
-    query at position q can attend to compressed position k if
-    ``k < ceil(q / ratio)`` (i.e., the compressed token was produced from
-    original tokens all earlier than q).
+    In DSA, compressed KV positions use a coarser causal constraint.  A
+    compressed token becomes visible only after its full ``ratio``-token
+    source group exists.  For zero-based query position ``q`` and compressed
+    position ``k``, the CSA reference contract is
+    ``k < floor((q + 1) / ratio)``.
 
     Args:
         S_q: number of query positions.
@@ -82,9 +83,11 @@ def compute_ratio_causal_mask(
     """
     q_idx = torch.arange(S_q, device=device, dtype=torch.int64)
     k_idx = torch.arange(S_k, device=device, dtype=torch.int64)
-    # query q can attend to compressed position k if k < ceil((q+1) / ratio)
-    # equivalently: k * ratio < q + 1, i.e., k * ratio <= q
-    valid = k_idx.unsqueeze(0) * ratio <= q_idx.unsqueeze(1)  # (S_q, S_k)
+    # Match CSA._forward_unfused exactly:
+    #   valid_count(q) = floor((q + 1) / ratio)
+    #   valid(q, k)    = k < valid_count(q)
+    valid_count = (q_idx + 1) // ratio
+    valid = k_idx.unsqueeze(0) < valid_count.unsqueeze(1)  # (S_q, S_k)
     mask = torch.where(valid, torch.zeros(1, device=device, dtype=dtype),
                        torch.full((1,), float("-inf"), device=device, dtype=dtype))
     return mask
@@ -180,9 +183,11 @@ def _compute_ratio_mask_triton(
 ):
     """Compute ratio-based causal mask in Triton.
 
-    Returns True (valid) if k_pos * ratio <= q_pos.
+    Returns True when the full source group for compressed position ``k_pos``
+    is available at query ``q_pos``.  This matches
+    ``k_pos < floor((q_pos + 1) / ratio)`` from the unfused CSA path.
     """
-    return k_pos * ratio <= q_pos
+    return (k_pos + 1) * ratio <= q_pos + 1
 
 
 @triton.jit

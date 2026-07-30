@@ -39,6 +39,18 @@ from megatron.plugin.dsa_kernel.triton_dsa_utils import (
 # 64 is a good default; lower to 32 if D >= 512 and GPU memory is very tight.
 _DENSE_BLOCK_Q = 512
 
+# Match compute_dsa_indexer_loss exactly.  This is intentionally much larger
+# than float32.tiny: the reference objective uses additive smoothing in both
+# logarithms, which also changes the gradient when predict is very small.
+_SPARSE_KL_EPS = 1e-10
+
+
+def _sparse_kl_grad_logits(predict: Tensor, target: Tensor) -> Tensor:
+    """Differentiate ``-sum(target * log(predict + eps))`` through softmax."""
+    scaled_target = target / (predict + _SPARSE_KL_EPS)
+    correction = (scaled_target * predict).sum(dim=-1, keepdim=True)
+    return predict * (correction - scaled_target)
+
 
 # ---------------------------------------------------------------------------
 # Sparse indexer score: compute ``predict`` distribution
@@ -429,9 +441,9 @@ def sparse_indexer_backward(
     per_head_scores = torch.relu(per_head_scores)  # (B, S_q, H_q, topk)
     combined = (per_head_scores * w.unsqueeze(-1)).sum(dim=2)  # (B, S_q, topk)
 
-    # Grad through KL + softmax: d_loss/d_combined
+    # Grad through the same epsilon-smoothed KL used by the reference path.
     invalid_mask = topk_indices == -1
-    grad_combined = (predict - target) * grad_loss  # (B, S_q, topk)
+    grad_combined = _sparse_kl_grad_logits(predict, target) * grad_loss
     grad_combined = grad_combined.masked_fill(invalid_mask, 0.0)
 
     # Grad through head-sum + weight multiply
@@ -616,8 +628,6 @@ def fused_sparse_indexer_loss_and_backward(
 
     B, S_q, H_q, D_idx = q_idx_bshd.shape
     topk = topk_indices_cmp.shape[-1]
-    eps = torch.finfo(torch.float32).tiny
-
     # --- Gather indexer keys (0-based into k_idx_bsd of shape (B, n_comp, D_idx)) ---
     idx_expanded = topk_indices_cmp.long().clamp(min=0)  # (B, S_q, topk)
     batch_idx = torch.arange(B, device=k_idx_bsd.device)[:, None, None]  # (B, 1, 1)
@@ -649,17 +659,21 @@ def fused_sparse_indexer_loss_and_backward(
     target = head_sum / denom  # (B, S_q, topk)
 
     # --- KL loss ---
-    t = target.clamp(min=eps)
-    p = predict.clamp(min=eps)
-    kl_per_row = (t * (torch.log(t) - torch.log(p))).sum(dim=-1)  # (B, S_q)
+    kl_per_row = (
+        target
+        * (
+            torch.log(target + _SPARSE_KL_EPS)
+            - torch.log(predict + _SPARSE_KL_EPS)
+        )
+    ).sum(dim=-1)
     row_valid = (~invalid_mask).any(dim=-1)  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     indexer_loss = loss_coeff * loss
 
     # --- Indexer backward ---
-    # grad through KL + softmax: (predict - target) is d(KL)/d(logits)
-    grad_combined = (predict - target)  # (B, S_q, topk)
+    # Differentiate the epsilon-smoothed sparse KL through predict=softmax(logits).
+    grad_combined = _sparse_kl_grad_logits(predict, target)
     grad_combined = grad_combined.masked_fill(invalid_mask, 0.0)
 
     # Apply loss_coeff and mean normalization to match unfused bwd_fused_indexer_loss_naive

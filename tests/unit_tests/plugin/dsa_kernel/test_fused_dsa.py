@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+    build_flat_topk_idxs,
+    dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,
     fused_indexer_sparse_attn,
     _sbhd_to_bshd_indexer_inputs,
     _indexer_topk_bshd,
@@ -70,9 +72,15 @@ from megatron.plugin.dsa_kernel.triton_indexer_kernels import (
     sparse_attn_score_recompute,
     dense_indexer_score_recompute,
     dense_attn_score_recompute,
+    fused_sparse_indexer_loss_and_backward,
+)
+from megatron.plugin.dsa_kernel.triton_dsa_utils import (
+    compute_ratio_causal_mask,
+    topk_with_causal_mask,
 )
 from megatron.core.transformer.experimental_attention_variant.csa import (
     unfused_compressed_sparse_attn,
+    get_compress_topk_idxs,
     get_window_topk_idxs,
 )
 
@@ -487,6 +495,48 @@ class TestFusedIndexerSparseAttnBackward:
             "grad_kv_full": kv_full.grad,
             "grad_attn_sink": attn_sink.grad,
         }
+
+    @pytest.mark.parametrize("sparse_loss", [True, False])
+    def test_backward_preserves_output_saved_for_di(self, device, sparse_loss):
+        """Indexer-fused backward must tolerate downstream output mutation."""
+        inputs = _make_fused_inputs(
+            128, 1, 16, 64, 32, 16, 4, 64, 16, 4, 128, device
+        )
+        grad_output = torch.randn(
+            128, 1, 16 * 64, device=device, dtype=torch.bfloat16
+        )
+
+        def run(mutate_output: bool):
+            query = inputs["query"].clone().detach().requires_grad_(True)
+            kv = inputs["kv_full"].clone().detach().requires_grad_(True)
+            sink = inputs["attn_sink"].clone().detach().requires_grad_(True)
+            out, _ = fused_indexer_sparse_attn(
+                query,
+                kv,
+                sink,
+                inputs["window_idxs"],
+                inputs["q_indexer"],
+                inputs["k_indexer"],
+                inputs["weights"],
+                inputs["indexer_topk"],
+                inputs["ratio"],
+                inputs["softmax_scale"],
+                inputs["indexer_softmax_scale"],
+                0.0,
+                sparse_loss,
+                inputs["kv_offset"],
+                False,
+            )
+            if mutate_output:
+                out.data.copy_(torch.randn_like(out))
+            out.backward(grad_output)
+            return query.grad, kv.grad, sink.grad
+
+        reference = run(mutate_output=False)
+        mutated = run(mutate_output=True)
+        torch.testing.assert_close(mutated[0], reference[0], rtol=0, atol=0)
+        torch.testing.assert_close(mutated[1], reference[1], rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(mutated[2], reference[2], rtol=0, atol=0)
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
@@ -2629,6 +2679,39 @@ class TestDSASparseAttnBackward:
             "grad_attn_sink": attn_sink.grad,
         }
 
+    def test_backward_preserves_output_saved_for_di(self, device):
+        """Downstream in-place output mutation must not corrupt backward Di."""
+        inputs = self._make_inputs(64, 96, 16, 64, 32, device)
+        grad_output = torch.randn(
+            64, 16, 64, device=device, dtype=torch.bfloat16
+        )
+
+        def run(mutate_output: bool):
+            query = inputs["query"].clone().detach().requires_grad_(True)
+            kv = inputs["kv"].clone().detach().requires_grad_(True)
+            sink = inputs["attn_sink"].clone().detach().requires_grad_(True)
+            out, _, _ = _triton_dsa_sparse_attn_raw(
+                query,
+                kv,
+                inputs["topk_idxs"].unsqueeze(1),
+                inputs["softmax_scale"],
+                d_v=query.shape[-1],
+                attn_sink=sink,
+            )
+            if mutate_output:
+                # Models the downstream fused inverse-RoPE kernel, which writes
+                # through the output pointer without updating PyTorch's version
+                # counter.
+                out.data.copy_(torch.randn_like(out))
+            out.backward(grad_output)
+            return query.grad, kv.grad, sink.grad
+
+        reference = run(mutate_output=False)
+        mutated = run(mutate_output=True)
+        torch.testing.assert_close(mutated[0], reference[0], rtol=0, atol=0)
+        torch.testing.assert_close(mutated[1], reference[1], rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(mutated[2], reference[2], rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         "total_sq,total_skv,np_,d,topk",
         [
@@ -2744,9 +2827,385 @@ class TestDSASparseAttnBackward:
         )
 
 
+class TestRatio128NoIndexerParity:
+    """Exercise the deterministic ratio=128 path used by alternating CSA layers."""
+
+    def test_ratio128_compressed_mask_boundaries(self):
+        device = torch.device("cuda")
+        ratio, sq, b, offset = 128, 2048, 2, 2048
+        indices = get_compress_topk_idxs(ratio, b, sq, offset, device)
+
+        assert indices.shape == (b, sq, sq // ratio)
+        for q in (0, 126, 127, 128, 254, 255, 256, sq - 1):
+            expected_count = (q + 1) // ratio
+            row = indices[0, q]
+            valid = row[row >= 0]
+
+            assert valid.numel() == expected_count, (
+                f"q={q}: expected {expected_count} completed compressed blocks, "
+                f"got {valid.numel()}"
+            )
+            torch.testing.assert_close(
+                valid,
+                torch.arange(
+                    offset,
+                    offset + expected_count,
+                    device=device,
+                    dtype=valid.dtype,
+                ),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_ratio128_fused_unfused_forward_backward(self):
+        torch.manual_seed(20260730)
+        device = torch.device("cuda")
+
+        # A pretraining-shaped causal layout with deterministic compressed KV:
+        # 2048 original tokens, 16 completed ratio=128 blocks and a 128-token
+        # local window. Batch 1 keeps the materialized unfused reference
+        # comfortably below H100 memory limits.
+        sq, b, num_heads, d = 2048, 1, 32, 128
+        ratio, window_size = 128, 128
+        n_compressed = sq // ratio
+        offset = sq
+        scale = d**-0.5
+
+        query_base = torch.randn(
+            sq, b, num_heads, d, device=device, dtype=torch.bfloat16,
+        )
+        kv_base = torch.randn(
+            sq + n_compressed, b, d, device=device, dtype=torch.bfloat16,
+        )
+        sink_base = torch.randn(
+            num_heads, device=device, dtype=torch.float32,
+        ) * 0.1
+
+        window = get_window_topk_idxs(window_size, b, sq, device)
+        compressed = get_compress_topk_idxs(ratio, b, sq, offset, device)
+        combined = torch.cat((window, compressed), dim=-1).int()
+        flat_indices, _ = build_flat_topk_idxs(
+            window,
+            compressed,
+            batch_size=b,
+            seqlen_kv=sq + n_compressed,
+        )
+
+        query_u = query_base.clone().requires_grad_(True)
+        kv_u = kv_base.clone().requires_grad_(True)
+        sink_u = sink_base.clone().requires_grad_(True)
+        output_u = unfused_compressed_sparse_attn(
+            query_u,
+            kv_u,
+            sink_u,
+            combined,
+            scale,
+        )
+
+        query_f = query_base.clone().requires_grad_(True)
+        kv_f = kv_base.clone().requires_grad_(True)
+        sink_f = sink_base.clone().requires_grad_(True)
+        output_f = _triton_dsa_sparse_attn_sbhd(
+            query_f,
+            kv_f,
+            sink_f,
+            flat_indices,
+            scale,
+        )
+
+        grad_output = torch.randn_like(output_u)
+        output_u.backward(grad_output)
+        output_f.backward(grad_output)
+
+        def metrics(actual, reference):
+            actual = actual.float().reshape(-1)
+            reference = reference.float().reshape(-1)
+            relative_l2 = (
+                torch.linalg.vector_norm(actual - reference)
+                / torch.linalg.vector_norm(reference).clamp_min(1e-30)
+            ).item()
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.unsqueeze(0),
+                reference.unsqueeze(0),
+            ).item()
+            norm_ratio = (
+                torch.linalg.vector_norm(actual)
+                / torch.linalg.vector_norm(reference).clamp_min(1e-30)
+            ).item()
+            return relative_l2, cosine, norm_ratio
+
+        output_metrics = metrics(output_f, output_u)
+        dq_metrics = metrics(query_f.grad, query_u.grad)
+        dkv_metrics = metrics(kv_f.grad, kv_u.grad)
+
+        logger.info(
+            "ratio128 parity: output(rel=%.6e cos=%.8f ratio=%.6f), "
+            "dQ(rel=%.6e cos=%.8f ratio=%.6f), "
+            "dKV(rel=%.6e cos=%.8f ratio=%.6f)",
+            *output_metrics,
+            *dq_metrics,
+            *dkv_metrics,
+        )
+
+        assert output_metrics[0] < 5e-3
+        assert output_metrics[1] > 0.999
+        assert dq_metrics[1] > 0.99
+        assert 0.95 < dq_metrics[2] < 1.05
+        assert dkv_metrics[1] > 0.99
+        assert 0.95 < dkv_metrics[2] < 1.05
+
+
 # ---------------------------------------------------------------------------
 # Indexer gradient accuracy: fused (triton plugin) vs unfused (Megatron core)
 # ---------------------------------------------------------------------------
+
+
+class TestRatioCausalMaskParity:
+    """Match the fused compressed-KV causal contract to the CSA reference."""
+
+    @staticmethod
+    def _unfused_reference_mask(
+        sq: int, sk: int, ratio: int, device: torch.device
+    ) -> Tensor:
+        # Keep this expression structurally identical to CSA._forward_unfused:
+        # compressed index k is valid iff k < (one_based_query_position // ratio).
+        compressed_indices = torch.arange(sk, device=device).unsqueeze(0).expand(sq, -1)
+        positions = torch.arange(1, sq + 1, device=device).unsqueeze(1)
+        return torch.where(
+            compressed_indices >= positions // ratio,
+            float("-inf"),
+            0.0,
+        )
+
+    @pytest.mark.parametrize(
+        "sq,sk,ratio",
+        [
+            (2048, 512, 4),
+            (4096, 1024, 4),
+        ],
+        ids=["pretrain_seq2k_ratio4", "pretrain_seq4k_ratio4"],
+    )
+    def test_compute_ratio_causal_mask_matches_unfused(self, sq, sk, ratio):
+        device = torch.device("cuda:0")
+        actual = compute_ratio_causal_mask(sq, sk, ratio, device)
+        expected = self._unfused_reference_mask(sq, sk, ratio, device)
+
+        assert torch.equal(actual, expected), (
+            f"ratio causal mask mismatch for sq={sq}, sk={sk}, ratio={ratio}; "
+            "fused must use the same floor-based compressed-token availability "
+            "as CSA._forward_unfused"
+        )
+
+    def test_pretrain_ratio4_valid_counts_at_compression_boundaries(self):
+        """Validate representative boundaries in a 4K pretraining sequence."""
+        device = torch.device("cuda:0")
+        sq, sk, ratio = 4096, 1024, 4
+        mask = compute_ratio_causal_mask(sq, sk, ratio, device)
+        actual_counts = torch.isfinite(mask).sum(dim=-1)
+        positions = torch.arange(1, sq + 1, device=device)
+        expected_counts = (positions // ratio).clamp(max=sk).to(actual_counts.dtype)
+
+        assert torch.equal(actual_counts, expected_counts), (
+            "4K ratio-4 causal availability differs from unfused CSA; "
+            f"first mismatching query positions: "
+            f"{torch.nonzero(actual_counts != expected_counts).flatten()[:16].tolist()}"
+        )
+
+        # Explicitly document the beginning, an interior compression boundary,
+        # and the final query position of the production sequence.
+        boundary_queries = torch.tensor(
+            [0, 1, 2, 3, 4, 1022, 1023, 1024, 4094, 4095],
+            device=device,
+        )
+        assert torch.equal(
+            actual_counts[boundary_queries],
+            expected_counts[boundary_queries],
+        )
+
+    def test_pretrain_topk_never_selects_future_compressed_tokens(self):
+        """Stress production top-k=256 with future positions ranked highest."""
+        device = torch.device("cuda:0")
+        sq, sk, ratio, topk = 4096, 1024, 4, 256
+
+        # Scores increase monotonically with compressed position, so every
+        # not-yet-available position outranks all causally valid positions.
+        # Correct masking must still restrict selection to k < (q+1)//ratio.
+        scores = (
+            torch.arange(sk, device=device, dtype=torch.float32)
+            .view(1, 1, sk)
+            .expand(1, sq, sk)
+        )
+        topk_indices, topk_length = topk_with_causal_mask(
+            scores, k=topk, ratio=ratio
+        )
+
+        valid_count_per_query = (
+            torch.arange(1, sq + 1, device=device, dtype=torch.int32) // ratio
+        ).clamp(max=sk)
+        expected_length = valid_count_per_query.clamp(max=topk).view(1, sq)
+        assert torch.equal(topk_length, expected_length)
+
+        valid_count = valid_count_per_query.view(1, sq, 1)
+        selected_is_valid = (topk_indices < valid_count) | (topk_indices == -1)
+        assert selected_is_valid.all(), (
+            "top-k selected a compressed token before the unfused CSA causal "
+            "contract makes it available"
+        )
+
+
+class TestSparseIndexerExtremeProbability:
+    """Stress sparse indexer KL semantics after predict probabilities become tiny.
+
+    The selected top-k is fixed to ``[0, 1]`` so these tests isolate the loss
+    and backward formulas from top-k selection and causal-mask differences.
+    """
+
+    @staticmethod
+    def _make_inputs(gap: float, device: torch.device) -> dict:
+        # Indexer logits are [gap + 1, 1], while the attention target logits
+        # are [1, gap + 1].  Both pre-ReLU indexer scores are strictly
+        # positive, avoiding the undefined derivative at ReLU(0).
+        high = (gap + 1.0) / 2.0
+        low = 0.5
+        q_idx = torch.tensor(
+            [[[[1.0, 1.0]]]], device=device, dtype=torch.bfloat16
+        )
+        k_idx = torch.tensor(
+            [[[high, high], [low, low]]], device=device, dtype=torch.bfloat16
+        )
+        weights = torch.ones((1, 1, 1), device=device, dtype=torch.bfloat16)
+
+        q_attn = torch.tensor(
+            [[[[1.0, 1.0]]]], device=device, dtype=torch.bfloat16
+        )
+        k_attn = torch.tensor(
+            [[[low, low], [high, high]]], device=device, dtype=torch.bfloat16
+        )
+        attn_logits = torch.einsum(
+            "bqhd,bkd->bqhk", q_attn.float(), k_attn.float()
+        )
+        lse = torch.logsumexp(attn_logits, dim=-1)
+
+        return {
+            "q_idx": q_idx,
+            "k_idx": k_idx,
+            "weights": weights,
+            "topk": torch.tensor([[[0, 1]]], device=device, dtype=torch.int32),
+            "q_attn": q_attn,
+            "k_attn": k_attn,
+            "lse": lse,
+        }
+
+    @staticmethod
+    def _run_fused(inputs: dict) -> dict:
+        loss, grad_q, grad_k, grad_w = fused_sparse_indexer_loss_and_backward(
+            inputs["q_idx"],
+            inputs["k_idx"],
+            inputs["weights"],
+            inputs["topk"],
+            inputs["q_attn"],
+            inputs["k_attn"],
+            inputs["lse"],
+            indexer_softmax_scale=1.0,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            calculate_per_token_loss=False,
+            idx_nh=1,
+            kv_offset=0,
+        )
+        return {"loss": loss, "q": grad_q, "k": grad_k, "w": grad_w}
+
+    @staticmethod
+    def _run_autograd_reference(inputs: dict, epsilon: float) -> dict:
+        q = inputs["q_idx"].clone().requires_grad_(True)
+        k = inputs["k_idx"].clone().requires_grad_(True)
+        w = inputs["weights"].clone().requires_grad_(True)
+
+        per_head = torch.einsum("bqhd,bkd->bqhk", q.float(), k.float())
+        logits = (torch.relu(per_head) * w.float().unsqueeze(-1)).sum(dim=2)
+        predict = torch.softmax(logits, dim=-1)
+
+        attn_logits = torch.einsum(
+            "bqhd,bkd->bqhk",
+            inputs["q_attn"].float(),
+            inputs["k_attn"].float(),
+        )
+        target = torch.softmax(attn_logits, dim=-1).sum(dim=2)
+        target = target / target.sum(dim=-1, keepdim=True)
+
+        if epsilon == 0.0:
+            tiny = torch.finfo(torch.float32).tiny
+            t = target.clamp(min=tiny)
+            p = predict.clamp(min=tiny)
+            loss = (t * (torch.log(t) - torch.log(p))).sum(dim=-1).mean()
+        else:
+            # This is the sparse KL expression used by compute_dsa_indexer_loss.
+            loss = (
+                target
+                * (
+                    torch.log(target + epsilon)
+                    - torch.log(predict + epsilon)
+                )
+            ).sum(dim=-1).mean()
+
+        loss.backward()
+        return {
+            "loss": loss.detach(),
+            "q": q.grad.detach(),
+            "k": k.grad.detach(),
+            "w": w.grad.detach(),
+            "predict_min": predict.min().detach(),
+        }
+
+    @pytest.mark.parametrize("gap", [0.0, 10.0, 20.0, 30.0, 50.0])
+    def test_fused_manual_backward_matches_reference_formula(self, gap):
+        """The fused loss/backward must match the epsilon-smoothed reference."""
+        inputs = self._make_inputs(gap, torch.device("cuda:0"))
+        actual = self._run_fused(inputs)
+        expected = self._run_autograd_reference(inputs, epsilon=1e-10)
+
+        assert torch.allclose(actual["loss"], expected["loss"], atol=2e-4, rtol=2e-4)
+        for name in ("q", "k", "w"):
+            assert torch.allclose(
+                actual[name].float(),
+                expected[name].float(),
+                atol=2e-2,
+                rtol=3e-2,
+            ), (
+                f"gap={gap}: fused manual grad_{name} does not match the "
+                f"epsilon-smoothed unfused reference"
+            )
+
+    def test_extreme_probability_matches_unfused_epsilon_semantics(self):
+        """Guard parity after predict falls below the 1e-10 smoothing scale."""
+        inputs = self._make_inputs(30.0, torch.device("cuda:0"))
+        fused = self._run_fused(inputs)
+        unfused = self._run_autograd_reference(inputs, epsilon=1e-10)
+
+        fused_norm = fused["k"].float().norm()
+        unfused_norm = unfused["k"].float().norm()
+        norm_ratio = fused_norm / unfused_norm.clamp_min(1e-30)
+        loss_delta = (fused["loss"] - unfused["loss"]).abs()
+
+        logger.info(
+            "extreme sparse KL parity: predict_min=%.3e fused_loss=%.6f "
+            "unfused_loss=%.6f grad_k_norm_ratio=%.6f",
+            unfused["predict_min"].item(),
+            fused["loss"].item(),
+            unfused["loss"].item(),
+            norm_ratio.item(),
+        )
+
+        assert unfused["predict_min"] < 1e-10
+        assert loss_delta < 2e-4
+        assert 0.97 < norm_ratio < 1.03
+        for name in ("q", "k", "w"):
+            assert torch.allclose(
+                fused[name].float(),
+                unfused[name].float(),
+                atol=2e-2,
+                rtol=3e-2,
+            ), f"extreme-probability grad_{name} parity failed"
 
 
 class TestIndexerGradAccuracy:
@@ -3680,4 +4139,3 @@ class TestFusedBackwardIntegration:
             f"dq_norm={query.grad.float().norm().item():.4e}, "
             f"dkv_norm={kv.grad.float().norm().item():.4e}"
         )
-

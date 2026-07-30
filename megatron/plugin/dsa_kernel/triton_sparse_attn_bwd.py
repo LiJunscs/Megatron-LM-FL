@@ -519,7 +519,7 @@ def fused_dq(
     dQ = torch.empty((total_Sq, H, D), dtype=torch.float32, device=scores.device)
 
     BLOCK_H = 16
-    grid = (total_Sq, H // BLOCK_H)
+    grid = (total_Sq, triton.cdiv(H, BLOCK_H))
 
     _fused_dq_kernel[grid](
         scores, lse, Di, dO, kv_gathered, valid_shared, dQ,
