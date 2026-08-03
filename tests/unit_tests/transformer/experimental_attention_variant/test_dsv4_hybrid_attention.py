@@ -366,6 +366,10 @@ class TestDSv4HybridQKV:
         # key and value are single-head (MQA-style) with an extra head dim
         assert k.shape[-1] == v_dim
         assert v.shape[-1] == v_dim
+        ##### FlagScale Begin #####
+        assert q_compressed.shape[:2] == (seq_len, batch_size)
+        assert q_compressed.requires_grad
+        ##### FlagScale End #####
 
     def test_key_equals_value(self):
         """In the wkv path, key and value should be the same tensor."""

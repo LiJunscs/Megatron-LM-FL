@@ -36,12 +36,14 @@ from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import (
 )
 from megatron.plugin.dsa_kernel.triton_indexer_kernels import (
     sparse_indexer_score_recompute,
-    sparse_attn_score_recompute,
     dense_indexer_score_recompute,
     dense_attn_score_recompute,
     indexer_topk_selection,
     fused_sparse_indexer_loss_and_backward,
     fused_dense_indexer_loss_and_backward,
+    compute_sparse_local_target_head_sum,
+    compute_sparse_indexer_predict_state,
+    sparse_indexer_kl_and_backward,
 )
 
 
@@ -53,6 +55,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DSA_PROFILE = os.environ.get("DSA_PROFILE", "0") == "1"
+
+# TP overlap for sparse indexer loss: async all-reduce + predict overlap.
+# Default off; enable after distributed correctness is validated.
+_DSA_TP_OVERLAP = os.environ.get("MEGATRON_DSA_TP_OVERLAP", "0") == "1"
 
 
 class _CudaProfiler:
@@ -617,6 +623,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sparse_loss: bool,
         kv_offset: int,
         calculate_per_token_loss: bool,
+        tp_group=None,
     ) -> Tuple[Tensor, Tensor]:
         sq, b, np_, d = query.shape
         skv = kv_full.shape[0]
@@ -738,13 +745,27 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         if sparse_loss:
             k_attn_bsd = kv_full[:, :, :d].permute(1, 0, 2)  # (b, skv, d)
 
+            # Determine TP size for target reduction
+            _tp_size = tp_group.size() if tp_group is not None and hasattr(tp_group, 'size') else 1
+            _need_tp_reduce = _tp_size > 1
+
             if needs_grad:
-                # Fused: loss + backward in one pass (single K gather + einsum)
-                indexer_loss, precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights = (
-                    fused_sparse_indexer_loss_and_backward(
-                        q_idx_bshd, k_idx_bsd, w_bsh_scaled,
+                if not _need_tp_reduce:
+                    # Preserve the original fused TP=1 path. Besides being faster,
+                    # its indexer backward avoids the decomposed scatter_add path.
+                    (
+                        indexer_loss,
+                        precomputed_grad_q_indexer,
+                        precomputed_grad_k_indexer,
+                        precomputed_grad_weights,
+                    ) = fused_sparse_indexer_loss_and_backward(
+                        q_idx_bshd,
+                        k_idx_bsd,
+                        w_bsh_scaled,
                         topk_indices_cmp,
-                        q_attn_bshd, k_attn_bsd, lse_indexer_bsh,
+                        q_attn_bshd,
+                        k_attn_bsd,
+                        lse_indexer_bsh,
                         indexer_softmax_scale=indexer_softmax_scale,
                         softmax_scale=softmax_scale,
                         loss_coeff=loss_coeff,
@@ -752,7 +773,52 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                         idx_nh=idx_nh,
                         kv_offset=kv_offset,
                     )
-                )
+                else:
+                    # Decompose only when TP needs a global target reduction.
+                    local_head_sum = compute_sparse_local_target_head_sum(
+                        q_attn_bshd,
+                        k_attn_bsd,
+                        lse_indexer_bsh,
+                        topk_indices_cmp,
+                        softmax_scale=softmax_scale,
+                        kv_offset=kv_offset,
+                    ).contiguous()
+
+                    tp_work = None
+                    if _DSA_TP_OVERLAP:
+                        tp_work = torch.distributed.all_reduce(
+                            local_head_sum,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=tp_group,
+                            async_op=True,
+                        )
+                    else:
+                        torch.distributed.all_reduce(
+                            local_head_sum,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=tp_group,
+                        )
+
+                    predict_state = compute_sparse_indexer_predict_state(
+                        q_idx_bshd, k_idx_bsd, w_bsh_scaled, topk_indices_cmp,
+                    )
+                    if tp_work is not None:
+                        tp_work.wait()
+
+                    (
+                        indexer_loss,
+                        precomputed_grad_q_indexer,
+                        precomputed_grad_k_indexer,
+                        precomputed_grad_weights,
+                    ) = sparse_indexer_kl_and_backward(
+                        local_head_sum,
+                        predict_state,
+                        q_idx_bshd,
+                        k_idx_bsd,
+                        w_bsh_scaled,
+                        loss_coeff=loss_coeff,
+                        calculate_per_token_loss=calculate_per_token_loss,
+                    )
                 # BSHD -> SBHD (match input layout)
                 precomputed_grad_q_indexer = precomputed_grad_q_indexer.permute(1, 0, 2, 3).contiguous()
                 precomputed_grad_k_indexer = precomputed_grad_k_indexer.permute(1, 0, 2).contiguous()
@@ -767,16 +833,26 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     q_idx_bshd, k_idx_bsd, w_bsh_scaled, topk_indices_cmp,
                     qhead_per_kv_head=idx_nh,
                 )
-                # Shift valid compressed indices by kv_offset, keep -1 as-is
-                topk_for_target = topk_indices_cmp.clone()
-                valid_cmp_mask = topk_for_target >= 0
-                topk_for_target[valid_cmp_mask] += kv_offset
-                target_result = sparse_attn_score_recompute(
-                    q_attn_bshd, k_attn_bsd, lse_indexer_bsh, topk_for_target,
-                    softmax_scale, qhead_per_kv_head=np_,
-                )
+                local_head_sum = compute_sparse_local_target_head_sum(
+                    q_attn_bshd,
+                    k_attn_bsd,
+                    lse_indexer_bsh,
+                    topk_indices_cmp,
+                    softmax_scale=softmax_scale,
+                    kv_offset=kv_offset,
+                ).contiguous()
+                if _need_tp_reduce:
+                    torch.distributed.all_reduce(
+                        local_head_sum,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=tp_group,
+                    )
+                target = local_head_sum / local_head_sum.sum(
+                    dim=-1, keepdim=True
+                ).clamp(min=1e-12)
                 indexer_loss = _kl_loss_from_target_predict(
-                    target_result["target"], predict_result["predict"],
+                    target,
+                    predict_result["predict"],
                     topk_indices_cmp, loss_coeff, calculate_per_token_loss
                 )
                 precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
@@ -800,6 +876,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                         ratio=ratio,
                         calculate_per_token_loss=calculate_per_token_loss,
                         idx_nh=idx_nh,
+                        tp_group=tp_group,
                     )
                 )
                 # BSHD -> SBHD (match input layout)
@@ -961,6 +1038,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             grad_k_indexer,
             grad_weights,
             None, None, None, None, None, None, None, None,  # scalar args
+            None,  # tp_group
         )
 
 
@@ -980,10 +1058,15 @@ def fused_indexer_sparse_attn(
     sparse_loss: bool,
     kv_offset: int,
     calculate_per_token_loss: bool,
+    tp_group=None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused indexer loss + sparse attention (Path B training).
 
     Drop-in replacement for ``dsa_kernels.fused_indexer_sparse_attn``.
+
+    Args:
+        tp_group: TP process group. When provided with size > 1, the sparse
+            indexer target is all-reduced across TP ranks before normalization.
 
     Returns:
         ``(output, indexer_loss)`` where output is ``(sq, b, np * d_v)`` bf16
@@ -1005,6 +1088,7 @@ def fused_indexer_sparse_attn(
         sparse_loss,
         kv_offset,
         calculate_per_token_loss,
+        tp_group,
     )
 
 

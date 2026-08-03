@@ -12,6 +12,8 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -23,9 +25,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.utils import (
+    make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
-##### FlagScale Begin #####
+
 # ---------------------------------------------------------------------------
 # Backend dispatch: SM90 (Triton) vs SM100+ (FlashMLA + cuDNN)
 #
@@ -74,7 +81,6 @@ def _ensure_dsa_kernels():
         _fused_indexer_sparse_attn = _triton_fused
         _indexer_topk = _triton_topk
         _build_flat_topk_idxs_fn = _triton_build_flat_topk_idxs
-##### FlagScale End #####
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -346,11 +352,18 @@ class Compressor(MegatronModule):
 
         proj_out_dim = self.coff * head_dim
 
+        # The parent Dsv4HybridSparseAttention gathers the sequence before
+        # entering CSA.  Every duplicated operator in this module therefore
+        # consumes the complete sequence and must not enable TE's SP behavior
+        # or the final SP parameter-gradient reduction.
+        full_sequence_config = copy.copy(config)
+        full_sequence_config.sequence_parallel = False
+
         self.linear_wkv = build_module(
             submodules.linear_wkv,
             config.hidden_size,
             proj_out_dim,
-            config=config,
+            config=full_sequence_config,
             init_method=config.init_method,
             bias=False,
             skip_bias_add=False,
@@ -362,7 +375,7 @@ class Compressor(MegatronModule):
             submodules.linear_wgate,
             config.hidden_size,
             proj_out_dim,
-            config=config,
+            config=full_sequence_config,
             init_method=config.init_method,
             bias=False,
             skip_bias_add=False,
@@ -377,7 +390,7 @@ class Compressor(MegatronModule):
         config.init_method(_ape)
         self.ape = nn.Parameter(_ape)
 
-        norm_config = copy.copy(config)
+        norm_config = copy.copy(full_sequence_config)
         norm_config.normalization = "RMSNorm"
         self.norm = build_module(
             submodules.norm, config=norm_config, hidden_size=head_dim, eps=config.layernorm_epsilon
@@ -508,12 +521,16 @@ class CSAIndexer(MegatronModule):
 
         self.rotary_pos_emb = rotary_pos_emb
 
+        # qr and x are full-sequence tensors at the CSA boundary.
+        full_sequence_config = copy.copy(config)
+        full_sequence_config.sequence_parallel = False
+
         # Q projection
         self.linear_wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
             self.index_n_heads * self.index_head_dim,
-            config=config,
+            config=full_sequence_config,
             init_method=config.init_method,
             bias=False,
             skip_bias_add=False,
@@ -526,7 +543,7 @@ class CSAIndexer(MegatronModule):
             submodules.linear_weights_proj,
             self.hidden_size,
             self.index_n_heads,
-            config=config,
+            config=full_sequence_config,
             init_method=config.init_method,
             bias=False,
             skip_bias_add=False,
@@ -651,20 +668,26 @@ class CompressedSparseAttention(MegatronModule):
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        self.n_local_heads = config.num_attention_heads
+        tp_size = self.pg_collection.tp.size()
+        assert config.num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({config.num_attention_heads}) must be "
+            f"divisible by TP size ({tp_size})"
+        )
+        self.n_local_heads = config.num_attention_heads // tp_size
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
 
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
-        ##### FlagScale Begin #####
         if self.apply_dsa_kernel_fusion:
             _ensure_dsa_kernels()
-        ##### FlagScale End #####
 
-        # Learnable attention sink per head
+        # Learnable attention sink per head (TP-sharded along head dim)
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+        set_tensor_model_parallel_attributes(
+            self.attn_sink, is_parallel=True, dim=0, stride=1
+        )
 
         # Conditionally build Compressor (ratio > 1)
         if self.compress_ratio > 1 and submodules.compressor is not None:
@@ -696,6 +719,23 @@ class CompressedSparseAttention(MegatronModule):
         else:
             self.indexer = None
 
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Represent the per-head attention sink as a TP-axis-0 shard."""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = super().sharded_state_dict(
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+        sink_key = f"{prefix}attn_sink"
+        sharded_state_dict[sink_key] = make_tp_sharded_tensor_for_checkpoint(
+            self.attn_sink,
+            sink_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+        return sharded_state_dict
+
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
@@ -713,6 +753,13 @@ class CompressedSparseAttention(MegatronModule):
         if self.compressor is not None and self.compress_ratio > 1:
             compressed_kv = self.compressor(x)
             if compressed_kv is not None:
+                # The compressor is replicated, while each TP rank's attention
+                # owns only its local query heads.  Preserve the replicated
+                # value in forward and sum all local-head dKV contributions
+                # before running the shared compressor backward.
+                compressed_kv = copy_to_tensor_model_parallel_region(
+                    compressed_kv, group=self.pg_collection.tp
+                )
                 kv_full = torch.cat([kv, compressed_kv], dim=0)
                 n_compressed = compressed_kv.size(0)
             else:
@@ -836,17 +883,17 @@ class CompressedSparseAttention(MegatronModule):
             compress_topk_idxs = get_compress_topk_idxs(
                 self.compress_ratio, b, sq, offset, query.device
             )
-            flat_idxs, _ = _build_flat_topk_idxs_fn(                ##### FlagScale Begin #####
+            flat_idxs, _ = _build_flat_topk_idxs_fn(
                 window_idxs, compress_topk_idxs, batch_size=b, seqlen_kv=kv_full.shape[0]
             )
         else:
-            flat_idxs, _ = _build_flat_topk_idxs_fn(                ##### FlagScale Begin #####
+            flat_idxs, _ = _build_flat_topk_idxs_fn(
                 window_idxs, batch_size=b, seqlen_kv=kv_full.shape[0]
             )
         nvtx_range_pop("compressed_indices")
 
         nvtx_range_push("sparse_attn_kernel")
-        output = _dsa_sparse_attn(                                  ##### FlagScale Begin #####
+        output = _dsa_sparse_attn(
             query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -872,7 +919,7 @@ class CompressedSparseAttention(MegatronModule):
         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
             x_det, qr_det, packed_seq_params
         )
-        topk_indices_cmp, _ = _indexer_topk(        ##### FlagScale Begin #####
+        topk_indices_cmp, _ = _indexer_topk(
             q_indexer,
             k_indexer,
             weights_indexer,
@@ -881,13 +928,13 @@ class CompressedSparseAttention(MegatronModule):
             indexer_softmax_scale=self.indexer.softmax_scale,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
-        flat_idxs, flat_tlen = _build_flat_topk_idxs_fn(            ##### FlagScale Begin #####
+        flat_idxs, flat_tlen = _build_flat_topk_idxs_fn(
             window_idxs, compress_topk_idxs, batch_size=b, seqlen_kv=kv_full.shape[0], compact=True
         )
         nvtx_range_pop("compressed_indices")
 
         nvtx_range_push("sparse_attn_kernel")
-        output = _dsa_sparse_attn(          ##### FlagScale Begin #####
+        output = _dsa_sparse_attn(
             query,
             kv_full,
             self.attn_sink.float(),
@@ -924,7 +971,7 @@ class CompressedSparseAttention(MegatronModule):
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
 
         nvtx_range_push("sparse_attn_kernel")
-        output, indexer_loss = _fused_indexer_sparse_attn(          ##### FlagScale Begin #####
+        output, indexer_loss = _fused_indexer_sparse_attn(
             query,
             kv_full,
             self.attn_sink.float(),
@@ -940,6 +987,7 @@ class CompressedSparseAttention(MegatronModule):
             sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
             kv_offset=offset,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
+            tp_group=self.pg_collection.tp,
         )
         nvtx_range_pop("sparse_attn_kernel")
 
@@ -986,6 +1034,19 @@ class CompressedSparseAttention(MegatronModule):
         ), "Packed sequence not supported for CompressedSparseAttention"
 
         sq, b, np, hn = query.size()
+        assert np == self.n_local_heads, (
+            f"query has {np} local heads, expected {self.n_local_heads} for "
+            f"TP size {self.pg_collection.tp.size()}"
+        )
+        assert self.attn_sink.numel() == np
+        assert key.size(0) == sq and x.size(0) == sq, (
+            "query, key, and x must enter CSA with the same full sequence length, while"
+            f"query has {sq} tokens, key has {key.size(0)} tokens, and x has {x.size(0)} tokens"
+        )
+        if qr is not None:
+            assert qr.size(0) == sq, (
+                "q_compressed must be all-gathered before entering CSA"
+            )
 
         kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
         kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)

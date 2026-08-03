@@ -24,6 +24,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 
 ########## FlagScale Begin ##########
 from megatron.plugin.platform import get_platform
@@ -646,7 +648,10 @@ class TopKRouter(Router):
 
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h]
         # and get flattened to [s*b, h]. Transpose to match.
-        flat_ids = input_ids.T.reshape(-1)
+        # Split input_ids when enable sequence parallel. Note that it should be split in tensor_model_parallel_group, not expert_tensor_parallel_group.
+        if self.config.sequence_parallel and parallel_state.get_tensor_model_parallel_world_size() > 1:
+            input_ids = scatter_to_sequence_parallel_region(input_ids.T, parallel_state.get_tensor_model_parallel_group())
+        flat_ids = input_ids.reshape(-1)  # [num_tokens]
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
 
         probs = scores.gather(1, top_indices)

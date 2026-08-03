@@ -582,6 +582,193 @@ def dense_indexer_backward(
 
 
 # ---------------------------------------------------------------------------
+# Decomposed sparse indexer helpers (for TP overlap)
+# ---------------------------------------------------------------------------
+
+
+def compute_sparse_local_target_head_sum(
+    q_attn_bshd: Tensor,
+    k_attn_bsd: Tensor,
+    lse_bsh: Tensor,
+    topk_indices_cmp: Tensor,
+    softmax_scale: float,
+    kv_offset: int = 0,
+) -> Tensor:
+    """Compute local-heads attention probability sum over top-K positions.
+
+    This produces the *local* head sum that should be TP all-reduced before
+    normalization to form the global teacher target.
+
+    Args:
+        q_attn_bshd: ``(B, S_q, np, D_attn)`` bf16 — attention queries.
+        k_attn_bsd: ``(B, S_kv, D_attn)`` bf16 — full attention keys.
+        lse_bsh: ``(B, S_q, np)`` fp32 — LSE from sparse attention forward.
+        topk_indices_cmp: ``(B, S_q, topk)`` int32 — indices into [0, n_comp).
+        softmax_scale: scale for attention scores.
+        kv_offset: offset where compressed KV starts in k_attn_bsd.
+
+    Returns:
+        head_sum: ``(B, S_q, topk)`` fp32 — sum of attention probs over local heads.
+    """
+    B, S_q, topk = topk_indices_cmp.shape
+
+    # Gather attention keys at top-K positions (offset into full KV buffer)
+    idx_attn_expanded = (topk_indices_cmp.long() + kv_offset).clamp(min=0)  # (B, S_q, topk)
+    batch_idx = torch.arange(B, device=k_attn_bsd.device)[:, None, None]
+    k_attn_gathered = k_attn_bsd.float()[batch_idx, idx_attn_expanded]  # (B, S_q, topk, D_attn)
+
+    invalid_mask = topk_indices_cmp == -1  # (B, S_q, topk)
+
+    # Compute attention scores and probabilities
+    q_attn = q_attn_bshd.float()
+    attn_scores = torch.einsum("bqhd,bqtd->bqht", q_attn, k_attn_gathered) * softmax_scale
+    attn_probs = torch.exp(attn_scores - lse_bsh.unsqueeze(-1))  # (B, S_q, np, topk)
+
+    # Sum over local heads
+    head_sum = attn_probs.sum(dim=2)  # (B, S_q, topk)
+    head_sum = head_sum.masked_fill(invalid_mask, 0.0)
+
+    return head_sum
+
+
+def compute_sparse_indexer_predict_state(
+    q_idx_bshd: Tensor,
+    k_idx_bsd: Tensor,
+    w_bsh: Tensor,
+    topk_indices_cmp: Tensor,
+) -> dict:
+    """Compute indexer predict distribution and intermediates for backward.
+
+    This does NOT depend on the teacher target and can run concurrently with
+    TP all-reduce of the local head sum.
+
+    Args:
+        q_idx_bshd: ``(B, S_q, H_q, D_idx)`` bf16 — indexer queries.
+        k_idx_bsd: ``(B, S_k, D_idx)`` bf16 — indexer keys.
+        w_bsh: ``(B, S_q, H_q)`` bf16 — scaled weights.
+        topk_indices_cmp: ``(B, S_q, topk)`` int32 — indices into [0, n_comp).
+
+    Returns:
+        dict with keys: predict, per_head_scores_relu, relu_mask, combined,
+        k_idx_gathered, invalid_mask, q_idx_float, w_float
+    """
+    B, S_q, H_q, D_idx = q_idx_bshd.shape
+    topk = topk_indices_cmp.shape[-1]
+
+    # Gather indexer keys
+    idx_expanded = topk_indices_cmp.long().clamp(min=0)  # (B, S_q, topk)
+    batch_idx = torch.arange(B, device=k_idx_bsd.device)[:, None, None]
+    k_idx_gathered = k_idx_bsd.float()[batch_idx, idx_expanded]  # (B, S_q, topk, D_idx)
+
+    invalid_mask = topk_indices_cmp == -1  # (B, S_q, topk)
+
+    # Compute predict (indexer distribution)
+    q_idx = q_idx_bshd.float()
+    w = w_bsh.float()
+    per_head_scores = torch.einsum("bqhd,bqtd->bqht", q_idx, k_idx_gathered)
+    relu_mask = per_head_scores > 0
+    per_head_scores_relu = torch.relu(per_head_scores)  # (B, S_q, H_q, topk)
+    combined = (per_head_scores_relu * w.unsqueeze(-1)).sum(dim=2)  # (B, S_q, topk)
+    combined = combined.masked_fill(invalid_mask, float("-inf"))
+    predict = torch.softmax(combined, dim=-1).masked_fill(invalid_mask, 0.0)
+
+    return {
+        "predict": predict,
+        "per_head_scores_relu": per_head_scores_relu,
+        "relu_mask": relu_mask,
+        "combined": combined,
+        "k_idx_gathered": k_idx_gathered,
+        "invalid_mask": invalid_mask,
+        "q_idx_float": q_idx,
+        "w_float": w,
+        "idx_expanded": idx_expanded,
+    }
+
+
+def sparse_indexer_kl_and_backward(
+    head_sum: Tensor,
+    predict_state: dict,
+    q_idx_bshd: Tensor,
+    k_idx_bsd: Tensor,
+    w_bsh: Tensor,
+    loss_coeff: float,
+    calculate_per_token_loss: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Compute KL loss and indexer backward from global head sum and predict state.
+
+    Args:
+        head_sum: ``(B, S_q, topk)`` fp32 — **already all-reduced** global head sum.
+        predict_state: dict from ``compute_sparse_indexer_predict_state``.
+        q_idx_bshd: ``(B, S_q, H_q, D_idx)`` — for grad dtype.
+        k_idx_bsd: ``(B, S_k, D_idx)`` — for grad shape/dtype.
+        w_bsh: ``(B, S_q, H_q)`` — for grad dtype.
+        loss_coeff: KL loss coefficient.
+        calculate_per_token_loss: if True, use sum instead of mean.
+
+    Returns:
+        (indexer_loss, grad_q_indexer, grad_k_indexer, grad_weights)
+    """
+    predict = predict_state["predict"]
+    per_head_scores_relu = predict_state["per_head_scores_relu"]
+    relu_mask = predict_state["relu_mask"]
+    k_idx_gathered = predict_state["k_idx_gathered"]
+    invalid_mask = predict_state["invalid_mask"]
+    q_idx = predict_state["q_idx_float"]
+    w = predict_state["w_float"]
+    idx_expanded = predict_state["idx_expanded"]
+
+    B, S_q, topk = head_sum.shape
+    D_idx = q_idx_bshd.shape[-1]
+    S_k = k_idx_bsd.shape[1]
+
+    # Normalize head_sum to get target
+    denom = head_sum.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    target = head_sum / denom  # (B, S_q, topk)
+
+    # KL loss
+    kl_per_row = (
+        target
+        * (
+            torch.log(target + _SPARSE_KL_EPS)
+            - torch.log(predict + _SPARSE_KL_EPS)
+        )
+    ).sum(dim=-1)
+    row_valid = (~invalid_mask).any(dim=-1)  # (B, S_q)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    indexer_loss = loss_coeff * loss
+
+    # Indexer backward
+    grad_combined = _sparse_kl_grad_logits(predict, target)
+    grad_combined = grad_combined.masked_fill(invalid_mask, 0.0)
+
+    if not calculate_per_token_loss:
+        grad_combined = grad_combined * (loss_coeff / (B * S_q))
+    else:
+        grad_combined = grad_combined * loss_coeff
+
+    grad_relu_scores = grad_combined.unsqueeze(2) * w.unsqueeze(-1)  # (B, S_q, H_q, topk)
+    grad_w = (grad_combined.unsqueeze(2) * per_head_scores_relu).sum(dim=-1)  # (B, S_q, H_q)
+    grad_pre_relu = grad_relu_scores * relu_mask.float()
+
+    grad_q = torch.einsum("bqht,bqtd->bqhd", grad_pre_relu, k_idx_gathered)
+    grad_k_gathered = torch.einsum("bqht,bqhd->bqtd", grad_pre_relu, q_idx)
+
+    # Scatter grad_k_gathered back to full k_indexer
+    grad_k = torch.zeros(B, S_k, D_idx, dtype=torch.float32, device=k_idx_bsd.device)
+    flat_idx = idx_expanded.reshape(B, S_q * topk, 1).expand(-1, -1, D_idx)
+    flat_grad = grad_k_gathered.reshape(B, S_q * topk, D_idx)
+    grad_k.scatter_add_(1, flat_idx, flat_grad)
+
+    return (
+        indexer_loss,
+        grad_q.to(q_idx_bshd.dtype),
+        grad_k.to(k_idx_bsd.dtype),
+        grad_w.to(w_bsh.dtype),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fused sparse indexer loss + backward (P0 optimization)
 # ---------------------------------------------------------------------------
 
@@ -729,12 +916,17 @@ def fused_dense_indexer_loss_and_backward(
     ratio: int = 1,
     calculate_per_token_loss: bool = False,
     idx_nh: int = 1,
+    tp_group=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """One-pass fused dense: indexer score + attn score + KL loss + backward.
 
     Merges ``dense_indexer_score_recompute`` + ``dense_attn_score_recompute`` +
     ``_kl_loss_from_dense_scores`` + ``dense_indexer_backward`` into a single
     tiled pass over Q blocks.
+
+    When ``tp_group`` is provided with size > 1, each query block's attention
+    head-sum target is synchronously all-reduced before normalization. This
+    preserves the original bounded-memory behavior; overlap is sparse-only.
 
     Args:
         q_idx_bshd: ``(B, S_q, H_q, D_idx)`` bf16 — indexer queries.
@@ -750,6 +942,7 @@ def fused_dense_indexer_loss_and_backward(
         ratio: compression ratio for causal mask.
         calculate_per_token_loss: if True, use sum instead of mean.
         idx_nh: number of indexer heads.
+        tp_group: TP process group for target all-reduce. None means TP=1.
 
     Returns:
         (indexer_loss, grad_q_indexer, grad_k_indexer, grad_weights)
@@ -770,7 +963,12 @@ def fused_dense_indexer_loss_and_backward(
     # Row validity from topk_indices
     row_valid = (topk_indices_cmp >= 0).any(dim=-1)  # (B, S_q)
 
-    # Accumulators
+    # Determine TP size
+    _tp_size = tp_group.size() if tp_group is not None and hasattr(tp_group, 'size') else 1
+    _need_tp_reduce = _tp_size > 1
+
+    # Keep the dense path memory-bounded. Each Q block is reduced synchronously;
+    # sparse loss is the only path that enables communication overlap for now.
     grad_q = torch.empty(B, S_q, H_q, D_idx, dtype=torch.float32, device=q_idx_bshd.device)
     grad_k = torch.zeros(B, S_k, D_idx, dtype=torch.float32, device=k_idx_bsd.device)
     grad_w = torch.empty(B, S_q, H_q, dtype=torch.float32, device=w_bsh.device)
@@ -779,7 +977,6 @@ def fused_dense_indexer_loss_and_backward(
     BLOCK_Q = _DENSE_BLOCK_Q
     for q_start in range(0, S_q, BLOCK_Q):
         q_end = min(q_start + BLOCK_Q, S_q)
-        block_len = q_end - q_start
 
         # Slice inputs for this Q block
         q_idx_block = q_idx_bshd[:, q_start:q_end].float()  # (B, block, H_q, D_idx)
@@ -798,17 +995,23 @@ def fused_dense_indexer_loss_and_backward(
         index_lse = torch.logsumexp(combined, dim=-1)  # (B, block)
         index_score = combined  # keep for KL
 
-        # --- Attention scores (target) ---
-        # For the dense path, compute self-contained softmax over compressed keys
-        # (matching unfused FusedDSAIndexerLoss which does softmax(Q@K_comp*scale+mask))
+        # --- Attention scores (teacher target) ---
         attn_per_head = torch.einsum("bqhd,bkd->bqhk", q_attn_block, k_attn) * softmax_scale
-        # (B, block, np, S_k) — apply causal mask before softmax
-        attn_per_head = attn_per_head.masked_fill(~mask_block.unsqueeze(0).unsqueeze(2), float("-inf"))
-        # Self-contained softmax per head over S_k (no external LSE)
-        attn_probs = torch.softmax(attn_per_head, dim=-1)  # (B, block, np, S_k)
-        attn_probs = attn_probs.masked_fill(~mask_block.unsqueeze(0).unsqueeze(2), 0.0)
-        attn_score = attn_probs.sum(dim=2)  # (B, block, S_k)
+        attn_per_head = attn_per_head.masked_fill(
+            ~mask_block.unsqueeze(0).unsqueeze(2), float("-inf")
+        )
+        attn_probs = torch.softmax(attn_per_head, dim=-1)
+        attn_probs = attn_probs.masked_fill(
+            ~mask_block.unsqueeze(0).unsqueeze(2), 0.0
+        )
+        attn_score = attn_probs.sum(dim=2).contiguous()
         attn_score = attn_score.masked_fill(~mask_block.unsqueeze(0), 0.0)
+        if _need_tp_reduce:
+            torch.distributed.all_reduce(
+                attn_score,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
         attn_l1norm = attn_score.sum(dim=-1)  # (B, block)
 
         # --- KL loss for this block ---
@@ -827,7 +1030,6 @@ def fused_dense_indexer_loss_and_backward(
         kl_acc[:, q_start:q_end] = kl_per_row_block
 
         # --- Dense indexer backward for this block ---
-        # grad through KL + logsumexp: predict_prob - target_prob
         predict_prob = torch.softmax(combined.masked_fill(~mask_block.unsqueeze(0), float("-inf")), dim=-1)
         predict_prob = predict_prob.masked_fill(~mask_block.unsqueeze(0), 0.0)
         target_prob = target_block.masked_fill(~mask_block.unsqueeze(0), 0.0)
