@@ -715,16 +715,17 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sparse_loss: bool,
         kv_offset: int,
         calculate_per_token_loss: bool,
-        tp_group=None,
+        tp_group=None, ##### FlagScale Add #####
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
-
+        ##### FlagScale Add #####
         if tp_group is not None and tp_group.size() > 1:
             raise NotImplementedError(
                 "TP indexer-target reduction is currently implemented only for the "
                 "SM90 Triton DSA backend"
             )
+        ##### FlagScale End #####
 
         sq, b, np_, d = query.shape
         skv = kv_full.shape[0]
@@ -953,7 +954,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
-            None,
+            None, ##### FlagScale Add #####
         )
 
 
@@ -973,7 +974,7 @@ def fused_indexer_sparse_attn(
     sparse_loss: bool = False,
     kv_offset: int = 0,
     calculate_per_token_loss: bool = False,
-    tp_group=None,
+    tp_group=None, ##### FlagScale Add #####
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -1006,7 +1007,7 @@ def fused_indexer_sparse_attn(
         kv_offset:    start of compressed region within ``kv_full``.
         calculate_per_token_loss: if True, report raw local KL sum and
             compensate the cuDNN backward wrappers' local averaging.
-        tp_group: tensor-parallel group. TP indexer-target reduction is not yet
+        tp_group: tensor-parallel group. TP indexer-target reduction is not yet ##### FlagScale Add #####
             implemented for the SM100+ backend.
 
     Returns:

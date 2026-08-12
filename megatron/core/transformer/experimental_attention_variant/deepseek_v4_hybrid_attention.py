@@ -25,6 +25,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+##### FlagScale Add #####
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
@@ -42,7 +43,7 @@ try:
 except Exception:
     _FusedMLARoPEInplace = None
     fused_mla_rope_inplace = None
-
+##### FlagScale End #####
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -55,7 +56,7 @@ def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
-
+##### FlagScale Add #####
 class _DSv4SPBackwardPolicy(Enum):
     """Backward ownership contract for one field in the packed SP gather.
 
@@ -262,7 +263,7 @@ def _dsv4_sp_rope_gather(
             gathered_field = gathered_field.detach()
         named_gathered_fields[field.name] = gathered_field
     return query, named_gathered_fields
-
+##### FlagScale End #####
 
 @dataclass
 class DSv4HybridSelfAttentionSubmodules:
@@ -304,7 +305,7 @@ class DSv4HybridAttention(Attention):
             is_mtp_layer=is_mtp_layer,
         )
         self.config: MLATransformerConfig
-
+        ##### FlagScale Add #####
         tp_size = get_pg_size(self.pg_collection.tp)
         assert self.config.num_attention_heads % tp_size == 0, (
             f"num_attention_heads ({self.config.num_attention_heads}) must be divisible by "
@@ -317,6 +318,7 @@ class DSv4HybridAttention(Attention):
         assert tp_size == 1 or self.config.apply_rope_fusion, (
             "DSv4 Hybrid TP requires apply_rope_fusion=True"
         )
+        ##### FlagScale End #####
 
         assert (
             not self.checkpoint_core_attention
@@ -324,14 +326,15 @@ class DSv4HybridAttention(Attention):
         assert (
             not self.offload_qkv_linear
         ), "Offload qkv linear is not supported in DSv4 Hybrid Attention."
-
+        ##### FlagScale Add #####
         # ColumnParallelLinear constructors take global dimensions and perform
         # the TP division internally.  Keep Megatron's standard global meaning
         # for query_projection_size and track the local width separately.
+        ##### FlagScale End #####
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
         self.query_projection_size_per_partition = (
             self.config.v_head_dim * self.num_local_q_heads
-        )
+        )   ##### FlagScale Add #####
 
         self.q_head_dim = self.config.v_head_dim
 
@@ -398,6 +401,7 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
+        ##### FlagScale Add #####
         assert self.config.o_groups % tp_size == 0, (
             f"o_groups ({self.config.o_groups}) must be divisible by tensor parallel "
             f"size ({tp_size})"
@@ -408,13 +412,14 @@ class DSv4HybridAttention(Attention):
         )
         group_proj_in_size = self.query_projection_size_per_partition // self.o_local_groups
         group_proj_out_size = self.o_local_groups * self.config.o_lora_rank
-
+        ##### FlagScale End #####
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
             group_proj_in_size,
             device=torch.cuda.current_device(),
             dtype=self.config.params_dtype,
         )
+        ##### FlagScale Add #####
         # This parameter is TP-sharded along its group/output axis.  Initialize
         # it from the model-parallel RNG stream so TP ranks receive distinct
         # local shards.  Forking also restores the default/DP RNG afterwards,
@@ -431,6 +436,7 @@ class DSv4HybridAttention(Attention):
         set_tensor_model_parallel_attributes(
             self.linear_o_group_proj, is_parallel=True, dim=0, stride=1
         )
+        ##### FlagScale End #####
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -465,7 +471,7 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
-
+    ##### FlagScale Add #####
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Shard the grouped output projection along its group/output axis."""
         metadata = ensure_metadata_has_dp_cp_group(metadata)
@@ -482,6 +488,7 @@ class DSv4HybridAttention(Attention):
             dp_cp_group=metadata["dp_cp_group"],
         )
         return sharded_state_dict
+    ##### FlagScale End #####
 
     def forward(
         self,
@@ -522,6 +529,7 @@ class DSv4HybridAttention(Attention):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
+        ##### FlagScale Add #####
         query, key, value, q_compressed, gathered_hidden_states = (
             self.get_query_key_value_tensors(
                 hidden_states,
@@ -531,12 +539,15 @@ class DSv4HybridAttention(Attention):
                 inference_context=inference_context,
             )
         )
+        ##### FlagScale End #####
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
+        ##### FlagScale Add #####
         # DSv4's single MQA tensor is shared by key and value. Preserve that
         # alias instead of materializing the same contiguous tensor twice.
+        ##### FlagScale End #####
         value = key
 
         # ==================================
@@ -553,8 +564,10 @@ class DSv4HybridAttention(Attention):
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
+                ##### FlagScale Add #####
                 # CSA consumes the full sequence, unlike the SP input to this layer.
                 x=gathered_hidden_states,
+                ##### FlagScale End #####
                 qr=q_compressed,
             )
         # NOTE: No implement in megatron version core_v0.17.0, group_commit(v0.17.0) -> group_offload(latest)
@@ -577,7 +590,7 @@ class DSv4HybridAttention(Attention):
 
         # inverse RoPE on last qk_pos_emb_head_dim of each head
         seq_len = core_attn_out.size(0)
-        n_heads = self.num_local_q_heads
+        n_heads = self.num_local_q_heads    ##### FlagScale Add #####
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = self.config.v_head_dim - pos_dim
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
@@ -725,8 +738,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         self.linear_q_up_proj = build_module(
             submodules.linear_q_up_proj,
             self.config.q_lora_rank,
+            ##### FlagScale Add #####
             # ColumnParallelLinear takes the global output width and returns
             # query_projection_size (= local Q heads * head dim) on each rank.
+            ##### FlagScale End #####
             self.query_projection_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -735,10 +750,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
-            skip_weight_param_allocation=False,
+            skip_weight_param_allocation=False, ##### FlagScale Add #####
             tp_group=pg_collection.tp,
         )
-
+        ##### FlagScale Add #####
         kv_proj_kwargs = {}
         if submodules.linear_kv_proj in [TELinear]:
             # The single MQA KV head is intentionally replicated.  Sharding
@@ -746,6 +761,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             kv_proj_kwargs['parallel_mode'] = 'duplicated'
         else:
             raise ValueError(f"Unsupported linear_kv_proj: {submodules.linear_kv_proj}")
+        ##### FlagScale End #####
 
         self.linear_kv_proj = build_module(
             submodules.linear_kv_proj,
@@ -753,12 +769,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             self.config.v_head_dim,
             config=self.config,
             init_method=self.config.init_method,
-            skip_weight_param_allocation=False,
+            skip_weight_param_allocation=False, ##### FlagScale Add #####
             bias=False,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
-            tp_group=None,
+            tp_group=None,  ##### FlagScale Add #####
             **kv_proj_kwargs,
         )
         self.kv_layernorm = submodules.kv_layernorm(
@@ -871,7 +887,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # QKV up projection and RoPE apply
         # =========================================
 
-        def qkv_up_proj_and_rope_apply(q_compressed, hidden_states, k_pos_emb, rotary_pos_emb):
+        def qkv_up_proj_and_rope_apply(q_compressed, hidden_states, k_pos_emb, rotary_pos_emb): ##### FlagScale Add #####
             """
             Apply the up projection and RoPE to the query and key.
             When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
@@ -881,7 +897,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
             q, _ = self.linear_q_up_proj(q_compressed)
-
+            ##### FlagScale Add #####
             # q: [num_tokens, n, q_head_dim]
             assert q.size(-1) == self.query_projection_size_per_partition, (
                 f"local Q projection width ({q.size(-1)}) must equal "
@@ -889,9 +905,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 f"({self.query_projection_size_per_partition})"
             )
             q = q.view(*q.size()[:-1], self.num_local_q_heads, self.q_head_dim)
+            ##### FlagScale End #####
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
-            kv, _ = self.linear_kv_proj(hidden_states)
+            kv, _ = self.linear_kv_proj(hidden_states) ##### FlagScale Add #####
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             if k_pos_emb is not None:
@@ -900,6 +917,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
+                ##### FlagScale Add #####
                 sp_enabled = (
                     self.config.sequence_parallel and self.pg_collection.tp.size() > 1
                 )
@@ -953,6 +971,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         remove_interleaving=True,
                     )
                 kv = self.kv_layernorm(kv)
+                ##### FlagScale End #####
                 kv = kv.unsqueeze(-2)
                 kv = fused_mla_rope_inplace(
                     kv,
@@ -966,7 +985,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     remove_interleaving=True,
                 )
             else:
-                kv = self.kv_layernorm(kv)
+                kv = self.kv_layernorm(kv) ##### FlagScale Add #####
                 q_len = q.size()[0]
                 if packed_seq_params is None or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
@@ -1017,7 +1036,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
-
+            ##### FlagScale Add #####
             if self.pg_collection.tp.size() > 1 and not self.config.sequence_parallel:
                 # The single MQA KV head is replicated but consumed by TP-local
                 # query heads. Non-SP bypasses _DSv4SPRopeGather, so SUM the
@@ -1027,25 +1046,27 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 )
 
             key = value = kv
+            ##### FlagScale End #####
 
-            return query, key, value, q_compressed, hidden_states
+            return query, key, value, q_compressed, hidden_states ##### FlagScale Add #####
 
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            query, key, value, q_compressed, hidden_states = self.qkv_up_checkpoint.checkpoint(
+            query, key, value, q_compressed, hidden_states = self.qkv_up_checkpoint.checkpoint( ##### FlagScale Add #####
                 qkv_up_proj_and_rope_apply, q_compressed, hidden_states, k_pos_emb, rotary_pos_emb
             )
         else:
-            query, key, value, q_compressed, hidden_states = qkv_up_proj_and_rope_apply(
+            query, key, value, q_compressed, hidden_states = qkv_up_proj_and_rope_apply( ##### FlagScale Add #####
                 q_compressed, hidden_states, k_pos_emb, rotary_pos_emb
             )
-
+        ##### FlagScale Add #####
         assert q_compressed.size(0) == query.size(0), (
             f"q_compressed sequence length ({q_compressed.size(0)}) must match "
             f"query sequence length ({query.size(0)})"
         )
-        return query, key, value, q_compressed, hidden_states
+        ##### FlagScale End #####
+        return query, key, value, q_compressed, hidden_states 
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""

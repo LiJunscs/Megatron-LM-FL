@@ -1352,6 +1352,7 @@ class TransformerConfig(ModelParallelConfig):
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
+            ##### FlagScale Add #####
             assert self.num_attention_heads % self.tensor_model_parallel_size == 0, (
                 f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})"
@@ -1360,6 +1361,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"o_groups ({self.o_groups}) must be divisible by "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})"
             )
+            ##### FlagScale End #####
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
@@ -1379,7 +1381,7 @@ class TransformerConfig(ModelParallelConfig):
                     assert self.tensor_model_parallel_size == 1, (
                         "DSv4 Hybrid TP indexer-target reduction is currently supported "
                         "only by the SM90 Triton backend"
-                    )
+                    )  ##### FlagScale Add #####
                     _flash_mla_available = True
                     try:
                         from flash_mla import flash_mla_sparse_fwd  # noqa: F401

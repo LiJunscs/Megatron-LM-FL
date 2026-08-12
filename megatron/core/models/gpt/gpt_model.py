@@ -545,8 +545,10 @@ class GPTModel(LanguageModule):
 
         # Pass input_ids to decoder for hash-based MoE routing
         decoder_extra_block_kwargs = extra_block_kwargs or {}
+        #### FlagScale Add ####
         # When enable sequence parallel, hidden_states' shape is [S/TP, B, h], while the input_ids' shape is [B, S]. 
         # We do not split it here, to avoid later gathering and splitting, which is not efficient. The hash router should handle the input_ids' shape correctly.
+        #### FlagScale End ####
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
