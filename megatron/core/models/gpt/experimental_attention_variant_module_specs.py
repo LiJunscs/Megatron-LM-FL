@@ -192,7 +192,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
             #### FlagScale Add ####
             # DSv4 has one MQA KV head.  Keep its small v_head_dim projection
             # replicated while Q heads remain column-parallel across TP ranks.
-            #### FlagScal End #### 
+            #### FlagScale End #### 
             linear_kv_proj=backend.linear(),
             core_attention=core_attention,
             linear_proj=backend.row_parallel_linear(),
@@ -231,7 +231,7 @@ def get_experimental_attention_variant_module_spec(
 #### FlagScale Add #### Following functions are introduced in the next version of mcore.
 def get_transformer_layer_with_experimental_attention_variant_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
-) -> TransformerBlockSubmodules:
+) -> List[ModuleSpec]:
     """Build transformer block spec with experimental attention variants (e.g., linear attention).
 
     This function constructs a heterogeneous transformer block that supports mixing different

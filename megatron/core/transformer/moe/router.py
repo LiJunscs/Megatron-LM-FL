@@ -651,8 +651,9 @@ class TopKRouter(Router):
         # and get flattened to [s*b, h]. Transpose to match.
         ##### FlagScale Add #####
         # Split input_ids when enable sequence parallel. Note that it should be split in tensor_model_parallel_group, not expert_tensor_parallel_group.
+        input_ids = input_ids.T
         if self.config.sequence_parallel and parallel_state.get_tensor_model_parallel_world_size() > 1:
-            input_ids = scatter_to_sequence_parallel_region(input_ids.T, parallel_state.get_tensor_model_parallel_group())
+            input_ids = scatter_to_sequence_parallel_region(input_ids, parallel_state.get_tensor_model_parallel_group())
         flat_ids = input_ids.reshape(-1)  # [num_tokens]
         ##### FlagScale End #####
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
