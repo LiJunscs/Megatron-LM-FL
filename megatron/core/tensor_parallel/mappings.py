@@ -34,7 +34,8 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    input_ = input_.contiguous()
+    torch.distributed.all_reduce(input_, group=group)
 
     return input_
 

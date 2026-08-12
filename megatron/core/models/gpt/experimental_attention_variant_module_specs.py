@@ -227,8 +227,8 @@ def get_experimental_attention_variant_module_spec(
 ##########
 
 
-def get_transformer_block_with_experimental_attention_variant_spec(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+def get_transformer_layer_with_experimental_attention_variant_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> TransformerBlockSubmodules:
     """Build transformer block spec with experimental attention variants (e.g., linear attention).
 
@@ -262,8 +262,8 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         Currently only supports transformer_engine backend. Kitchen backend can be used as a
         wrapper with TE fallback for unsupported operations.
     """
-
-    backend = _get_backend_spec_provider(config=config)
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
 
     # Get attention patterns and specs
     experimental_attention_pattern = [0] * config.num_layers
@@ -341,6 +341,42 @@ def get_transformer_block_with_experimental_attention_variant_spec(
             )
         )
 
+    return layer_specs
+
+
+def get_transformer_block_with_experimental_attention_variant_spec(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> TransformerBlockSubmodules:
+    """Build transformer block spec with experimental attention variants (e.g., linear attention).
+
+    This function constructs a heterogeneous transformer block that supports mixing different
+    attention mechanisms (experimental vs standard) and MLP types (MoE vs dense) across layers.
+    **Note that, this API is a experimental API in the short term, and might be deprecated in the
+    future. In the long run, we will move to a new design that better support hybrid models.**
+
+    Constructing transformer layer specs by
+    `get_transformer_layer_with_experimental_attention_variant_spec` and then slicing the
+    layer specs to only include the layers that are built in this pipeline stage.
+
+    Args:
+        config: Transformer configuration containing model hyperparameters and feature flags.
+        vp_stage: Virtual pipeline stage index for interleaved pipeline parallelism.
+        pp_rank: Pipeline model parallel rank.
+
+    Returns:
+        TransformerBlockSubmodules containing per-layer specs and final layer norm.
+
+    Note:
+        Currently only supports transformer_engine backend. Kitchen backend can be used as a
+        wrapper with TE fallback for unsupported operations.
+    """
+
+    backend = _get_backend_spec_provider(config=config)
+
+    layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(
+        config=config, backend=backend
+    )
+
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     if config.pipeline_model_parallel_layout is not None:
         local_layer_ids = config.pipeline_model_parallel_layout.get_layer_id_list(
@@ -354,6 +390,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
+    rms_norm = config.normalization == "RMSNorm"
     gpt_decoder_block_spec = TransformerBlockSubmodules(
         layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
     )

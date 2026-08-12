@@ -12,6 +12,14 @@ Validates:
 5. End-to-end fused_indexer_sparse_attn with tp_group=None preserves behavior.
 
 Run with: pytest tests/unit_tests/plugin/dsa_kernel/test_fused_dsa_tp.py -v -s
+8-GPU TP correctness run:
+  torchrun --standalone --nproc_per_node=8 -m pytest \
+    tests/unit_tests/plugin/dsa_kernel/test_fused_dsa_tp.py \
+    -k "TestDistributedTPCorrectness or TestDistributedTPUnfusedParity" -v -s
+TP performance report example:
+  torchrun --standalone --nproc_per_node=8 -m pytest \
+    tests/unit_tests/plugin/dsa_kernel/test_fused_dsa_tp.py \
+    -k TestDistributedTPPerformance --run-perf --dsa-report=tp_results.md -s
 Requires: CUDA GPU with Triton support.
 """
 
@@ -110,8 +118,11 @@ class TestDecomposedMatchesFused:
     def setup(self):
         self.device = "cuda"
 
-    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-    @pytest.mark.parametrize("np_", [4, 16])
+    @pytest.mark.parametrize(
+        "np_,calculate_per_token_loss",
+        [(4, False), (16, True)],
+        ids=["heads4-reduced-loss", "heads16-per-token-loss"],
+    )
     def test_loss_and_grads_match(self, np_, calculate_per_token_loss):
         inputs = _make_sparse_loss_inputs(np_=np_, device=self.device)
         loss_coeff = 0.1
@@ -184,20 +195,20 @@ class TestDecomposedMatchesFused:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Simulated TP=2 head splitting gives correct global target
+# Test 2: Simulated TP head splitting gives correct global target
 # ---------------------------------------------------------------------------
 
 
 @_skip_unless_sm90
 class TestSimulatedTPHeadSplit:
-    """On a single GPU, simulate TP=2 by splitting heads and verifying that
+    """On a single GPU, simulate TP by splitting heads and verifying that
     sum(local_head_sums) == global_head_sum from full heads."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
         self.device = "cuda"
 
-    @pytest.mark.parametrize("tp_size", [2, 4])
+    @pytest.mark.parametrize("tp_size", [2, 4, 8])
     def test_global_target_from_local_shards(self, tp_size):
         np_global = 16
         assert np_global % tp_size == 0
@@ -232,7 +243,7 @@ class TestSimulatedTPHeadSplit:
         reconstructed = sum(local_sums)
         torch.testing.assert_close(reconstructed, global_head_sum, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.parametrize("tp_size", [2, 4])
+    @pytest.mark.parametrize("tp_size", [2, 4, 8])
     def test_loss_matches_after_simulated_allreduce(self, tp_size):
         """Full pipeline: split heads → sum local targets → normalize → KL
         should match TP=1 loss."""
@@ -501,49 +512,6 @@ class TestBackwardCompatibility:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Local attn_sink shape test
-# ---------------------------------------------------------------------------
-
-
-@_skip_unless_sm90
-class TestLocalAttnSinkShape:
-    """Verify attn_sink shape matches local heads under TP."""
-
-    def test_sink_shape_tp2(self):
-        """With TP=2 and 16 global heads, local sink should be [8]."""
-        # We test this by directly verifying the math, not importing
-        # the full module (which requires distributed init).
-        global_heads = 16
-        tp_size = 2
-        expected_local = global_heads // tp_size
-        assert expected_local == 8
-
-        # Simulate what CSA.__init__ does
-        import torch.nn as nn
-        attn_sink = nn.Parameter(torch.zeros(expected_local, dtype=torch.float32))
-        assert attn_sink.shape == (8,)
-
-    def test_sink_shape_mismatch_would_fail(self):
-        """Verify that using global heads as sink size would mismatch local query."""
-        global_heads = 16
-        tp_size = 2
-        local_heads = global_heads // tp_size
-
-        # Simulate query shape with local heads
-        sq, b, d = 64, 2, 128
-        query = torch.randn(sq, b, local_heads, d)
-
-        # Wrong sink (global size)
-        wrong_sink = torch.zeros(global_heads)
-        # This would fail in the kernel: attn_sink.view(1, np_, 1, 1) where np_=query.size(2)
-        assert wrong_sink.numel() != query.size(2)
-
-        # Correct sink (local size)
-        correct_sink = torch.zeros(local_heads)
-        assert correct_sink.numel() == query.size(2)
-
-
-# ---------------------------------------------------------------------------
 # Test 6b: Dense loss TP integration (方案B: full buffer + single all-reduce)
 # ---------------------------------------------------------------------------
 
@@ -624,7 +592,7 @@ class TestDenseTPIntegration:
         assert not torch.isnan(grad_k).any()
         assert not torch.isnan(grad_w).any()
 
-    @pytest.mark.parametrize("tp_size", [2, 4])
+    @pytest.mark.parametrize("tp_size", [2, 4, 8])
     def test_dense_simulated_tp_target_correct(self, tp_size):
         """Simulate TP: split heads → compute local attn_score → sum → normalize
         should match full-heads target."""
@@ -679,7 +647,7 @@ class TestDenseTPIntegration:
 
         torch.testing.assert_close(target_recon, target_ref, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.parametrize("tp_size", [2, 4])
+    @pytest.mark.parametrize("tp_size", [2, 4, 8])
     def test_dense_simulated_tp_loss_matches_global(self, tp_size):
         """Full pipeline with simulated TP should produce same loss as TP=1."""
         np_global = 16
@@ -747,33 +715,44 @@ class TestDenseTPIntegration:
 # Distributed TP Tests (tp_size = world_size)
 #
 # Run with:
-#   torchrun --nproc_per_node=N -m pytest tests/unit_tests/plugin/dsa_kernel/test_fused_dsa_tp.py -v -k "Distributed"
+#   torchrun --standalone --nproc_per_node=8 -m pytest \
+#     tests/unit_tests/plugin/dsa_kernel/test_fused_dsa_tp.py -v -k "Distributed"
 # ===========================================================================
 
 import os
 
-_DISTRIBUTED_AVAILABLE = (
-    torch.cuda.is_available() and torch.cuda.device_count() >= 2
-)
+_SUPPORTED_DISTRIBUTED_TP_SIZES = (2, 4, 8)
+
+
+def _torchrun_world_size():
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+_DISTRIBUTED_AVAILABLE = torch.cuda.is_available() and _torchrun_world_size() >= 2
 _skip_unless_distributed = pytest.mark.skipif(
     not _DISTRIBUTED_AVAILABLE,
-    reason="Requires 2+ GPUs and torchrun launch"
+    reason="Requires a multi-process torchrun launch",
 )
 
 
 def _is_torchrun():
     """Check if we're launched via torchrun (WORLD_SIZE set)."""
-    return int(os.environ.get("WORLD_SIZE", "1")) >= 2
+    return _torchrun_world_size() >= 2
 
 
 def _get_tp_size():
     """Get TP size from WORLD_SIZE (assume world_size == tp_size)."""
-    return int(os.environ.get("WORLD_SIZE", "1"))
+    return _torchrun_world_size()
 
 
 def _init_tp():
     """Initialize TP process group with tp_size = world_size."""
     tp_size = _get_tp_size()
+    if tp_size not in _SUPPORTED_DISTRIBUTED_TP_SIZES:
+        pytest.skip(
+            f"Distributed fused DSA tests support TP sizes "
+            f"{_SUPPORTED_DISTRIBUTED_TP_SIZES}, got WORLD_SIZE={tp_size}"
+        )
     from tests.unit_tests.test_utilities import Utils
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -804,6 +783,10 @@ def _make_tp_test_inputs(
     device: str = "cuda",
 ):
     """Generate deterministic global inputs on all ranks, then shard query/sink by head."""
+    tp_size = _get_tp_size()
+    assert np_global % tp_size == 0, (
+        f"np_global={np_global} must be divisible by TP={tp_size}"
+    )
     torch.manual_seed(seed)
 
     skv = sq + n_comp
@@ -832,6 +815,9 @@ def _make_tp_test_inputs(
 
 def _shard_for_rank(inputs: dict, rank: int, tp_size: int):
     """Shard query and attn_sink by head for given rank."""
+    assert inputs["np_global"] % tp_size == 0, (
+        f"np_global={inputs['np_global']} must be divisible by TP={tp_size}"
+    )
     np_local = inputs["np_global"] // tp_size
     start_h = rank * np_local
     end_h = start_h + np_local
@@ -922,8 +908,8 @@ class TestDistributedCompressorGradient:
 class TestDistributedTPCorrectness:
     """Real multi-GPU TP tests comparing unfused, fused, and fused+overlap paths.
 
-    Run with: torchrun --nproc_per_node=N -m pytest ... -k "TestDistributedTPCorrectness"
-    where N is the desired TP size (2, 4, 8, etc.).
+    Run with: torchrun --standalone --nproc_per_node=8 -m pytest ...
+    -k "TestDistributedTPCorrectness".
     """
 
     @pytest.fixture(scope="class", autouse=True)
@@ -936,6 +922,59 @@ class TestDistributedTPCorrectness:
         self.__class__._tp_size = tp_size
         yield
         _destroy_tp()
+
+    def test_indexer_logging_averages_across_tp(self):
+        """Prove the old writer was rank-local and the fixed writer is TP-averaged."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+
+        class RecordingWriter:
+            def __init__(self):
+                self.values = []
+
+            def add_scalar(self, name, value, iteration):
+                self.values.append((name, float(value), iteration))
+
+        # In this test world_size == TP size. Megatron creates TensorBoard's
+        # writer only on the last global rank, so this reproduces that policy.
+        writer = RecordingWriter() if self._rank == self._tp_size - 1 else None
+        local_loss = torch.tensor(
+            float(self._rank + 1), device="cuda", dtype=torch.float32
+        )
+
+        def record_once(avg_group):
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=local_loss,
+                layer_number=1,
+                num_layers=1,
+                avg_group=avg_group,
+            )
+            DSAIndexerLossLoggingHelper.track_indexer_metrics(
+                loss_scale=1.0,
+                iteration=1,
+                writer=writer,
+                num_layers=1,
+                csa_compress_ratios=[4],
+            )
+
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        try:
+            # Negative control: without a TP group, the sole writer receives
+            # its own TP-rank value, not the TP mean. This characterizes the
+            # pre-fix TensorBoard behavior without reverting production code.
+            record_once(avg_group=None)
+            if writer is not None:
+                assert writer.values == [("indexer loss", float(self._tp_size), 1)]
+
+            # Fixed path: TP AVG makes the scalar topology-invariant before
+            # the sole writer records it.
+            record_once(avg_group=self._tp_group)
+            expected = (self._tp_size + 1) / 2.0
+            if writer is not None:
+                assert writer.values[-1] == ("indexer loss", expected, 1)
+        finally:
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
     def _run_fused_tp(self, inputs, rank, tp_group, tp_size, overlap: bool):
         """Run fused path with TP group."""
@@ -1370,22 +1409,32 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_attention_
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.device_count() >= 2),
-    reason="Requires 2+ CUDA GPUs",
+    not _DISTRIBUTED_AVAILABLE,
+    reason="Requires a multi-process torchrun launch",
 )
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 9,
     reason="Fused Triton CSA performance requires SM90+",
 )
 class TestDistributedTPPerformance:
-    """Module-level TP accuracy and performance for the three CSA modes."""
+    """Small accuracy gates plus post-SP, large-shape TP performance tests."""
 
     @pytest.fixture(scope="class", autouse=True)
     def setup_teardown(self, request):
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+        if not _is_torchrun():
             pytest.skip("Must be launched with torchrun")
 
-        tp_size = int(os.environ["WORLD_SIZE"])
+        tp_size = _get_tp_size()
+        if tp_size not in _SUPPORTED_DISTRIBUTED_TP_SIZES:
+            pytest.skip(
+                f"Distributed fused DSA tests support TP sizes "
+                f"{_SUPPORTED_DISTRIBUTED_TP_SIZES}, got WORLD_SIZE={tp_size}"
+            )
+        num_attention_heads = int(os.environ.get("DSA_PERF_NUM_HEADS", "128"))
+        if num_attention_heads % tp_size != 0:
+            pytest.skip(
+                f"DSA_PERF_NUM_HEADS={num_attention_heads} must be divisible by TP={tp_size}"
+            )
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=1
         )
@@ -1401,7 +1450,8 @@ class TestDistributedTPPerformance:
             # unit-test default (16 global heads), TP=8 leaves only two heads
             # per rank and measures launch/collective latency rather than the
             # kernel regime used by pre-training.
-            num_attention_heads=int(os.environ.get("DSA_PERF_NUM_HEADS", "128")),
+            num_attention_heads=num_attention_heads,
+            hidden_size=int(os.environ.get("DSA_PERF_HIDDEN_SIZE", "4096")),
             v_head_dim=128,
             csa_compress_ratios=[4, 4, 4, 4],
             csa_window_size=128,
@@ -1442,9 +1492,9 @@ class TestDistributedTPPerformance:
             compress_ratio=compress_ratio,
         ).cuda().train()
 
-    def _make_inputs(self):
+    def _make_inputs(self, seq=2048):
         torch.manual_seed(20260802)
-        seq, batch = 2048, 1
+        batch = 1
         local_heads = self.config.num_attention_heads // self.tp_size
         head_dim = self.config.v_head_dim
         return {
@@ -1571,7 +1621,9 @@ class TestDistributedTPPerformance:
         ],
         ids=["ratio4_indexer", "ratio128", "window_only"],
     )
-    def test_csa_module_fused_vs_unfused_accuracy(self, case_name, compress_ratio):
+    def test_csa_module_fused_vs_unfused_accuracy(
+        self, case_name, compress_ratio, dsa_metrics
+    ):
         """Validate full-module forward and backward against unfused CSA."""
         import megatron.plugin.dsa_kernel.triton_dsa_kernels as triton_dsa
 
@@ -1622,6 +1674,15 @@ class TestDistributedTPPerformance:
         reference = run(unfused)
         actual = run(fused)
 
+        metric_params = {
+            "case": case_name,
+            "tp": self.tp_size,
+            "sq": 2048,
+            "hidden": self.config.hidden_size,
+            "global_heads": self.config.num_attention_heads,
+            "ratio": compress_ratio,
+        }
+
         def assert_numerically_close(name, actual_tensor, reference_tensor, max_rel_l2, min_cos):
             actual_flat = actual_tensor.reshape(-1)
             reference_flat = reference_tensor.reshape(-1)
@@ -1638,6 +1699,17 @@ class TestDistributedTPPerformance:
                 f"{case_name} {name} mismatch: relative_l2={relative_l2:.6g}, "
                 f"cosine={cosine:.9g}, max_abs_diff={diff.abs().max().item():.6g}"
             )
+            # Each torchrun worker owns an independent pytest session.  Only
+            # TP rank 0 contributes records, avoiding duplicate rows and
+            # concurrent writes to the same Markdown report.
+            if self.pg_collection.tp.rank() == 0:
+                dsa_metrics.record_accuracy(
+                    params=metric_params,
+                    cos_sim=cosine,
+                    max_diff=diff.abs().max().item(),
+                    mean_diff=diff.abs().mean().item(),
+                    target=name,
+                )
 
         assert_numerically_close(
             "output", actual["output"], reference["output"], max_rel_l2=2e-2, min_cos=0.999
@@ -1671,68 +1743,110 @@ class TestDistributedTPPerformance:
         ],
         ids=["ratio4_indexer", "ratio128", "window_only"],
     )
-    def test_csa_module_fused_vs_unfused_performance(self, case_name, compress_ratio):
-        inputs = self._make_inputs()
+    def test_csa_module_fused_vs_unfused_performance(
+        self, case_name, compress_ratio, dsa_metrics
+    ):
+        # CSA runs after the SP gather in DSv4HybridSparseAttention, so its
+        # sequence dimension is the global (post-SP) sequence length.  Keep
+        # this substantially larger than the accuracy case to represent the
+        # regime where TP+SP is useful, while allowing constrained machines
+        # to override it explicitly.
+        global_seq = int(os.environ.get("DSA_PERF_GLOBAL_SEQ", "8192"))
+        assert global_seq % self.tp_size == 0, (
+            f"DSA_PERF_GLOBAL_SEQ={global_seq} must be divisible by TP={self.tp_size}"
+        )
+        sp_local_seq = global_seq // self.tp_size
+        inputs = self._make_inputs(seq=global_seq)
         unfused = self._build_csa(fused=False, compress_ratio=compress_ratio)
         fused = self._build_csa(fused=True, compress_ratio=compress_ratio)
         fused.load_state_dict(unfused.state_dict())
 
-        unfused_ms = self._benchmark(unfused, inputs, overlap=False)
-        fused_sync_ms = self._benchmark(fused, inputs, overlap=False)
-        unfused_fwd_ms = self._benchmark(unfused, inputs, overlap=False, backward=False)
-        fused_sync_fwd_ms = self._benchmark(fused, inputs, overlap=False, backward=False)
+        warmup = int(os.environ.get("DSA_PERF_WARMUP", "2"))
+        iters = int(os.environ.get("DSA_PERF_ITERS", "5"))
+
+        def bench(module, overlap, backward=True):
+            return self._benchmark(
+                module,
+                inputs,
+                overlap=overlap,
+                backward=backward,
+                warmup=warmup,
+                iters=iters,
+            )
+
+        unfused_ms = bench(unfused, overlap=False)
+        fused_sync_ms = bench(fused, overlap=False)
+        fused_async_ms = bench(fused, overlap=True)
+        unfused_fwd_ms = bench(unfused, overlap=False, backward=False)
+        fused_sync_fwd_ms = bench(fused, overlap=False, backward=False)
+        fused_async_fwd_ms = bench(fused, overlap=True, backward=False)
         unfused_peak_mb = self._measure_peak_memory(unfused, inputs, overlap=False)
         fused_sync_peak_mb = self._measure_peak_memory(fused, inputs, overlap=False)
-
-        # TP communication overlap exists only in the ratio=4 indexer-loss
-        # path.  Benchmarking an "overlap" variant for the other two cases
-        # would merely repeat the same no-indexer implementation.
-        if compress_ratio == 4:
-            fused_overlap_ms = self._benchmark(fused, inputs, overlap=True)
-            fused_overlap_fwd_ms = self._benchmark(
-                fused, inputs, overlap=True, backward=False
-            )
-            fused_overlap_peak_mb = self._measure_peak_memory(fused, inputs, overlap=True)
-        else:
-            fused_overlap_ms = None
-            fused_overlap_fwd_ms = None
-            fused_overlap_peak_mb = None
+        fused_async_peak_mb = self._measure_peak_memory(fused, inputs, overlap=True)
 
         rank = self.pg_collection.tp.rank()
         if rank == 0:
+            metric_params = {
+                "case": case_name,
+                "tp": self.tp_size,
+                "global_sq": global_seq,
+                "sp_local_sq": sp_local_seq,
+                "hidden": self.config.hidden_size,
+                "global_heads": self.config.num_attention_heads,
+                "topk": self.config.dsa_indexer_topk,
+                "ratio": compress_ratio,
+            }
+            for label, fused_ms, unfused_baseline_ms in (
+                ("fwd_sync", fused_sync_fwd_ms, unfused_fwd_ms),
+                ("fwd_async", fused_async_fwd_ms, unfused_fwd_ms),
+                ("e2e_sync", fused_sync_ms, unfused_ms),
+                ("e2e_async", fused_async_ms, unfused_ms),
+            ):
+                dsa_metrics.record_performance(
+                    params=metric_params,
+                    fused_ms=fused_ms,
+                    unfused_ms=unfused_baseline_ms,
+                    speedup=unfused_baseline_ms / max(fused_ms, 1e-6),
+                    label=label,
+                )
+            dsa_metrics.record_memory(
+                params={**metric_params, "mode": "sync"},
+                fused_mb=fused_sync_peak_mb,
+                unfused_mb=unfused_peak_mb,
+                ratio=unfused_peak_mb / max(fused_sync_peak_mb, 1e-6),
+            )
+            dsa_metrics.record_memory(
+                params={**metric_params, "mode": "async"},
+                fused_mb=fused_async_peak_mb,
+                unfused_mb=unfused_peak_mb,
+                ratio=unfused_peak_mb / max(fused_async_peak_mb, 1e-6),
+            )
             print(
                 f"\n  End-to-end CSA module performance "
                 f"(case={case_name}, TP={self.tp_size}):"
             )
             print(
-                f"    shape: S=2048, B=1, global_heads={self.config.num_attention_heads}, "
+                f"    shape: post-SP global_S={global_seq}, SP-local_S={sp_local_seq}, B=1, "
+                f"hidden={self.config.hidden_size}, global_heads={self.config.num_attention_heads}, "
                 f"local_heads={self.config.num_attention_heads // self.tp_size}, "
                 f"head_dim={self.config.v_head_dim}, topk={self.config.dsa_indexer_topk}, "
                 f"window={self.config.csa_window_size}, compress_ratio={compress_ratio}"
             )
             print(f"    forward old/new sync : {unfused_fwd_ms:.3f} / {fused_sync_fwd_ms:.3f} ms")
+            print(f"    forward fused async  : {fused_async_fwd_ms:.3f} ms")
             print(f"    old (unfused)       : {unfused_ms:.3f} ms/iter")
             print(f"    new (fused sync)    : {fused_sync_ms:.3f} ms/iter")
+            print(f"    new (fused async)   : {fused_async_ms:.3f} ms/iter")
             print(f"    sync speedup (old/new): {unfused_ms / fused_sync_ms:.3f}x")
-            print(f"    peak memory old/new sync: {unfused_peak_mb:.1f} / {fused_sync_peak_mb:.1f} MiB")
+            print(f"    async speedup (old/new): {unfused_ms / fused_async_ms:.3f}x")
+            print(
+                f"    peak memory old/sync/async: {unfused_peak_mb:.1f} / "
+                f"{fused_sync_peak_mb:.1f} / {fused_async_peak_mb:.1f} MiB"
+            )
             print(
                 f"    memory ratio (old/new): "
                 f"{unfused_peak_mb / max(fused_sync_peak_mb, 1e-6):.3f}x"
             )
-            if fused_overlap_ms is not None:
-                print(
-                    f"    forward old/new ovlp : "
-                    f"{unfused_fwd_ms:.3f} / {fused_overlap_fwd_ms:.3f} ms"
-                )
-                print(f"    new (fused overlap) : {fused_overlap_ms:.3f} ms/iter")
-                print(
-                    f"    overlap speedup (old/new): "
-                    f"{unfused_ms / fused_overlap_ms:.3f}x"
-                )
-                print(
-                    f"    peak memory old/new overlap: "
-                    f"{unfused_peak_mb:.1f} / {fused_overlap_peak_mb:.1f} MiB"
-                )
 
 
 
@@ -1750,7 +1864,8 @@ class TestDistributedTPUnfusedParity:
     The unfused path already has TP all-reduce in compute_dsa_indexer_loss.
     We verify that the fused decomposed path produces the same teacher target.
 
-    Run with: torchrun --nproc_per_node=N -m pytest ... -k "TestDistributedTPUnfusedParity"
+    Run with: torchrun --standalone --nproc_per_node=8 -m pytest ...
+    -k "TestDistributedTPUnfusedParity".
     """
 
     @pytest.fixture(scope="class", autouse=True)

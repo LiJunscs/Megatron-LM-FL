@@ -1,14 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import os
+
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from enum import Enum
+from typing import NoReturn, Optional, Sequence, Union
 
 import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -26,11 +28,11 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
-    deprecated,
     get_pg_size,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -54,8 +56,36 @@ def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
 
-class _DSv4TPRopeGather(torch.autograd.Function):
-    """Overlap Q RoPE with a sequence-parallel all-gather."""
+class _DSv4SPBackwardPolicy(Enum):
+    """Backward ownership contract for one field in the packed SP gather.
+
+    ``SCATTER`` means every TP rank already owns the complete gathered
+    gradient, ``REDUCE_SCATTER`` means ranks own partial contributions that
+    must be SUMed, and ``NO_GRAD`` declares a detached forward-only field.
+    """
+
+    SCATTER = "scatter"
+    REDUCE_SCATTER = "reduce_scatter"
+    NO_GRAD = "no_grad"
+
+
+@dataclass(frozen=True)
+class _DSv4SPGatherField:
+    """A named tensor and its backward contract in the packed SP gather."""
+
+    name: str
+    tensor: torch.Tensor
+    backward_policy: _DSv4SPBackwardPolicy
+
+
+class _DSv4SPRopeGather(torch.autograd.Function):
+    """Overlap Q RoPE with the DSv4 sequence-parallel all-gather.
+
+    Fields with different gradient ownership are packed into one forward
+    all-gather. Backward applies the explicit policy of each field while
+    coalescing every REDUCE_SCATTER field into one collective. Non-SP TP
+    execution bypasses this mapping entirely.
+    """
 
     @staticmethod
     def forward(
@@ -70,7 +100,7 @@ class _DSv4TPRopeGather(torch.autograd.Function):
         cp_rank,
         cp_size,
         tp_group,
-        async_communication,
+        field_specs,
         remove_interleaving,
     ):
         world_size = tp_group.size()
@@ -81,7 +111,7 @@ class _DSv4TPRopeGather(torch.autograd.Function):
             gathered,
             local_tensor.contiguous(),
             group=tp_group,
-            async_op=async_communication,
+            async_op=True,
         )
 
         # Reuse the fused RoPE autograd implementation and its saved context.
@@ -102,78 +132,85 @@ class _DSv4TPRopeGather(torch.autograd.Function):
         if work is not None:
             work.wait()
         ctx.tp_group = tp_group
-        ctx.async_communication = async_communication
+        ctx.field_specs = field_specs
         return query, gathered
 
     @staticmethod
     def backward(ctx, grad_query, grad_gathered):
-        local_grad = grad_gathered.new_empty(
-            grad_gathered.size(0) // ctx.tp_group.size(), *grad_gathered.shape[1:]
-        )
-        work = torch.distributed.reduce_scatter_tensor(
-            local_grad,
-            grad_gathered.contiguous(),
-            group=ctx.tp_group,
-            async_op=ctx.async_communication,
-        )
+        tp_size = ctx.tp_group.size()
+        tp_rank = ctx.tp_group.rank()
+        assert grad_gathered.size(0) % tp_size == 0
+        local_sequence_length = grad_gathered.size(0) // tp_size
+        field_widths = [width for _, width, _ in ctx.field_specs]
+        assert sum(field_widths) == grad_gathered.size(-1)
+        gathered_field_grads = torch.split(grad_gathered, field_widths, dim=-1)
+        local_field_grads = [None] * len(ctx.field_specs)
+
+        reduce_scatter_indices = []
+        reduce_scatter_grads = []
+        sequence_start = tp_rank * local_sequence_length
+        for index, ((_, _, policy), field_grad) in enumerate(
+            zip(ctx.field_specs, gathered_field_grads)
+        ):
+            if policy is _DSv4SPBackwardPolicy.SCATTER:
+                local_field_grads[index] = field_grad.narrow(
+                    0, sequence_start, local_sequence_length
+                ).contiguous()
+            elif policy is _DSv4SPBackwardPolicy.REDUCE_SCATTER:
+                reduce_scatter_indices.append(index)
+                reduce_scatter_grads.append(field_grad)
+            elif policy is _DSv4SPBackwardPolicy.NO_GRAD:
+                local_field_grads[index] = field_grad.new_zeros(
+                    local_sequence_length, *field_grad.shape[1:]
+                )
+            else:
+                raise AssertionError(f"Unsupported DSv4 SP backward policy: {policy}")
+
+        work = None
+        local_reduced_grad = None
+        if reduce_scatter_grads:
+            gathered_reduced_grad = torch.cat(reduce_scatter_grads, dim=-1)
+            local_reduced_grad = gathered_reduced_grad.new_empty(
+                local_sequence_length, *gathered_reduced_grad.shape[1:]
+            )
+            work = torch.distributed.reduce_scatter_tensor(
+                local_reduced_grad,
+                gathered_reduced_grad.contiguous(),
+                group=ctx.tp_group,
+                async_op=True,
+            )
         grad_q = _FusedMLARoPEInplace.backward(ctx, grad_query)[0]
         if work is not None:
             work.wait()
-        return grad_q, local_grad, None, None, None, None, None, None, None, None, None, None
+        if local_reduced_grad is not None:
+            reduced_widths = [field_widths[index] for index in reduce_scatter_indices]
+            for index, field_grad in zip(
+                reduce_scatter_indices,
+                torch.split(local_reduced_grad, reduced_widths, dim=-1),
+            ):
+                local_field_grads[index] = field_grad
 
-
-def _dsv4_tp_rope_gather(
-    q,
-    local_tensor,
-    cos,
-    sin,
-    nope_dim,
-    emb_dim,
-    cu_seqlens_q,
-    cp_rank,
-    cp_size,
-    tp_group,
-    async_communication=True,
-    remove_interleaving=True,
-):
-    if not async_communication:
-        return _deprecated_dsv4_tp_rope_gather_non_overlap(
-            q,
-            local_tensor,
-            cos,
-            sin,
-            nope_dim,
-            emb_dim,
-            cu_seqlens_q,
-            cp_rank,
-            cp_size,
-            tp_group,
-            remove_interleaving,
+        assert all(field_grad is not None for field_grad in local_field_grads)
+        local_grad = torch.cat(local_field_grads, dim=-1)
+        return (
+            grad_q,
+            local_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
-    return _DSv4TPRopeGather.apply(
-        q,
-        local_tensor,
-        cos,
-        sin,
-        nope_dim,
-        emb_dim,
-        cu_seqlens_q,
-        cp_rank,
-        cp_size,
-        tp_group,
-        async_communication,
-        remove_interleaving,
-    )
 
 
-@deprecated(
-    version="0.0.0",
-    alternative="_dsv4_tp_rope_gather",
-    reason="Temporary non-overlap performance baseline.",
-)
-def _deprecated_dsv4_tp_rope_gather_non_overlap(
+def _dsv4_sp_rope_gather(
     q,
-    local_tensor,
+    fields: Sequence[_DSv4SPGatherField],
     cos,
     sin,
     nope_dim,
@@ -184,7 +221,24 @@ def _deprecated_dsv4_tp_rope_gather_non_overlap(
     tp_group,
     remove_interleaving=True,
 ):
-    return _DSv4TPRopeGather.apply(
+    assert fields, "DSv4 SP gather requires at least one named field"
+    field_names = [field.name for field in fields]
+    assert len(field_names) == len(set(field_names)), (
+        f"DSv4 SP gather field names must be unique: {field_names}"
+    )
+    leading_shape = fields[0].tensor.shape[:-1]
+    for field in fields:
+        assert field.tensor.shape[:-1] == leading_shape, (
+            f"DSv4 SP gather field {field.name!r} has leading shape "
+            f"{field.tensor.shape[:-1]}, expected {leading_shape}"
+        )
+        assert field.tensor.size(-1) > 0, field.name
+
+    local_tensor = torch.cat([field.tensor for field in fields], dim=-1)
+    field_specs = tuple(
+        (field.name, field.tensor.size(-1), field.backward_policy) for field in fields
+    )
+    query, gathered = _DSv4SPRopeGather.apply(
         q,
         local_tensor,
         cos,
@@ -195,9 +249,19 @@ def _deprecated_dsv4_tp_rope_gather_non_overlap(
         cp_rank,
         cp_size,
         tp_group,
-        False,
+        field_specs,
         remove_interleaving,
     )
+
+    gathered_fields = torch.split(
+        gathered, [field.tensor.size(-1) for field in fields], dim=-1
+    )
+    named_gathered_fields = {}
+    for field, gathered_field in zip(fields, gathered_fields):
+        if field.backward_policy is _DSv4SPBackwardPolicy.NO_GRAD:
+            gathered_field = gathered_field.detach()
+        named_gathered_fields[field.name] = gathered_field
+    return query, named_gathered_fields
 
 
 @dataclass
@@ -212,7 +276,6 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_kv_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
-
 
 class DSv4HybridAttention(Attention):
     """DeepSeek-v4 Hybrid Attention layer."""
@@ -352,7 +415,18 @@ class DSv4HybridAttention(Attention):
             device=torch.cuda.current_device(),
             dtype=self.config.params_dtype,
         )
-        self.config.init_method(_linear_o_group_proj)
+        # This parameter is TP-sharded along its group/output axis.  Initialize
+        # it from the model-parallel RNG stream so TP ranks receive distinct
+        # local shards.  Forking also restores the default/DP RNG afterwards,
+        # preventing this TP-size-dependent tensor from shifting subsequent
+        # replicated parameter initialization (notably compressor ``ape``).
+        rng_tracker = get_cuda_rng_tracker()
+        assert rng_tracker.is_initialized(), (
+            "The CUDA RNG tracker must be initialized before constructing "
+            "DSv4HybridAttention.linear_o_group_proj"
+        )
+        with rng_tracker.fork():
+            self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
         set_tensor_model_parallel_attributes(
             self.linear_o_group_proj, is_parallel=True, dim=0, stride=1
@@ -448,18 +522,22 @@ class DSv4HybridAttention(Attention):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value, q_compressed, gathered_hidden_states = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
+        query, key, value, q_compressed, gathered_hidden_states = (
+            self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
         )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
-        value = value.contiguous()
+        # DSv4's single MQA tensor is shared by key and value. Preserve that
+        # alias instead of materializing the same contiguous tensor twice.
+        value = key
 
         # ==================================
         # core attention computation
@@ -822,33 +900,46 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                tp_sp = self.config.sequence_parallel and self.pg_collection.tp.size() > 1
-                if tp_sp:
+                sp_enabled = (
+                    self.config.sequence_parallel and self.pg_collection.tp.size() > 1
+                )
+                if sp_enabled:
                     assert packed_seq_params is None, (
-                        "Packed sequence is not supported by the deprecated DSv4 TP overlap path"
+                        "Packed sequence is not supported by the DSv4 SP overlap path"
                     )
-                    # KV projection output is consumed immediately after this gather.
-                    # hidden_states and q_compressed are also gathered because CSA uses
-                    # the full hidden sequence and its indexer uses the full compressed Q.
-                    split_sizes = [hidden_states.size(-1), kv.size(-1), q_compressed.size(-1)]
-                    local_tensor = torch.cat([hidden_states, kv, q_compressed], dim=-1)
-                    async_communication = os.environ.get("DSV4_TP_ASYNC_COMM", "0") == "1"
-                    query, gathered = _dsv4_tp_rope_gather(
-                        q,
-                        local_tensor,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        self.config.qk_head_dim,
-                        self.config.qk_pos_emb_head_dim,
-                        cu_seqlens_q,
-                        cp_rank,
-                        cp_size,
-                        self.pg_collection.tp,
-                        async_communication=async_communication,
+                    # Gather the complete sequence for the replicated CSA/indexer
+                    # while declaring each field's backward ownership explicitly.
+                    query, gathered = _dsv4_sp_rope_gather(
+                        q=q,
+                        fields=(
+                            _DSv4SPGatherField(
+                                "hidden_states",
+                                hidden_states,
+                                _DSv4SPBackwardPolicy.SCATTER,
+                            ),
+                            _DSv4SPGatherField(
+                                "kv",
+                                kv,
+                                _DSv4SPBackwardPolicy.REDUCE_SCATTER,
+                            ),
+                            _DSv4SPGatherField(
+                                "q_compressed",
+                                q_compressed,
+                                _DSv4SPBackwardPolicy.NO_GRAD,
+                            ),
+                        ),
+                        cos=rotary_pos_cos,
+                        sin=rotary_pos_sin,
+                        nope_dim=self.config.qk_head_dim,
+                        emb_dim=self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
+                        tp_group=self.pg_collection.tp,
                     )
-                    hidden_states, kv, q_compressed = torch.split(
-                        gathered, split_sizes, dim=-1
-                    )
+                    hidden_states = gathered["hidden_states"]
+                    kv = gathered["kv"]
+                    q_compressed = gathered["q_compressed"]
                 else:
                     query = fused_mla_rope_inplace(
                         q,
@@ -874,8 +965,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_size,
                     remove_interleaving=True,
                 )
-                key = kv
-                value = kv
             else:
                 kv = self.kv_layernorm(kv)
                 q_len = q.size()[0]
@@ -928,12 +1017,16 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
-                key = kv
-                value = kv
 
-            query = query.contiguous()
-            key = key.contiguous()
-            value = value.contiguous()
+            if self.pg_collection.tp.size() > 1 and not self.config.sequence_parallel:
+                # The single MQA KV head is replicated but consumed by TP-local
+                # query heads. Non-SP bypasses _DSv4SPRopeGather, so SUM the
+                # local-head dKV contributions explicitly during backward.
+                kv = tensor_parallel.copy_to_tensor_model_parallel_region(
+                    kv, group=self.pg_collection.tp
+                )
+
+            key = value = kv
 
             return query, key, value, q_compressed, hidden_states
 

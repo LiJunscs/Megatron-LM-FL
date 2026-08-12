@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest import mock
 from unittest.mock import patch
 
 import pytest
@@ -8,10 +9,24 @@ import torch.nn.functional as F
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.training.arguments import parse_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import set_args
+from megatron.training.training import get_model
+from megatron.training.utils import unwrap_model
+from tests.unit_tests.dist_checkpointing import (
+    TempNamedDir,
+    init_basic_mock_args,
+    init_checkpointing_mock_args,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -166,6 +181,16 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
 
+        # Q is head-sharded, while the single MQA KV projection is duplicated.
+        assert attn.num_local_q_heads == config.num_attention_heads
+        assert attn.query_projection_size == config.num_attention_heads * config.v_head_dim
+        assert attn.query_projection_size_per_partition == (
+            config.num_attention_heads * config.v_head_dim
+        )
+        assert attn.linear_q_up_proj.weight.shape[0] == attn.query_projection_size_per_partition
+        assert attn.linear_kv_proj.weight.shape[0] == config.v_head_dim
+        assert not getattr(attn.linear_kv_proj.weight, 'tensor_model_parallel', False)
+
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
         torch.manual_seed(_SEED)
@@ -176,6 +201,21 @@ class TestDSv4HybridAttentionConstructor:
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
         assert attn.q_head_dim == config.v_head_dim
+
+    def test_compressor_owns_tp_output_gradient_contract(self):
+        """Main and indexer compressors expose different TP backward semantics."""
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config()
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        attn = _build_attention(config, layer_number=2, pg_collection=pg)
+
+        core = attn.core_attention
+        assert core.compress_ratio == 4
+        assert core.compressor.reduce_output_grad_across_tp
+        assert core.indexer is not None
+        assert not core.indexer.compressor.reduce_output_grad_across_tp
 
     @pytest.mark.parametrize("layer_number", [1, 2, 3, 4])
     def test_rope_base_varies_with_compress_ratio(self, layer_number):
@@ -357,7 +397,7 @@ class TestDSv4HybridQKV:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
         ).cuda()
 
-        q, k, v, q_compressed, kv_compressed = attn.get_query_key_value_tensors(hidden)
+        q, k, v, q_compressed, gathered_hidden_states = attn.get_query_key_value_tensors(hidden)
 
         n_heads = self.config.num_attention_heads
         v_dim = self.config.v_head_dim
@@ -366,10 +406,9 @@ class TestDSv4HybridQKV:
         # key and value are single-head (MQA-style) with an extra head dim
         assert k.shape[-1] == v_dim
         assert v.shape[-1] == v_dim
-        ##### FlagScale Begin #####
         assert q_compressed.shape[:2] == (seq_len, batch_size)
         assert q_compressed.requires_grad
-        ##### FlagScale End #####
+        assert gathered_hidden_states.shape == hidden.shape
 
     def test_key_equals_value(self):
         """In the wkv path, key and value should be the same tensor."""
@@ -669,3 +708,503 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+def _load_tp1_parameters_into_tpn(module, tp1_parameters, tp_rank, tp_size):
+    """Load a TP1 parameter snapshot into a TP-sharded module."""
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            source = tp1_parameters[name].to(device=param.device, dtype=param.dtype)
+            if tuple(source.shape) == tuple(param.shape):
+                param.copy_(source)
+                continue
+
+            assert getattr(param, 'tensor_model_parallel', False), (
+                f"{name}: shape changed from {tuple(source.shape)} to {tuple(param.shape)} "
+                "without tensor_model_parallel metadata"
+            )
+            partition_dim = getattr(param, 'partition_dim')
+            local_width = param.shape[partition_dim]
+            assert source.shape[partition_dim] == local_width * tp_size
+            param.copy_(source.narrow(partition_dim, tp_rank * local_width, local_width))
+
+
+def _gather_sequence(tensor, tp_group):
+    gathered = torch.empty(
+        tensor.shape[0] * tp_group.size(),
+        *tensor.shape[1:],
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    torch.distributed.all_gather_into_tensor(gathered, tensor.contiguous(), group=tp_group)
+    return gathered
+
+
+def _relative_l2_error(actual, expected):
+    numerator = torch.linalg.vector_norm(actual.float() - expected.float())
+    denominator = torch.linalg.vector_norm(expected.float()).clamp_min(1e-12)
+    return (numerator / denominator).item()
+
+
+def _is_first_data_parallel_replica():
+    """Keep distributed diagnostics on one DP replica."""
+    return parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+
+
+def _format_grad_metrics(actual, reference):
+    """Compact precision metrics used only in failure messages."""
+    actual_flat = actual.float().reshape(-1)
+    reference_flat = reference.float().reshape(-1)
+    reference_norm = torch.linalg.vector_norm(reference_flat).clamp_min(1e-12)
+    cosine_similarity = F.cosine_similarity(actual_flat, reference_flat, dim=0).item()
+    least_squares_scale = (
+        torch.dot(actual_flat, reference_flat)
+        / torch.dot(reference_flat, reference_flat).clamp_min(1e-12)
+    ).item()
+    norm_ratio = (torch.linalg.vector_norm(actual_flat) / reference_norm).item()
+    relative_l2 = (
+        torch.linalg.vector_norm(actual_flat - reference_flat) / reference_norm
+    ).item()
+    max_abs = (actual_flat - reference_flat).abs().max().item()
+    minimum_tolerance = (
+        (actual_flat - reference_flat).abs() / (1.0 + reference_flat.abs())
+    ).max().item()
+    return (
+        f"cosine_similarity={cosine_similarity:.9f}; "
+        f"least_squares_scale={least_squares_scale:.9f}; "
+        f"norm_ratio={norm_ratio:.9f}; relative_l2={relative_l2:.9e}; "
+        f"max_abs={max_abs:.9e}; minimum_atol_eq_rtol={minimum_tolerance:.9e}"
+    )
+
+
+def _tracked_indexer_loss(layer_number):
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossLoggingHelper,
+    )
+
+    return DSAIndexerLossLoggingHelper.tracker['values'][layer_number - 1].detach().clone()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+@pytest.mark.experimental
+@pytest.mark.parametrize(
+    "apply_dsa_kernel_fusion", [False, True], ids=["unfused-dsa", "fused-dsa"]
+)
+@pytest.mark.parametrize(
+    ("tp", "sp"),
+    [
+        (2, False),  # TP w/o SP
+        (2, True),  # TP w/ SP
+        (4, False),  # TP w/o SP
+        (4, True),  # TP w/ SP
+        (8, False),  # TP w/o SP
+        (8, True),  # TP w/ SP
+    ],
+)
+def test_parallel_dsv4_hybrid_sparse_attention_correctness(
+    tmp_path_dist_ckpt, tp, sp, apply_dsa_kernel_fusion
+):
+    """A small GPT's DSv4 attention must match after TP checkpoint resharding.
+
+    This follows ``test_parallel_multi_latent_attention_correctness``: build a
+    TP1 GPT model, save its distributed checkpoint, rebuild the same GPT under
+    TP, load the checkpoint, and compare attention forward and backward results.
+    Both the fused and unfused DSA implementations pass through the complete
+    hybrid-attention path, including QKV projections, SP gather, CSA, inverse
+    RoPE, grouped output projection, and the row-parallel output projection.
+    """
+    if apply_dsa_kernel_fusion and torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Fused DSA TP correctness currently requires the SM90 Triton backend")
+
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossLoggingHelper,
+    )
+
+    seed = 123
+    sequence_length = 64
+    micro_batch_size = 2
+    hidden_size = 128
+    layer_number = 1
+
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
+        layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config, vp_stage=None, pp_rank=None
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=128,
+            max_sequence_length=sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            pg_collection=pg_collection,
+        )
+
+    transformer_config = _make_config(
+        num_layers=1,
+        hidden_size=hidden_size,
+        num_attention_heads=8,
+        v_head_dim=32,
+        qk_pos_emb_head_dim=16,
+        q_lora_rank=32,
+        o_groups=8,
+        o_lora_rank=32,
+        csa_compress_ratios=[4],
+        csa_window_size=8,
+        dsa_indexer_n_heads=4,
+        dsa_indexer_head_dim=32,
+        dsa_indexer_topk=8,
+        apply_rope_fusion=True,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+        dsa_indexer_loss_coeff=1.0,
+        dsa_indexer_use_sparse_loss=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        ffn_hidden_size=256,
+        normalization="RMSNorm",
+        transformer_impl="transformer_engine",
+    )
+    compress_ratio = transformer_config.csa_compress_ratios[layer_number - 1]
+    assert compress_ratio * transformer_config.dsa_indexer_topk <= sequence_length, (
+        "This correctness test must stay in the normal training regime where "
+        "compress_ratio * topk <= sequence_length; the sparse-attention implementation "
+        "does not handle the degenerate short-sequence boundary."
+    )
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        input_hidden_states = (
+            torch.rand((sequence_length, micro_batch_size, hidden_size), device="cuda")
+            .bfloat16()
+            .requires_grad_(True)
+        )
+
+        with TempNamedDir(tmp_path_dist_ckpt / "test_parallel_dsv4", sync=True) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            set_args(mock_args)
+            init_basic_mock_args(mock_args, 1, 1, bf16=True)
+            mock_args.context_parallel_size = 1
+            mock_args.sequence_parallel = False
+            gpt_model = unwrap_model(
+                get_model(initialize_gpt_model, config=transformer_config)
+            )
+
+            init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+            mock_args.no_save_optim = True
+            mock_args.no_save_rng = True
+            mock_args.no_load_optim = True
+            mock_args.no_load_rng = True
+            save_checkpoint(10, gpt_model, None, None, 0)
+
+            attention = gpt_model[0].decoder.layers[0].self_attention
+            assert (
+                attention.core_attention.apply_dsa_kernel_fusion
+                is apply_dsa_kernel_fusion
+            )
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+            output_baseline, bias_baseline = attention(
+                input_hidden_states, attention_mask=None
+            )
+            indexer_loss_baseline = _tracked_indexer_loss(layer_number)
+            output_baseline.sum().backward()
+            input_grad_baseline = input_hidden_states.grad.detach()
+            output_baseline = output_baseline.detach()
+
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tp, pipeline_model_parallel_size=1
+            )
+            torch.manual_seed(seed)
+            model_parallel_cuda_manual_seed(seed)
+            transformer_config.tensor_model_parallel_size = tp
+            transformer_config.sequence_parallel = sp
+            init_basic_mock_args(mock_args, tp, 1, bf16=True)
+            mock_args.context_parallel_size = 1
+            mock_args.sequence_parallel = sp
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            pg_collection.embd = parallel_state.get_embedding_group()
+            gpt_model = unwrap_model(
+                get_model(
+                    initialize_gpt_model,
+                    config=transformer_config,
+                    pg_collection=pg_collection,
+                )
+            )
+            with mock.patch("megatron.training.checkpointing.check_checkpoint_args"):
+                with mock.patch("megatron.training.checkpointing.update_num_microbatches"):
+                    load_checkpoint(gpt_model, None, None)
+
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+            def get_tensor_on_this_rank(tensor):
+                if tp > 1 and sp:
+                    sequence_per_tp_rank = sequence_length // tp
+                    tensor = tensor[
+                        tp_rank * sequence_per_tp_rank : (tp_rank + 1) * sequence_per_tp_rank
+                    ]
+                return tensor
+
+            input_parallel = (
+                get_tensor_on_this_rank(input_hidden_states).detach().requires_grad_(True)
+            )
+            parallel_attention = gpt_model[0].decoder.layers[0].self_attention
+            assert (
+                parallel_attention.core_attention.apply_dsa_kernel_fusion
+                is apply_dsa_kernel_fusion
+            )
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+            output_parallel, bias_parallel = parallel_attention(
+                input_parallel, attention_mask=None
+            )
+            indexer_loss_parallel = _tracked_indexer_loss(layer_number)
+            output_parallel.sum().backward()
+            input_grad_parallel = input_parallel.grad.detach()
+
+            output_baseline = get_tensor_on_this_rank(output_baseline)
+            input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
+            torch.testing.assert_close(
+                indexer_loss_parallel, indexer_loss_baseline, rtol=2e-4, atol=2e-4
+            )
+            assert bias_baseline is None
+            assert bias_parallel is None
+
+            for name, tensor in (
+                ("output_baseline", output_baseline),
+                ("output_parallel", output_parallel),
+                ("input_grad_baseline", input_grad_baseline),
+                ("input_grad_parallel", input_grad_parallel),
+            ):
+                assert torch.isfinite(tensor).all(), f"{name} contains NaN or Inf"
+
+            # Fixed tolerance contract (see docs/diagnostics notes); the unified
+            # precision metrics are only reported when an assertion fails.
+            # TP1 and TPN use different Triton launch shapes in the fused path.
+            # Its direct TP tests permit one BF16 output ULP (up to 0.015625),
+            # while the unfused hybrid path retains its tighter contract.
+            atol = rtol = 2e-2 if apply_dsa_kernel_fusion else 5e-3
+            rank = torch.distributed.get_rank()
+            should_report = _is_first_data_parallel_replica() and (
+                sp or parallel_state.get_tensor_model_parallel_rank() == 0
+            )
+            try:
+                torch.testing.assert_close(
+                    output_parallel,
+                    output_baseline,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
+                )
+            except AssertionError as error:
+                if should_report:
+                    print(
+                        f"[rank{rank}] output_hidden_states mismatch at atol=rtol={atol:.0e}: "
+                        f"{_format_grad_metrics(output_parallel, output_baseline)}"
+                    )
+                raise
+
+            try:
+                if apply_dsa_kernel_fusion:
+                    input_grad_relative_l2 = _relative_l2_error(
+                        input_grad_parallel, input_grad_baseline
+                    )
+                    input_grad_cosine = F.cosine_similarity(
+                        input_grad_parallel.float().reshape(1, -1),
+                        input_grad_baseline.float().reshape(1, -1),
+                    ).item()
+                    assert input_grad_relative_l2 < 7e-2 and input_grad_cosine > 0.995, (
+                        f"fused input_grad mismatch: relative_l2={input_grad_relative_l2:.6g}, "
+                        f"cosine={input_grad_cosine:.9g}"
+                    )
+                else:
+                    torch.testing.assert_close(
+                        input_grad_parallel,
+                        input_grad_baseline,
+                        atol=atol,
+                        rtol=rtol,
+                        msg=lambda msg: f"Mismatch in input_grad: {msg}",
+                    )
+            except AssertionError as initial_error:
+                if should_report:
+                    print(
+                        f"[rank{rank}] input_grad mismatch at atol=rtol={atol:.0e}: "
+                        f"{_format_grad_metrics(input_grad_parallel, input_grad_baseline)}"
+                    )
+                raise AssertionError(
+                    f"input_grad mismatch at atol=rtol={atol:.0e}; "
+                    f"{_format_grad_metrics(input_grad_parallel, input_grad_baseline)}"
+                ) from initial_error
+    finally:
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+@pytest.mark.parametrize("tp", (2, 4, 8), ids=lambda tp: f"tp{tp}")
+def test_dsv4_tp_full_sequence_duplicated_param_grads_match_tp1(tp):
+    """TP+SP duplicated CSA/indexer parameter gradients must match TP1.
+
+    In the fused tp_sp path the sequence-parallel gather feeds *complete*
+    sequences to the duplicated CSA/indexer operators, so they must not use
+    TE's sequence-parallel parameter-gradient reduction. The main compressor
+    is nevertheless consumed by TP-local query heads: its output mapping must
+    SUM those local-head activation gradients during backward before they
+    enter the replicated compressor. Indexer-private operators already compute
+    their replicated loss from the complete sequence and need no such mapping.
+    """
+    seq_len, batch_size, layer_number = 64, 2, 2
+    common = dict(
+        apply_rope_fusion=True,
+        apply_dsa_kernel_fusion=False,
+        csa_compress_ratios=[0, 4, 0, 0],
+        qk_layernorm=True,
+        dsa_indexer_loss_coeff=1.0,
+        dsa_indexer_use_sparse_loss=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    target_names = [
+        "core_attention.compressor.linear_wkv.weight",
+        "core_attention.compressor.linear_wgate.weight",
+        "core_attention.compressor.norm.weight",
+        "core_attention.compressor.ape",
+        "core_attention.indexer.linear_wq_b.weight",
+        "core_attention.indexer.linear_weights_proj.weight",
+        "core_attention.indexer.compressor.linear_wkv.weight",
+        "core_attention.indexer.compressor.linear_wgate.weight",
+        "core_attention.indexer.compressor.norm.weight",
+        "core_attention.indexer.compressor.ape",
+        "kv_layernorm.weight",
+    ]
+
+    try:
+        # Each process independently computes the same TP1 reference.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        pg_tp1 = ProcessGroupCollection.use_mpu_process_groups()
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        config_tp1 = _make_config(
+            tensor_model_parallel_size=1, sequence_parallel=False, **common
+        )
+        attn_tp1 = _build_attention(config_tp1, layer_number, pg_tp1).cuda().train()
+        tp1_parameters = {
+            name: param.detach().cpu().clone() for name, param in attn_tp1.named_parameters()
+        }
+
+        torch.manual_seed(_SEED + 1)
+        hidden_full = torch.randn(
+            seq_len,
+            batch_size,
+            config_tp1.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        output_tp1, _ = attn_tp1(hidden_states=hidden_full, attention_mask=None)
+        torch.manual_seed(_SEED + 2)
+        output_grad = torch.randn_like(output_tp1)
+        output_tp1.backward(output_grad)
+        param_grads_tp1 = {
+            name: param.grad.detach().cpu().clone()
+            for name, param in attn_tp1.named_parameters()
+            if param.grad is not None
+        }
+        del attn_tp1
+        Utils.destroy_model_parallel()
+
+        # Rebuild with TP+SP and load exact slices of the TP1 global weights.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1
+        )
+        pg_tp = ProcessGroupCollection.use_mpu_process_groups()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        config_tp = _make_config(
+            tensor_model_parallel_size=tp, sequence_parallel=True, **common
+        )
+        attn_tp = _build_attention(config_tp, layer_number, pg_tp).cuda().train()
+        _load_tp1_parameters_into_tpn(attn_tp, tp1_parameters, tp_rank, tp)
+        main_compressor = attn_tp.core_attention.compressor
+        assert main_compressor.reduce_output_grad_across_tp, (
+            "The main CSA compressor must reduce its output gradient across TP"
+        )
+        assert main_compressor.pg_collection.tp.size() == tp
+
+        seq_per_rank = seq_len // tp
+        seq_slice = slice(tp_rank * seq_per_rank, (tp_rank + 1) * seq_per_rank)
+        hidden_local = hidden_full.detach()[seq_slice].clone().requires_grad_(True)
+        csa_input_sequence_lengths = []
+
+        def capture_csa_input_sequence_lengths(module, args, kwargs):
+            csa_input_sequence_lengths.append(
+                {
+                    "query": args[0].shape[0],
+                    "x": kwargs["x"].shape[0],
+                    "qr": kwargs["qr"].shape[0],
+                }
+            )
+
+        hook = attn_tp.core_attention.register_forward_pre_hook(
+            capture_csa_input_sequence_lengths, with_kwargs=True
+        )
+        try:
+            output_local, _ = attn_tp(hidden_states=hidden_local, attention_mask=None)
+            output_local.backward(output_grad[seq_slice])
+        finally:
+            hook.remove()
+        assert csa_input_sequence_lengths == [
+            {"query": seq_len, "x": seq_len, "qr": seq_len}
+        ], (
+            "DSv4HybridSelfAttention must gather the SP sequence before entering CSA; "
+            f"got {csa_input_sequence_lengths} from local input length {seq_per_rank}"
+        )
+
+        # Emulate the TP part of finalize_model_grads. Full-sequence CSA/indexer
+        # parameters intentionally carry sequence_parallel=False; the main
+        # compressor's local-head contributions must already have been summed
+        # by its output activation-gradient mapping above.
+        for param in attn_tp.parameters():
+            if param.grad is not None and getattr(param, "sequence_parallel", False):
+                torch.distributed.all_reduce(param.grad, group=pg_tp.tp)
+
+        for name in target_names:
+            assert name in param_grads_tp1, f"TP1 reference has no gradient for {name}"
+            param = dict(attn_tp.named_parameters())[name]
+            assert param.grad is not None, f"TP{tp} has no gradient for {name}"
+            assert tuple(param.grad.shape) == tuple(param_grads_tp1[name].shape), name
+            reference = param_grads_tp1[name].to(device=param.device, dtype=param.grad.dtype)
+            # A double-gradient bug shows up as ~2x here and fails loudly.
+            try:
+                torch.testing.assert_close(
+                    param.grad,
+                    reference,
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda msg, name=name: f"Mismatch in parameter gradient {name}: {msg}",
+                )
+                relative_l2 = _relative_l2_error(param.grad, reference)
+                assert relative_l2 < 2e-2, f"{name}: relative_l2={relative_l2:.9e}"
+            except AssertionError as error:
+                rank = torch.distributed.get_rank()
+                if _is_first_data_parallel_replica():
+                    print(
+                        f"[rank{rank}] TP{tp} parameter-gradient mismatch for {name}: "
+                        f"{_format_grad_metrics(param.grad, reference)}"
+                    )
+                raise AssertionError(
+                    f"TP{tp} parameter-gradient mismatch for {name}; "
+                    f"{_format_grad_metrics(param.grad, reference)}"
+                ) from error
+    finally:
+        Utils.destroy_model_parallel()
