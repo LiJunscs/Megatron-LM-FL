@@ -9,14 +9,17 @@ import torch.nn.functional as F
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
+##### FlagScale Add #####
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
+##### FlagScale End #####
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+##### FlagScale Add #####
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -27,6 +30,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
+##### FlagScale End #####
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -180,7 +184,7 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'core_attention')
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
-
+        ##### FlagScale Add #####
         # Q is head-sharded, while the single MQA KV projection is duplicated.
         assert attn.num_local_q_heads == config.num_attention_heads
         assert attn.query_projection_size == config.num_attention_heads * config.v_head_dim
@@ -190,7 +194,7 @@ class TestDSv4HybridAttentionConstructor:
         assert attn.linear_q_up_proj.weight.shape[0] == attn.query_projection_size_per_partition
         assert attn.linear_kv_proj.weight.shape[0] == config.v_head_dim
         assert not getattr(attn.linear_kv_proj.weight, 'tensor_model_parallel', False)
-
+        ##### FlagScale End #####
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
         torch.manual_seed(_SEED)
@@ -201,7 +205,7 @@ class TestDSv4HybridAttentionConstructor:
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
         assert attn.q_head_dim == config.v_head_dim
-
+    ##### FlagScale Add #####
     def test_compressor_owns_tp_output_gradient_contract(self):
         """Main and indexer compressors expose different TP backward semantics."""
         torch.manual_seed(_SEED)
@@ -216,7 +220,7 @@ class TestDSv4HybridAttentionConstructor:
         assert core.compressor.reduce_output_grad_across_tp
         assert core.indexer is not None
         assert not core.indexer.compressor.reduce_output_grad_across_tp
-
+    ##### FlagScale End #####
     @pytest.mark.parametrize("layer_number", [1, 2, 3, 4])
     def test_rope_base_varies_with_compress_ratio(self, layer_number):
         """Layers with compress_ratio > 1 should use csa_compress_rotary_base."""
@@ -397,7 +401,7 @@ class TestDSv4HybridQKV:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
         ).cuda()
 
-        q, k, v, q_compressed, gathered_hidden_states = attn.get_query_key_value_tensors(hidden)
+        q, k, v, q_compressed, gathered_hidden_states = attn.get_query_key_value_tensors(hidden) ##### FlagScale Add #####
 
         n_heads = self.config.num_attention_heads
         v_dim = self.config.v_head_dim
@@ -406,9 +410,11 @@ class TestDSv4HybridQKV:
         # key and value are single-head (MQA-style) with an extra head dim
         assert k.shape[-1] == v_dim
         assert v.shape[-1] == v_dim
+        ##### FlagScale Add #####
         assert q_compressed.shape[:2] == (seq_len, batch_size)
         assert q_compressed.requires_grad
         assert gathered_hidden_states.shape == hidden.shape
+        ##### FlagScale End #####
 
     def test_key_equals_value(self):
         """In the wkv path, key and value should be the same tensor."""
@@ -709,7 +715,7 @@ class TestDSv4HybridRopeFusion:
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
 
-
+##### FlagScale Add #####
 def _load_tp1_parameters_into_tpn(module, tp1_parameters, tp_rank, tp_size):
     """Load a TP1 parameter snapshot into a TP-sharded module."""
     with torch.no_grad():
@@ -1208,3 +1214,4 @@ def test_dsv4_tp_full_sequence_duplicated_param_grads_match_tp1(tp):
                 ) from error
     finally:
         Utils.destroy_model_parallel()
+##### FlagScale End #####
