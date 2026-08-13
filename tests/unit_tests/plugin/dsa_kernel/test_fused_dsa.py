@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import Tuple
 
@@ -41,11 +42,30 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 # SM90+ check for module-level tests that use apply_dsa_kernel_fusion=True
 _SM90_AVAILABLE = (
-    torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 9
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
 )
 _skip_unless_sm90 = pytest.mark.skipif(
     not _SM90_AVAILABLE, reason="SM90+ (Hopper or later) required for apply_dsa_kernel_fusion"
 )
+
+# These correctness tests are single-GPU only: under CI's 8-process torchrun
+# launch every rank would otherwise re-tune the Triton kernels under
+# concurrent load and can select different autotune configs, causing
+# rank-dependent numeric drift past the fused-vs-unfused tolerances.
+_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+_GLOBAL_RANK = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+
+@pytest.fixture(autouse=True)
+def _single_gpu_only():
+    """Run single-GPU correctness tests on global rank 0 only.
+
+    Skipping here (not via a collection-time marker) keeps the class-scoped
+    Utils initialize/destroy fixtures on all ranks, so their NCCL barriers
+    stay balanced under multi-process launches.
+    """
+    if _WORLD_SIZE > 1 and _GLOBAL_RANK != 0:
+        pytest.skip("Single-GPU test: executed on global rank 0 only")
 
 # ---------------------------------------------------------------------------
 # Logging setup — use `pytest -s --log-cli-level=INFO` for detailed output,
@@ -253,7 +273,7 @@ class TestFusedIndexerSparseAttnAccuracy:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @pytest.mark.parametrize(
         "sq,b,np_,hn,n_comp,win_topk,idx_nh,idx_hd,indexer_topk,ratio",
@@ -420,7 +440,7 @@ class TestFusedIndexerSparseAttnBackward:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _run_fused_with_grad(inputs: dict, sparse_loss: bool) -> dict:
@@ -774,7 +794,7 @@ class TestFusedIndexerSparseAttnPerformance:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _benchmark(fn, warmup: int = 10, iters: int = 50) -> float:
@@ -1315,6 +1335,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
     CSAIndexerSubmodules,
 )
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
     dsa_sparse_attn as _triton_dsa_sparse_attn_raw,
@@ -1530,12 +1551,13 @@ class TestCSAFusedVsUnfusedAccuracy:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+        model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @pytest.mark.parametrize(
         "sq,b,num_heads,v_head_dim,window_size,indexer_topk",
@@ -1719,12 +1741,13 @@ class TestDSAIndexerLossAutoScaler:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+        model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     def test_forward_identity(self, device):
         """AutoScaler does not modify the forward output value."""
@@ -1921,12 +1944,13 @@ class TestCSAFusedVsUnfusedPerformance:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+        model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _benchmark(fn, warmup: int = 5, iters: int = 20) -> float:
@@ -2163,12 +2187,13 @@ class TestCSANoIndexerFusedVsUnfused:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+        model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @pytest.mark.parametrize(
         "compress_ratio,sq,b,num_heads,v_head_dim,window_size",
@@ -2370,12 +2395,13 @@ class TestCSANoIndexerPerformance:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
+        model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _benchmark(fn, warmup: int = 5, iters: int = 20) -> float:
@@ -2597,7 +2623,7 @@ class TestDSASparseAttnBackward:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _make_inputs(
@@ -2986,7 +3012,7 @@ class TestRatioCausalMaskParity:
         ids=["pretrain_seq2k_ratio4", "pretrain_seq4k_ratio4"],
     )
     def test_compute_ratio_causal_mask_matches_unfused(self, sq, sk, ratio):
-        device = torch.device("cuda:0")
+        device = torch.device(torch.cuda.current_device())
         actual = compute_ratio_causal_mask(sq, sk, ratio, device)
         expected = self._unfused_reference_mask(sq, sk, ratio, device)
 
@@ -2998,7 +3024,7 @@ class TestRatioCausalMaskParity:
 
     def test_pretrain_ratio4_valid_counts_at_compression_boundaries(self):
         """Validate representative boundaries in a 4K pretraining sequence."""
-        device = torch.device("cuda:0")
+        device = torch.device(torch.cuda.current_device())
         sq, sk, ratio = 4096, 1024, 4
         mask = compute_ratio_causal_mask(sq, sk, ratio, device)
         actual_counts = torch.isfinite(mask).sum(dim=-1)
@@ -3024,7 +3050,7 @@ class TestRatioCausalMaskParity:
 
     def test_pretrain_topk_never_selects_future_compressed_tokens(self):
         """Stress production top-k=256 with future positions ranked highest."""
-        device = torch.device("cuda:0")
+        device = torch.device(torch.cuda.current_device())
         sq, sk, ratio, topk = 4096, 1024, 4, 256
 
         # Scores increase monotonically with compressed position, so every
@@ -3160,7 +3186,7 @@ class TestSparseIndexerExtremeProbability:
     @pytest.mark.parametrize("gap", [0.0, 10.0, 20.0, 30.0, 50.0])
     def test_fused_manual_backward_matches_reference_formula(self, gap):
         """The fused loss/backward must match the epsilon-smoothed reference."""
-        inputs = self._make_inputs(gap, torch.device("cuda:0"))
+        inputs = self._make_inputs(gap, torch.device(torch.cuda.current_device()))
         actual = self._run_fused(inputs)
         expected = self._run_autograd_reference(inputs, epsilon=1e-10)
 
@@ -3178,7 +3204,7 @@ class TestSparseIndexerExtremeProbability:
 
     def test_extreme_probability_matches_unfused_epsilon_semantics(self):
         """Guard parity after predict falls below the 1e-10 smoothing scale."""
-        inputs = self._make_inputs(30.0, torch.device("cuda:0"))
+        inputs = self._make_inputs(30.0, torch.device(torch.cuda.current_device()))
         fused = self._run_fused(inputs)
         unfused = self._run_autograd_reference(inputs, epsilon=1e-10)
 
@@ -3221,7 +3247,7 @@ class TestIndexerGradAccuracy:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _run_fused_indexer_grads(inputs: dict, sparse_loss: bool) -> dict:
@@ -3579,7 +3605,7 @@ class TestIndexerLossConsistency:
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device(torch.cuda.current_device())
 
     @staticmethod
     def _get_fused_loss(inputs: dict, sparse_loss: bool) -> float:
