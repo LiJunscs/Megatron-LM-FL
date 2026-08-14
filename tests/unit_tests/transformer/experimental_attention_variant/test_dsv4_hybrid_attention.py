@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import os
+from copy import copy
 from unittest.mock import patch
 
 import pytest
@@ -123,6 +125,129 @@ def _build_attention(config, layer_number, pg_collection):
 
     spec = _make_attention_spec(config)
     return build_module(spec, config=config, layer_number=layer_number, pg_collection=pg_collection)
+
+
+# ===========================================================================
+# TP communication adapter tests
+# ===========================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestDSv4TPRopeExchange:
+    """Verify SP gather and non-SP replicated-KV backward contracts."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self):
+        if not torch.distributed.is_available() or int(os.environ.get('WORLD_SIZE', '1')) < 2:
+            pytest.skip("requires torchrun with at least two ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _fake_fused_rope():
+        class FakeFusedRope:
+            @staticmethod
+            def forward(ctx, q, *args):
+                return q * 2
+
+            @staticmethod
+            def backward(ctx, grad_query):
+                return (grad_query * 2,)
+
+        return FakeFusedRope
+
+    def test_sp_field_backward_policies(self):
+        from megatron.core.transformer.experimental_attention_variant import (
+            deepseek_v4_hybrid_attention as dsv4_attention,
+        )
+
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        tp_rank = pg.tp.rank()
+        device = torch.device('cuda', torch.cuda.current_device())
+        q = torch.ones(4, 1, 3, device=device, requires_grad=True)
+        hidden = torch.full((2, 2), float(tp_rank + 1), device=device, requires_grad=True)
+        kv = torch.ones(2, 3, device=device, requires_grad=True)
+        q_compressed = torch.ones(2, 1, device=device, requires_grad=True)
+        fields = (
+            dsv4_attention._DSv4TPField(
+                "hidden_states", hidden, dsv4_attention._DSv4TPBackwardPolicy.SCATTER
+            ),
+            dsv4_attention._DSv4TPField(
+                "kv", kv, dsv4_attention._DSv4TPBackwardPolicy.REDUCE_SCATTER
+            ),
+            dsv4_attention._DSv4TPField(
+                "q_compressed",
+                q_compressed,
+                dsv4_attention._DSv4TPBackwardPolicy.NO_GRAD,
+            ),
+        )
+
+        with patch.object(
+            dsv4_attention, '_FusedMLARoPEInplace', self._fake_fused_rope()
+        ):
+            query, exchanged = dsv4_attention._dsv4_tp_rope_exchange(
+                q,
+                fields,
+                torch.empty(0, device=device),
+                torch.empty(0, device=device),
+                0,
+                0,
+                torch.tensor([0, 4], dtype=torch.int32, device=device),
+                0,
+                1,
+                pg.tp,
+                gather_sequence=True,
+                is_thd=True,
+                apply_fused_rope=True,
+            )
+            assert exchanged["hidden_states"].shape[0] == 4
+            assert not exchanged["q_compressed"].requires_grad
+            (query.sum() + exchanged["hidden_states"].sum() + exchanged["kv"].sum()).backward()
+
+        torch.testing.assert_close(q.grad, torch.full_like(q, 2))
+        torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+        torch.testing.assert_close(kv.grad, torch.full_like(kv, 2))
+        torch.testing.assert_close(q_compressed.grad, torch.zeros_like(q_compressed))
+
+    def test_non_sp_kv_backward_all_reduce(self):
+        from megatron.core.transformer.experimental_attention_variant import (
+            deepseek_v4_hybrid_attention as dsv4_attention,
+        )
+
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        device = torch.device('cuda', torch.cuda.current_device())
+        q = torch.ones(2, 1, 1, 3, device=device, requires_grad=True)
+        kv = torch.ones(2, 1, 3, device=device, requires_grad=True)
+        field = dsv4_attention._DSv4TPField(
+            "kv", kv, dsv4_attention._DSv4TPBackwardPolicy.ALL_REDUCE
+        )
+
+        with patch.object(
+            dsv4_attention, '_FusedMLARoPEInplace', self._fake_fused_rope()
+        ):
+            query, exchanged = dsv4_attention._dsv4_tp_rope_exchange(
+                q,
+                (field,),
+                torch.empty(0, device=device),
+                torch.empty(0, device=device),
+                0,
+                0,
+                None,
+                0,
+                1,
+                pg.tp,
+                gather_sequence=False,
+                is_thd=False,
+                apply_fused_rope=True,
+            )
+            rank_scale = float(pg.tp.rank() + 1)
+            (query.sum() + exchanged["kv"].sum() * rank_scale).backward()
+
+        torch.testing.assert_close(q.grad, torch.full_like(q, 2))
+        torch.testing.assert_close(kv.grad, torch.full_like(kv, 3))
 
 
 # ===========================================================================
@@ -705,6 +830,40 @@ def _make_thd_packed_seq_params(seg_lens, device='cuda'):
     )
 
 
+_DSV4_TP_ATOL = 5e-3
+_DSV4_TP_RTOL = 5e-3
+
+
+def _copy_tp_parameters_to_tp1_reference(tp_module, ref_module, tp_group):
+    """Gather TP shards and load the equivalent parameters into a TP1 module."""
+    tp_size = tp_group.size()
+    tp_params = dict(tp_module.named_parameters())
+    for name, ref_param in ref_module.named_parameters():
+        assert name in tp_params, f"Missing TP parameter for TP1 reference parameter {name}"
+        tp_param = tp_params[name]
+        if tp_param.shape == ref_param.shape:
+            ref_param.data.copy_(tp_param.data)
+            continue
+
+        partition_dims = [
+            dim
+            for dim in range(tp_param.ndim)
+            if ref_param.size(dim) == tp_param.size(dim) * tp_size
+            and all(
+                ref_param.size(other_dim) == tp_param.size(other_dim)
+                for other_dim in range(tp_param.ndim)
+                if other_dim != dim
+            )
+        ]
+        assert len(partition_dims) == 1, (
+            f"Cannot infer TP partition dimension for {name}: "
+            f"local={tuple(tp_param.shape)}, full={tuple(ref_param.shape)}"
+        )
+        shards = [torch.empty_like(tp_param) for _ in range(tp_size)]
+        torch.distributed.all_gather(shards, tp_param.data, group=tp_group)
+        ref_param.data.copy_(torch.cat(shards, dim=partition_dims[0]))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 class TestDSv4HybridAttentionThd:
@@ -797,7 +956,9 @@ class TestDSv4HybridAttentionThd:
         learnable parameter (covers the full indexer-loss path in Path
         B THD when ``layer_number=2`` triggers ratio=4).
         """
-        seg_lens = [128, 96]
+        # Both packed segments contain a complete ratio-128 compression group;
+        # the SP midpoint still falls inside the first segment.
+        seg_lens = [160, 128]
         total = sum(seg_lens)
 
         torch.manual_seed(_SEED)
@@ -856,4 +1017,125 @@ class TestDSv4HybridAttentionThd:
         assert torch.allclose(out_sbhd.float(), out_thd.float(), atol=5e-2, rtol=5e-2), (
             f"B=1 SBHD/THD parity failed: max abs diff = "
             f"{(out_sbhd.float() - out_thd.float()).abs().max().item():.4e}"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridAttentionThdTP:
+    """Compare CP-disabled THD TP paths with a genuine TP1/SP-off reference."""
+
+    tp_size = 2
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        if not torch.distributed.is_available() or int(os.environ.get('WORLD_SIZE', '1')) < 2:
+            pytest.skip("THD TP parity requires torchrun with at least two ranks")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        cls.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+
+        # Transformer Engine needs a real ProcessGroup to execute its TP1
+        # column/row-linear paths. Every distributed rank creates the singleton
+        # groups in the same order, then keeps the group containing itself.
+        cls.ref_tp_group = None
+        for rank in range(torch.distributed.get_world_size()):
+            singleton_group = torch.distributed.new_group(ranks=[rank])
+            if rank == torch.distributed.get_rank():
+                cls.ref_tp_group = singleton_group
+        assert cls.ref_tp_group is not None
+        cls.ref_pg = copy(cls.pg)
+        cls.ref_pg.tp = cls.ref_tp_group
+
+        yield
+        torch.distributed.destroy_process_group(cls.ref_tp_group)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("sequence_parallel", [False, True], ids=["sp_off", "sp_on"])
+    @pytest.mark.parametrize("layer_number", [1, 3], ids=["window_only", "compressor"])
+    def test_forward_backward_matches_tp1_reference(self, sequence_parallel, layer_number):
+        """TP2 output/input-grad parity follows MLA's BF16 5e-3 tolerance."""
+        config_tp = _make_config(
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=sequence_parallel,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=True,
+        )
+        config_ref = _make_config(
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=True,
+        )
+        tp_attn = _build_attention(
+            config_tp, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_tp_parameters_to_tp1_reference(tp_attn, ref_attn, self.pg.tp)
+
+        seg_lens = [128, 96]
+        total_tokens = sum(seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens)
+        rows = torch.arange(total_tokens, dtype=torch.float32, device='cuda')
+        full_hidden = (rows.remainder(17) / 17).to(torch.bfloat16).view(-1, 1, 1)
+        full_hidden = full_hidden.expand(-1, 1, config_tp.hidden_size).contiguous()
+
+        if sequence_parallel:
+            local_tokens = total_tokens // self.tp_size
+            local_start = self.tp_rank * local_tokens
+            local_hidden_values = full_hidden.narrow(0, local_start, local_tokens)
+        else:
+            local_start = 0
+            local_tokens = total_tokens
+            local_hidden_values = full_hidden
+
+        local_hidden = local_hidden_values.detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+        output, _ = tp_attn(
+            hidden_states=local_hidden,
+            attention_mask=None,
+            packed_seq_params=packed,
+        )
+        ref_output, _ = ref_attn(
+            hidden_states=ref_hidden,
+            attention_mask=None,
+            packed_seq_params=packed,
+        )
+        ref_local_output = ref_output.narrow(0, local_start, local_tokens)
+
+        label = f"layer={layer_number}:tp{self.tp_size}:sp={sequence_parallel}:cp1"
+        torch.testing.assert_close(
+            output,
+            ref_local_output,
+            atol=_DSV4_TP_ATOL,
+            rtol=_DSV4_TP_RTOL,
+            msg=lambda msg: f"{label}: output mismatch: {msg}",
+        )
+
+        # Slice one deterministic full-sequence gradient with the same SP
+        # ownership rule so both executions differentiate the same objective.
+        full_grad = ((rows * 3).remainder(23) / 23).to(torch.bfloat16).view(-1, 1, 1)
+        full_grad = full_grad.expand_as(ref_output).contiguous()
+        output.backward(full_grad.narrow(0, local_start, local_tokens))
+        ref_output.backward(full_grad)
+        ref_local_hidden_grad = ref_hidden.grad.narrow(0, local_start, local_tokens)
+        torch.testing.assert_close(
+            local_hidden.grad,
+            ref_local_hidden_grad,
+            atol=_DSV4_TP_ATOL,
+            rtol=_DSV4_TP_RTOL,
+            msg=lambda msg: f"{label}: input gradient mismatch: {msg}",
         )

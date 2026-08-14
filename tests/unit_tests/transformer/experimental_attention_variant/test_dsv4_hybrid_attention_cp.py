@@ -4,6 +4,7 @@ import gc
 import os
 import statistics
 from contextlib import contextmanager, nullcontext
+from copy import copy
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -264,6 +265,8 @@ def _deterministic_torch_algorithms():
 def _make_dsv4_cp_config(
     *,
     context_parallel_size,
+    tensor_model_parallel_size=1,
+    sequence_parallel=False,
     dsa_indexer_loss_coeff=1.0,
     dsa_indexer_use_sparse_loss=True,
     apply_dsa_kernel_fusion=True,
@@ -286,6 +289,8 @@ def _make_dsv4_cp_config(
         dsa_indexer_topk=shape["dsa_indexer_topk"],
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        sequence_parallel=sequence_parallel,
         context_parallel_size=context_parallel_size,
         cp_partition_mode="contiguous" if context_parallel_size > 1 else "zigzag",
         sequence_packing_scheduler="dp_balanced" if context_parallel_size > 1 else None,
@@ -307,6 +312,67 @@ def _copy_module_parameters(src, dst):
     for name, param in dst.named_parameters():
         assert name in src_params
         param.data.copy_(src_params[name].data)
+
+
+def _tp_partition_dim(local_tensor, full_tensor, tp_size, name):
+    """Infer the single tensor dimension sharded by TP from local/full shapes."""
+    candidates = [
+        dim
+        for dim, (local_size, full_size) in enumerate(zip(local_tensor.shape, full_tensor.shape))
+        if full_size == local_size * tp_size
+        and all(
+            local_tensor.size(other_dim) == full_tensor.size(other_dim)
+            for other_dim in range(local_tensor.ndim)
+            if other_dim != dim
+        )
+    ]
+    assert len(candidates) == 1, (
+        f"Cannot infer TP partition dimension for {name}: "
+        f"local={tuple(local_tensor.shape)}, full={tuple(full_tensor.shape)}"
+    )
+    return candidates[0]
+
+
+def _copy_tp_parameters_to_reference(tp_module, ref_module, tp_group):
+    """Materialize TP parameter shards into an otherwise identical TP1 module."""
+    tp_size = tp_group.size()
+    tp_params = dict(tp_module.named_parameters())
+    for name, ref_param in ref_module.named_parameters():
+        assert name in tp_params, f"Missing TP parameter for reference parameter {name}"
+        tp_param = tp_params[name]
+        if tp_param.shape == ref_param.shape:
+            ref_param.data.copy_(tp_param.data)
+            continue
+
+        partition_dim = _tp_partition_dim(tp_param, ref_param, tp_size, name)
+        shards = [torch.empty_like(tp_param) for _ in range(tp_size)]
+        dist.all_gather(shards, tp_param.data, group=tp_group)
+        ref_param.data.copy_(torch.cat(shards, dim=partition_dim))
+
+
+def _assert_tp_parameter_grad_matches_reference(
+    name, tp_param, ref_param, tp_group, tp_rank, label
+):
+    """Compare a TP parameter gradient with its TP1 reference gradient.
+
+    TP-sharded parameters own the corresponding slice of the reference
+    gradient. Replicated parameters marked ``sequence_parallel`` see only the
+    local SP tokens, so their gradients must be summed across TP before the
+    comparison. Other replicated DSv4 parameters already implement their TP
+    gradient contract inside the module and are compared directly.
+    """
+    assert tp_param.grad is not None, f"Missing TP grad for {name}"
+    assert ref_param.grad is not None, f"Missing TP1/SP-off reference grad for {name}"
+
+    actual = tp_param.grad.detach().clone()
+    expected = ref_param.grad.detach()
+    if actual.shape != expected.shape:
+        partition_dim = _tp_partition_dim(actual, expected, tp_group.size(), name)
+        expected = expected.chunk(tp_group.size(), dim=partition_dim)[tp_rank].contiguous()
+    elif getattr(tp_param, "sequence_parallel", False):
+        dist.all_reduce(actual, group=tp_group)
+
+    _assert_cp_tensor_match(actual, expected, f"{label}:param_grad:{name}")
 
 
 def _make_ragged_cp_case(cp_size, cp_rank):
@@ -1075,4 +1141,142 @@ class TestDSv4HybridAttentionTHDCP:
         assert scale <= limit, report
 
         del cp_attn, local_hidden, local_grad
+        _clear_cuda_test_state()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridAttentionTHDTPSPCP:
+    """Compare unified THD TP+SP+CP against a TP1/SP-off CP reference."""
+
+    tp_size = 2
+    cp_size = 2
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        if Utils.world_size < self.tp_size * self.cp_size:
+            pytest.skip("THD TP+SP+CP requires at least four distributed ranks")
+        from megatron.core.transformer.experimental_attention_variant import (
+            csa_cp_layout_kernels,
+        )
+
+        if not csa_cp_layout_kernels._CUTE_AVAILABLE:
+            pytest.skip("THD CP layout tests require CuTeDSL")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=self.cp_size,
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        cls.cp_rank = parallel_state.get_context_parallel_rank()
+        cls.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+
+        # Build a real size-one TP group for the reference module. TE consumes
+        # the explicit process group and therefore executes its genuine TP1
+        # column/row-linear paths while the same CP group remains enabled.
+        cls.ref_tp_group = None
+        for rank in range(dist.get_world_size()):
+            singleton_group = dist.new_group(ranks=[rank])
+            if rank == dist.get_rank():
+                cls.ref_tp_group = singleton_group
+        assert cls.ref_tp_group is not None
+        cls.ref_pg = copy(cls.pg)
+        cls.ref_pg.tp = cls.ref_tp_group
+        yield
+        _clear_cuda_test_state()
+        dist.destroy_process_group(cls.ref_tp_group)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused_rope", "unfused_rope"])
+    @pytest.mark.parametrize("layer_number", [1, 3], ids=["window_only", "compressor"])
+    def test_forward_backward_matches_tp1_sp_off_reference(
+        self, apply_rope_fusion, layer_number
+    ):
+        packed, padded_tokens, cp_indices = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        config_tp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=True,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=apply_rope_fusion,
+        )
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=apply_rope_fusion,
+        )
+        tp_attn = _build_attention(
+            config_tp, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_tp_parameters_to_reference(tp_attn, ref_attn, self.pg.tp)
+
+        csa = tp_attn.core_attention
+        assert csa.n_local_heads == config_tp.num_attention_heads // self.tp_size
+        assert csa.attn_sink.shape == (csa.n_local_heads,)
+        if csa.compressor is not None:
+            assert csa.compressor.linear_wkv.config.sequence_parallel is False
+        if csa.indexer is not None:
+            assert csa.indexer.linear_wq_b.config.sequence_parallel is False
+
+        sp_rows = cp_indices.numel() // self.tp_size
+        sp_start = self.tp_rank * sp_rows
+        row_values = torch.arange(padded_tokens, dtype=torch.float32, device='cuda')
+        full_hidden = (row_values.remainder(17) / 17).to(torch.bfloat16).view(-1, 1, 1)
+        full_hidden = full_hidden.expand(-1, 1, config_tp.hidden_size)
+        cp_hidden = full_hidden.index_select(0, cp_indices).contiguous()
+        local_hidden = cp_hidden.narrow(0, sp_start, sp_rows).detach().clone().requires_grad_(True)
+        ref_hidden = cp_hidden.detach().clone().requires_grad_(True)
+
+        output, _ = tp_attn(
+            hidden_states=local_hidden,
+            attention_mask=None,
+            packed_seq_params=packed,
+        )
+        ref_output, _ = ref_attn(
+            hidden_states=ref_hidden,
+            attention_mask=None,
+            packed_seq_params=packed,
+        )
+        ref_local_output = ref_output.narrow(0, sp_start, sp_rows)
+        label = (
+            f"layer={layer_number}:tp{self.tp_size}:sp:on:"
+            f"cp{self.cp_size}:rope={apply_rope_fusion}"
+        )
+        _assert_cp_tensor_match(output.detach(), ref_local_output.detach(), f"{label}:output")
+
+        # Use one deterministic CP-local output gradient and slice it exactly as
+        # SP slices the output. This preserves the same scalar objective in the
+        # TP+SP and TP1/SP-off executions.
+        cp_grad_rows = row_values.index_select(0, cp_indices)
+        cp_grad = ((cp_grad_rows * 3).remainder(23) / 23).to(torch.bfloat16).view(-1, 1, 1)
+        cp_grad = cp_grad.expand_as(ref_output).contiguous()
+        output.backward(cp_grad.narrow(0, sp_start, sp_rows))
+        ref_output.backward(cp_grad)
+        _assert_cp_tensor_match(
+            local_hidden.grad.detach(),
+            ref_hidden.grad.narrow(0, sp_start, sp_rows),
+            f"{label}:hidden_grad",
+        )
+
+        ref_params = dict(ref_attn.named_parameters())
+        for name, tp_param in tp_attn.named_parameters():
+            assert name in ref_params
+            _assert_tp_parameter_grad_matches_reference(
+                name, tp_param, ref_params[name], self.pg.tp, self.tp_rank, label
+            )
+
+        del tp_attn, ref_attn, full_hidden, cp_hidden, local_hidden, ref_hidden
+        del output, ref_output, cp_grad
         _clear_cuda_test_state()

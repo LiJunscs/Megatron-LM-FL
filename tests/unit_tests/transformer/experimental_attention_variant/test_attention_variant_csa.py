@@ -596,6 +596,25 @@ class TestCompressedSparseAttentionRatio1:
         assert output.dtype == torch.bfloat16
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_window_only_does_not_require_compression_inputs(self):
+        """Window-only CSA keeps ``x`` and ``qr`` optional."""
+        seq_len, batch_size = 8, 1
+        np_, hn = self.config.num_attention_heads, self.config.v_head_dim
+        self.csa.cuda()
+        query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.bfloat16, device='cuda')
+        key = torch.randn(seq_len, batch_size, 1, hn, dtype=torch.bfloat16, device='cuda')
+
+        output = self.csa(
+            query=query,
+            key=key,
+            value=key,
+            attention_mask=None,
+            x=None,
+            qr=None,
+        )
+        assert output.shape == (seq_len, batch_size, np_ * hn)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_ratio1_backward(self):
         """Test backward pass with window-only attention."""
         seq_len = 32
@@ -2151,3 +2170,330 @@ class TestCSAHighPrecisionParams:
         assert bf16_module.module.indexer.compressor.ape.dtype == torch.float32
         assert bf16_module.module.compressor.linear_wkv.weight.dtype == torch.bfloat16
         assert bf16_module.module.compressor.linear_wgate.weight.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestCSATensorSequenceParallel:
+    """Validate replicated CSA modules after the outer TP/SP gather."""
+
+    tp_size = 2
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        if Utils.world_size < self.tp_size:
+            pytest.skip("CSA TP/SP tests require at least two distributed ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        cls = request.cls
+        cls.config = _make_mla_config(
+            csa_compress_ratios=[4, 4, 4, 4],
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=True,
+        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp']
+        )
+
+        from megatron.core.models.common.embeddings import RotaryEmbedding
+
+        cls.rotary_pos_emb = RotaryEmbedding(
+            cls.config.qk_pos_emb_head_dim,
+            rotary_percent=cls.config.rotary_percent,
+            rotary_base=cls.config.rotary_base,
+            cp_group=cls.pg_collection.cp,
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    def _assert_same_across_tp(self, tensor):
+        gathered = [torch.empty_like(tensor) for _ in range(self.tp_size)]
+        torch.distributed.all_gather(gathered, tensor, group=self.pg_collection.tp)
+        for other in gathered[1:]:
+            torch.testing.assert_close(other, gathered[0], atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_main_compressor_uses_full_sequence_and_reduces_output_grad(self, layout):
+        compressor = Compressor(
+            config=self.config,
+            submodules=_make_compressor_submodules(),
+            compress_ratio=4,
+            head_dim=self.config.v_head_dim,
+            rotate=False,
+            reduce_output_grad_across_tp=True,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+
+        assert compressor.linear_wkv.config.sequence_parallel is False
+        assert compressor.linear_wgate.config.sequence_parallel is False
+
+        x = torch.randn(
+            8, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        if layout == "thd":
+            output, _ = compressor(x, packed_seq_params=_make_packed_seq_params_thd([4, 4]))
+        else:
+            output = compressor(x)
+
+        self._assert_same_across_tp(output.detach())
+        rank_scale = float(self.pg_collection.tp.rank() + 1)
+        output.float().sum().mul(rank_scale).backward()
+
+        assert x.grad is not None
+        self._assert_same_across_tp(x.grad)
+        for parameter in compressor.parameters():
+            assert parameter.grad is not None
+            self._assert_same_across_tp(parameter.grad)
+
+    def test_csa_owns_local_head_sink_and_disables_sp_in_indexer(self):
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+        ).cuda()
+
+        assert csa.n_local_heads == self.config.num_attention_heads // self.tp_size
+        assert csa.attn_sink.shape == (csa.n_local_heads,)
+        assert csa.attn_sink.tensor_model_parallel
+        assert csa.attn_sink.partition_dim == 0
+        assert csa.compressor.reduce_output_grad_across_tp
+        assert not csa.indexer.compressor.reduce_output_grad_across_tp
+        assert csa.indexer.linear_wq_b.config.sequence_parallel is False
+        assert csa.indexer.linear_weights_proj.config.sequence_parallel is False
+
+    def test_csa_checkpoint_shards_only_the_local_head_sink(self):
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+        ).cuda()
+
+        prefix = "core_attention."
+        sharded_state = csa.sharded_state_dict(prefix=prefix)
+        sink = sharded_state[f"{prefix}attn_sink"]
+        local_heads = self.config.num_attention_heads // self.tp_size
+        tp_rank = self.pg_collection.tp.rank()
+
+        assert sink.data is csa.attn_sink
+        assert sink.local_shape == (local_heads,)
+        assert sink.global_shape == (self.config.num_attention_heads,)
+        assert sink.global_offset == (tp_rank * local_heads,)
+        assert sink.axis_fragmentations == (self.tp_size,)
+
+        # Compressor and Indexer state is duplicated over TP. Their checkpoint
+        # entries retain local/global shape equality and encode TP rank as a
+        # replica id instead of another tensor shard.
+        replicated_parameters = {
+            f"{prefix}compressor.ape": csa.compressor.ape,
+            f"{prefix}indexer.compressor.ape": csa.indexer.compressor.ape,
+        }
+        for key, parameter in replicated_parameters.items():
+            sharded_parameter = sharded_state[key]
+            assert sharded_parameter.data is parameter
+            assert sharded_parameter.local_shape == tuple(parameter.shape)
+            assert sharded_parameter.global_shape == tuple(parameter.shape)
+            assert sharded_parameter.global_offset == (0,) * parameter.ndim
+            assert sharded_parameter.axis_fragmentations == (1,) * parameter.ndim
+            assert sharded_parameter.replica_id[1] == tp_rank
+
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_indexer_consumes_sp_gathered_inputs_without_internal_sp(self, layout):
+        indexer = CSAIndexer(
+            config=self.config,
+            submodules=_make_csa_indexer_submodules(),
+            compress_ratio=4,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+
+        assert indexer.linear_wq_b.config.sequence_parallel is False
+        assert indexer.linear_weights_proj.config.sequence_parallel is False
+        assert indexer.compressor.linear_wkv.config.sequence_parallel is False
+        assert not indexer.compressor.reduce_output_grad_across_tp
+
+        # These are already SP-gathered tensors at the CSA boundary. Every TP
+        # rank deliberately receives the same complete CP-local token axis.
+        x = torch.randn(
+            8, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        qr = torch.randn(
+            8, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        packed = _make_packed_seq_params_thd([4, 4]) if layout == "thd" else None
+
+        result = indexer.forward_before_topk(x, qr, packed_seq_params=packed)
+        q, k, weights = result[:3]
+        assert k is not None
+        self._assert_same_across_tp(q.detach())
+        self._assert_same_across_tp(k.detach())
+        self._assert_same_across_tp(weights.detach())
+
+        # The indexer is replicated and computes the same loss on every TP
+        # rank, so it must not add the main compressor's output-gradient sum.
+        (q.float().sum() + k.float().sum() + weights.float().sum()).backward()
+        assert x.grad is not None
+        assert qr.grad is not None
+        self._assert_same_across_tp(x.grad)
+        self._assert_same_across_tp(qr.grad)
+        for parameter in indexer.parameters():
+            assert parameter.grad is not None
+            self._assert_same_across_tp(parameter.grad)
+
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_csa_consumes_local_query_heads_and_sp_gathered_kv(self, layout):
+        # Dense mode removes the learned indexer while retaining the main
+        # compressor, isolating the TP contract of the core attention path.
+        old_dense_mode = self.config.csa_dense_mode
+        self.config.csa_dense_mode = True
+        try:
+            csa = CompressedSparseAttention(
+                config=self.config,
+                submodules=_make_csa_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                pg_collection=self.pg_collection,
+                rotary_pos_emb=self.rotary_pos_emb,
+                compress_ratio=4,
+            ).cuda()
+        finally:
+            self.config.csa_dense_mode = old_dense_mode
+
+        assert csa.indexer is None
+        local_heads = self.config.num_attention_heads // self.tp_size
+        seq_len = 8
+        query_shape = (
+            (seq_len, local_heads, self.config.v_head_dim)
+            if layout == "thd"
+            else (seq_len, 1, local_heads, self.config.v_head_dim)
+        )
+        query = torch.randn(query_shape, dtype=torch.bfloat16, device='cuda').requires_grad_(True)
+        key = torch.randn(
+            seq_len, 1, 1, self.config.v_head_dim, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        x = torch.randn(
+            seq_len, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        packed = _make_packed_seq_params_thd([4, 4]) if layout == "thd" else None
+
+        output = csa(
+            query=query,
+            key=key,
+            value=key,
+            attention_mask=None,
+            x=x,
+            qr=None,
+            packed_seq_params=packed,
+        )
+        assert output.shape == (seq_len, 1, local_heads * self.config.v_head_dim)
+        assert torch.isfinite(output).all()
+        self._assert_same_across_tp(output.detach())
+
+        # Each TP rank owns a distinct query-head shard. Give those local
+        # outputs different upstream gradients: only the replicated main
+        # compressor path should sum them across TP.
+        rank_scale = float(self.pg_collection.tp.rank() + 1)
+        output.float().sum().mul(rank_scale).backward()
+        assert query.grad is not None and torch.isfinite(query.grad).all()
+        assert key.grad is not None and torch.isfinite(key.grad).all()
+        assert csa.attn_sink.grad is not None and torch.isfinite(csa.attn_sink.grad).all()
+        assert x.grad is not None
+        self._assert_same_across_tp(x.grad)
+        for parameter in csa.compressor.parameters():
+            assert parameter.grad is not None
+            self._assert_same_across_tp(parameter.grad)
+
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_csa_indexer_reduces_local_head_targets_across_tp(self, layout):
+        config = _make_mla_config(
+            csa_compress_ratios=[4, 4, 4, 4],
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel=True,
+            dsa_indexer_topk=2,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+        )
+        csa = CompressedSparseAttention(
+            config=config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+        ).cuda()
+        assert csa.indexer is not None
+        assert not csa.apply_dsa_kernel_fusion
+
+        local_heads = config.num_attention_heads // self.tp_size
+        seq_len = 16
+        query_shape = (
+            (seq_len, local_heads, config.v_head_dim)
+            if layout == "thd"
+            else (seq_len, 1, local_heads, config.v_head_dim)
+        )
+        # Model the real TP ownership: each rank has different local query
+        # heads, while KV, hidden states, and q_compressed are replicated after
+        # the outer SP gather.
+        query = (
+            torch.randn(query_shape, dtype=torch.bfloat16, device='cuda')
+            + 0.125 * self.pg_collection.tp.rank()
+        ).requires_grad_(True)
+        key = torch.randn(
+            seq_len, 1, 1, config.v_head_dim, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        x = torch.randn(
+            seq_len, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        qr = torch.randn(
+            seq_len, 1, config.q_lora_rank, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        packed = _make_packed_seq_params_thd([8, 8]) if layout == "thd" else None
+
+        csa.train()
+        output = csa(
+            query=query,
+            key=key,
+            value=key,
+            attention_mask=None,
+            x=x,
+            qr=qr,
+            packed_seq_params=packed,
+        )
+        assert output.shape == (seq_len, 1, local_heads * config.v_head_dim)
+        assert torch.isfinite(output).all()
+
+        rank_scale = float(self.pg_collection.tp.rank() + 1)
+        output.float().sum().mul(rank_scale).backward()
+        assert query.grad is not None and torch.isfinite(query.grad).all()
+        assert key.grad is not None and torch.isfinite(key.grad).all()
+        # CSA intentionally detaches the Indexer inputs; only its parameters
+        # learn from the auxiliary loss.
+        assert qr.grad is None
+
+        # Main-compressor attention gradients and Indexer target probabilities
+        # are reduced over TP by their respective owners. All replicated
+        # parameter gradients must therefore agree despite different local Q.
+        assert x.grad is not None
+        self._assert_same_across_tp(x.grad)
+        for parameter in csa.compressor.parameters():
+            assert parameter.grad is not None
+            self._assert_same_across_tp(parameter.grad)
+        for parameter in csa.indexer.parameters():
+            assert parameter.grad is not None
+            self._assert_same_across_tp(parameter.grad)

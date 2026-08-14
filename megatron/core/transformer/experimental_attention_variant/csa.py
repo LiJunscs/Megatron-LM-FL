@@ -13,7 +13,15 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+)
+from megatron.core.tensor_parallel.random import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
 from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
@@ -36,7 +44,49 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.utils import (
+    make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+# Keep the cuDNN/FlashMLA backend as the SM100+ default. Hopper uses the
+# vendored Triton implementation, whose public wrappers intentionally match
+# these three layout-aware functions for both SBHD and THD.
+_cudnn_dsa_sparse_attn = dsa_sparse_attn
+_cudnn_fused_indexer_sparse_attn = fused_indexer_sparse_attn
+_cudnn_indexer_topk = indexer_topk
+_cudnn_build_flat_topk_idxs = build_flat_topk_idxs
+_dsa_backend_sm = None
+
+
+def _ensure_dsa_kernel_backend() -> None:
+    """Select Triton on SM90 and cuDNN/FlashMLA on SM100+."""
+    global _dsa_backend_sm
+    global build_flat_topk_idxs, dsa_sparse_attn, fused_indexer_sparse_attn, indexer_topk
+
+    sm_major = torch.cuda.get_device_capability()[0]
+    if _dsa_backend_sm == sm_major:
+        return
+    if sm_major == 9:
+        from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+            build_flat_topk_idxs as triton_build_flat_topk_idxs,
+            dsa_sparse_attn as triton_dsa_sparse_attn,
+            fused_indexer_sparse_attn as triton_fused_indexer_sparse_attn,
+            indexer_topk as triton_indexer_topk,
+        )
+
+        build_flat_topk_idxs = triton_build_flat_topk_idxs
+        dsa_sparse_attn = triton_dsa_sparse_attn
+        fused_indexer_sparse_attn = triton_fused_indexer_sparse_attn
+        indexer_topk = triton_indexer_topk
+    else:
+        build_flat_topk_idxs = _cudnn_build_flat_topk_idxs
+        dsa_sparse_attn = _cudnn_dsa_sparse_attn
+        fused_indexer_sparse_attn = _cudnn_fused_indexer_sparse_attn
+        indexer_topk = _cudnn_indexer_topk
+    _dsa_backend_sm = sm_major
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -828,6 +878,7 @@ class Compressor(MegatronModule):
         compress_ratio: int,
         head_dim: int,
         rotate: bool = False,
+        reduce_output_grad_across_tp: bool = False,
         rotary_pos_emb: nn.Module = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
@@ -847,18 +898,29 @@ class Compressor(MegatronModule):
         self.overlap = compress_ratio == 4
         self.coff = 1 + int(self.overlap)
         self.rotate = rotate
+        self.reduce_output_grad_across_tp = reduce_output_grad_across_tp
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
         self.rotary_pos_emb = rotary_pos_emb
 
         proj_out_dim = self.coff * head_dim
 
+        # The DSv4 TP adapter has already converted every CSA input from
+        # SP-local to CP-local before entering this module. These operators are
+        # replicated across TP ranks, so allowing TE to inherit
+        # ``sequence_parallel=True`` would perform a second sequence gather and
+        # a mismatched parameter-gradient reduction. This copied config is used
+        # for both SBHD and THD because their token axis has the same ownership
+        # at the CSA boundary.
+        full_sequence_config = copy.copy(config)
+        full_sequence_config.sequence_parallel = False
+
         with get_fp8_disabled_context(config, is_init=True):
             self.linear_wkv = build_module(
                 submodules.linear_wkv,
                 config.hidden_size,
                 proj_out_dim,
-                config=config,
+                config=full_sequence_config,
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
@@ -871,7 +933,7 @@ class Compressor(MegatronModule):
                 submodules.linear_wgate,
                 config.hidden_size,
                 proj_out_dim,
-                config=config,
+                config=full_sequence_config,
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
@@ -884,14 +946,37 @@ class Compressor(MegatronModule):
         _ape = torch.empty(
             compress_ratio, proj_out_dim, device=torch.cuda.current_device(), dtype=torch.float32
         )
-        config.init_method(_ape)
+        # ``ape`` is replicated. Use the DP RNG stream explicitly so a
+        # preceding TP-sharded allocation cannot desynchronize its initial
+        # value across TP ranks.
+        rng_tracker = get_cuda_rng_tracker()
+        assert rng_tracker.is_initialized(), (
+            "The CUDA RNG tracker must be initialized before constructing DSv4 Compressor.ape"
+        )
+        with rng_tracker.fork(get_data_parallel_rng_tracker_name()):
+            config.init_method(_ape)
         self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
 
-        norm_config = copy.copy(config)
+        norm_config = copy.copy(full_sequence_config)
         norm_config.normalization = "RMSNorm"
         self.norm = build_module(
             submodules.norm, config=norm_config, hidden_size=head_dim, eps=config.layernorm_epsilon
         )
+
+    def _apply_tp_output_grad_contract(self, compressed: torch.Tensor) -> torch.Tensor:
+        """Sum local-query-head gradients before entering replicated parameters.
+
+        Forward is an identity. In backward, the main attention compressor
+        receives one contribution from each TP rank's local query heads, so the
+        contributions must be all-reduced. The indexer's private compressor
+        disables this contract because its replicated indexer loss already
+        produces a complete gradient on every rank.
+        """
+        if self.reduce_output_grad_across_tp and self.pg_collection.tp.size() > 1:
+            compressed = copy_to_tensor_model_parallel_region(
+                compressed, group=self.pg_collection.tp
+            )
+        return compressed
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float = 0) -> torch.Tensor:
         """Apply overlapping window transform for 4x compression.
@@ -977,7 +1062,7 @@ class Compressor(MegatronModule):
 
         if self.rotate:
             kv = rotate_activation(kv)
-        return kv
+        return self._apply_tp_output_grad_contract(kv)
 
     def _forward_thd(
         self,
@@ -1139,6 +1224,7 @@ class Compressor(MegatronModule):
 
         if self.rotate:
             compressed_thd = rotate_activation(compressed_thd)
+        compressed_thd = self._apply_tp_output_grad_contract(compressed_thd)
         return compressed_thd, cu_seqlens_compressed
 
     def forward(
@@ -1159,6 +1245,15 @@ class Compressor(MegatronModule):
         """
         nvtx_range_push("compressor")
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        assert x.ndim == 3 and x.size(-1) == self.config.hidden_size, (
+            f"Compressor expects [S,B,H] or [T,1,H] with H={self.config.hidden_size}, "
+            f"got {tuple(x.shape)}"
+        )
+        if is_thd:
+            assert x.size(1) == 1, (
+                f"THD Compressor input must keep the Megatron dummy batch axis, "
+                f"got {tuple(x.shape)}"
+            )
         if is_thd:
             cu_seqlens = (
                 packed_seq_params.cu_seqlens_q_padded
@@ -1241,13 +1336,19 @@ class CSAIndexer(MegatronModule):
 
         self.rotary_pos_emb = rotary_pos_emb
 
+        # x and qr have already crossed the DSv4 TP/SP adapter. Indexer
+        # projections are duplicated rather than column/row parallel, and must
+        # consume the complete CP-local token axis in both SBHD and THD.
+        full_sequence_config = copy.copy(config)
+        full_sequence_config.sequence_parallel = False
+
         # Q projection (FP8 in the reference DeepSeek V4 checkpoint, so it is built
         # inside the enclosing fp8_model_init context like the other FP8 weights)
         self.linear_wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
             self.index_n_heads * self.index_head_dim,
-            config=config,
+            config=full_sequence_config,
             init_method=config.init_method,
             bias=False,
             skip_bias_add=False,
@@ -1264,7 +1365,7 @@ class CSAIndexer(MegatronModule):
                 submodules.linear_weights_proj,
                 self.hidden_size,
                 self.index_n_heads,
-                config=config,
+                config=full_sequence_config,
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
@@ -1280,6 +1381,7 @@ class CSAIndexer(MegatronModule):
             compress_ratio=compress_ratio,
             head_dim=self.index_head_dim,
             rotate=True,
+            reduce_output_grad_across_tp=False,
             rotary_pos_emb=rotary_pos_emb,
             pg_collection=pg_collection,
             name=(name + ".compressor") if name is not None else None,
@@ -1311,6 +1413,28 @@ class CSAIndexer(MegatronModule):
         nvtx_range_push("indexer_before_topk")
 
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+
+        # The outer DSv4 adapter owns SP communication. Both inputs must
+        # therefore describe the same already-gathered CP-local token axis;
+        # the duplicated indexer projections below never perform SP collectives.
+        assert x.ndim == 3 and qr.ndim == 3, (
+            f"CSAIndexer expects 3-D x/qr, got {tuple(x.shape)}/{tuple(qr.shape)}"
+        )
+        assert x.shape[:2] == qr.shape[:2], (
+            "CSAIndexer x and qr must have identical SP-gathered token and batch axes, "
+            f"got {tuple(x.shape[:2])}/{tuple(qr.shape[:2])}"
+        )
+        assert x.size(-1) == self.hidden_size, (
+            f"CSAIndexer x hidden size must be {self.hidden_size}, got {x.size(-1)}"
+        )
+        assert qr.size(-1) == self.q_lora_rank, (
+            f"CSAIndexer qr hidden size must be {self.q_lora_rank}, got {qr.size(-1)}"
+        )
+        if is_thd:
+            assert x.size(1) == 1, (
+                f"THD CSAIndexer inputs must keep the Megatron dummy batch axis, "
+                f"got {tuple(x.shape)}"
+            )
 
         sq, bsz, _ = x.size()  # in THD: sq = total_q, bsz = 1.
 
@@ -1503,18 +1627,29 @@ class CompressedSparseAttention(MegatronModule):
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        self.n_local_heads = config.num_attention_heads
+        tp_size = self.pg_collection.tp.size()
+        assert config.num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({config.num_attention_heads}) must be divisible by "
+            f"TP size ({tp_size})"
+        )
+        self.n_local_heads = config.num_attention_heads // tp_size
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
 
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        if self.apply_dsa_kernel_fusion:
+            _ensure_dsa_kernel_backend()
 
-        # Learnable attention sink per head, kept in high precision
-        # (FP32 in the reference DeepSeek V4 checkpoint)
+        # Query heads are column-parallel, so the sink follows the same TP head
+        # shard. Keeping a global-sized sink here would broadcast the wrong
+        # dimension in both SBHD [S,B,H,D] and THD [T,H,D].
         self.attn_sink = mark_keep_in_fp32(
             nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+        )
+        set_tensor_model_parallel_attributes(
+            self.attn_sink, is_parallel=True, dim=0, stride=1
         )
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
@@ -1525,6 +1660,7 @@ class CompressedSparseAttention(MegatronModule):
                 compress_ratio=self.compress_ratio,
                 head_dim=config.v_head_dim,
                 rotate=False,
+                reduce_output_grad_across_tp=True,
                 rotary_pos_emb=rotary_pos_emb,
                 pg_collection=pg_collection,
                 name=(name + ".compressor") if name is not None else None,
@@ -1548,6 +1684,38 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        metadata: Optional[dict] = None,
+    ) -> dict:
+        """Build the distributed-checkpoint representation for CSA parameters.
+
+        Args:
+            prefix: Prefix applied to state-dict keys.
+            sharded_offsets: Sharding offsets already introduced by parent modules.
+            metadata: Recursive distributed-checkpoint metadata.
+
+        Returns:
+            The CSA sharded state dict. ``attn_sink`` is sharded with the local
+            query-head axis; Compressor and Indexer parameters remain TP replicas.
+        """
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = super().sharded_state_dict(
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+        sink_key = f"{prefix}attn_sink"
+        sharded_state_dict[sink_key] = make_tp_sharded_tensor_for_checkpoint(
+            self.attn_sink,
+            sink_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+        return sharded_state_dict
 
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
@@ -1623,6 +1791,10 @@ class CompressedSparseAttention(MegatronModule):
                     # indexer_softmax_scale; apply it here via the
                     # weights-scaling trick so the effective weights match
                     # the pre-scale-split behaviour.
+                    # Query/key targets contain only this TP rank's local
+                    # attention heads. FusedDSAIndexerLoss sums those target
+                    # probabilities over its explicit TP group; q/k/weights
+                    # are replicated and need no additional CSA communication.
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
                     topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_indexer,
@@ -1789,6 +1961,10 @@ class CompressedSparseAttention(MegatronModule):
             sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
             kv_offset=offset,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
+            # The fused indexer loss is built from this rank's local query
+            # heads. Let the Triton wrapper combine those targets across TP
+            # before normalizing them; indexer activations remain replicated.
+            tp_group=self.pg_collection.tp,
         )
         nvtx_range_pop("sparse_attn_kernel")
 
@@ -1833,7 +2009,59 @@ class CompressedSparseAttention(MegatronModule):
         """
         nvtx_range_push("compressed_sparse_attn")
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if self.compressor is not None:
+            assert x is not None, "CSA requires the SP-gathered hidden states for compression"
+        assert key.ndim == 4, f"CSA expects a 4-D MQA key, got {tuple(key.shape)}"
+        if x is not None:
+            assert x.ndim == 3, f"CSA hidden states must be 3-D, got {tuple(x.shape)}"
+            assert x.size(-1) == self.config.hidden_size, (
+                f"CSA hidden size must be {self.config.hidden_size}, got {x.size(-1)}"
+            )
+        expected_query_ndim = 3 if is_thd else 4
+        assert query.ndim == expected_query_ndim, (
+            f"CSA {'THD' if is_thd else 'SBHD'} query must have {expected_query_ndim} "
+            f"dimensions, got {tuple(query.shape)}"
+        )
+        assert query.size(-2) == self.n_local_heads, (
+            f"query has {query.size(-2)} local heads, expected {self.n_local_heads} "
+            f"for TP size {self.pg_collection.tp.size()}"
+        )
+        assert self.attn_sink.numel() == self.n_local_heads
+        assert query.size(-1) == self.v_head_dim and key.size(-1) == self.v_head_dim, (
+            f"CSA Q/KV head dim must be {self.v_head_dim}, got "
+            f"{query.size(-1)}/{key.size(-1)}"
+        )
+        assert key.size(0) == query.size(0), (
+            "query and key must enter CSA with the same CP-local, SP-gathered token length"
+        )
+        if x is not None:
+            assert x.size(0) == query.size(0), (
+                "hidden states must enter CSA with the same CP-local, SP-gathered token length"
+            )
+        if self.indexer is not None:
+            assert qr is not None, "CSA Indexer requires the SP-gathered q_compressed tensor"
+        if qr is not None:
+            expected_qr_size = self.config.q_lora_rank or self.config.hidden_size
+            assert qr.ndim == 3 and qr.size(0) == query.size(0), (
+                "q_compressed must be a 3-D, SP-gathered tensor on the same token axis"
+            )
+            assert qr.size(-1) == expected_qr_size, (
+                f"q_compressed hidden size must be {expected_qr_size}, got {qr.size(-1)}"
+            )
+
+        if is_thd:
+            if x is not None:
+                assert x.size(1) == 1, (
+                    f"THD hidden states must be [T,1,H], got {tuple(x.shape)}"
+                )
+            assert key.size(1) == 1 and key.size(2) == 1, (
+                f"THD MQA key must be [T,1,1,D], got {tuple(key.shape)}"
+            )
+            if qr is not None:
+                assert qr.size(1) == 1, (
+                    f"THD q_compressed must be [T,1,H], got {tuple(qr.shape)}"
+                )
             if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
                 output = self._forward_thd_cp(
                     query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
@@ -1842,6 +2070,20 @@ class CompressedSparseAttention(MegatronModule):
                 output = self._forward_thd(query, key, x, qr, packed_seq_params)
             nvtx_range_pop("compressed_sparse_attn")
             return output
+
+        assert query.shape[:2] == key.shape[:2], (
+            "SBHD query and key must share the same SP-gathered [S,B] axes, "
+            f"got {tuple(query.shape[:2])}/{tuple(key.shape[:2])}"
+        )
+        if x is not None:
+            assert x.shape[:2] == query.shape[:2], (
+                "SBHD hidden states must share query's SP-gathered [S,B] axes"
+            )
+        assert key.size(2) == 1, f"SBHD CSA expects a single MQA KV head, got {key.size(2)}"
+        if qr is not None:
+            assert qr.shape[:2] == query.shape[:2], (
+                "SBHD q_compressed must share query's SP-gathered [S,B] axes"
+            )
 
         sq, b, np, hn = query.size()
 
@@ -1938,6 +2180,9 @@ class CompressedSparseAttention(MegatronModule):
                     k_thd = k_indexer.squeeze(1)
 
                     key_for_loss_thd = compressed_kv.unsqueeze(1).expand(-1, np_, -1)
+                    # ``query`` and ``key_for_loss_thd`` contain local TP heads;
+                    # FusedDSAIndexerLoss owns their target-score all-reduce.
+                    # The Indexer's q/k/weights remain replicated.
                     weights_for_unfused = w_thd * self.indexer.softmax_scale
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
 
@@ -2265,6 +2510,10 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv=compressed_kv,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
             cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
+            # THD changes only token packing. Query heads are still TP-local,
+            # so target construction follows the same TP reduction contract as
+            # the SBHD fused path.
+            tp_group=self.pg_collection.tp,
         )
 
         if indexer_loss_coeff > 0:

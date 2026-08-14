@@ -2,13 +2,15 @@
 
 
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from enum import Enum
+from typing import NoReturn, Optional, Sequence, Union
 
 import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    _FusedMLARoPEInplace,
     fused_mla_rope_inplace,
     fused_mla_rope_out_of_place,
 )
@@ -21,19 +23,343 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import get_pg_size, is_te_min_version
+from megatron.core.utils import get_pg_size, is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
 else:
     (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
+
+
+##### FlagScale Add #####
+class _DSv4TPBackwardPolicy(Enum):
+    """Backward ownership of a field crossing the DSv4 TP adapter."""
+
+    PASS_THROUGH = "pass_through"
+    SCATTER = "scatter"
+    REDUCE_SCATTER = "reduce_scatter"
+    ALL_REDUCE = "all_reduce"
+    NO_GRAD = "no_grad"
+
+
+@dataclass(frozen=True)
+class _DSv4TPField:
+    """Named tensor and its backward policy in the DSv4 TP adapter."""
+
+    name: str
+    tensor: torch.Tensor
+    backward_policy: _DSv4TPBackwardPolicy
+
+
+class _DSv4TPRopeExchange(torch.autograd.Function):
+    """Apply Q RoPE while hiding DSv4's SP and replicated-KV TP communication."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        local_tensor,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        tp_group,
+        field_specs,
+        gather_sequence,
+        apply_fused_rope,
+        remove_interleaving,
+    ):
+        work = None
+        if gather_sequence:
+            gathered = local_tensor.new_empty(
+                local_tensor.size(0) * tp_group.size(), *local_tensor.shape[1:]
+            )
+            work = torch.distributed.all_gather_into_tensor(
+                gathered,
+                local_tensor.contiguous(),
+                group=tp_group,
+                async_op=True,
+            )
+        else:
+            gathered = local_tensor
+
+        if apply_fused_rope:
+            query = _FusedMLARoPEInplace.forward(
+                ctx,
+                q,
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q,
+                cp_rank,
+                cp_size,
+                False,
+                False,
+                remove_interleaving,
+            )
+        else:
+            query = q
+        if work is not None:
+            work.wait()
+
+        ctx.tp_group = tp_group
+        ctx.field_specs = field_specs
+        ctx.gather_sequence = gather_sequence
+        ctx.apply_fused_rope = apply_fused_rope
+        return query, gathered
+
+    @staticmethod
+    def backward(ctx, grad_query, grad_fields):
+        tp_size = ctx.tp_group.size()
+        field_widths = [width for _, width, _ in ctx.field_specs]
+        field_grads = torch.split(grad_fields, field_widths, dim=-1)
+        local_field_grads = [None] * len(ctx.field_specs)
+        communication_indices = []
+        communication_grads = []
+
+        if ctx.gather_sequence:
+            assert grad_fields.size(0) % tp_size == 0
+            local_rows = grad_fields.size(0) // tp_size
+            sequence_start = ctx.tp_group.rank() * local_rows
+            communication_policy = _DSv4TPBackwardPolicy.REDUCE_SCATTER
+        else:
+            local_rows = grad_fields.size(0)
+            sequence_start = 0
+            communication_policy = _DSv4TPBackwardPolicy.ALL_REDUCE
+
+        for index, ((_, _, policy), field_grad) in enumerate(
+            zip(ctx.field_specs, field_grads)
+        ):
+            if policy is _DSv4TPBackwardPolicy.PASS_THROUGH:
+                local_field_grads[index] = field_grad
+            elif policy is _DSv4TPBackwardPolicy.SCATTER:
+                local_field_grads[index] = field_grad.narrow(
+                    0, sequence_start, local_rows
+                ).contiguous()
+            elif policy is communication_policy:
+                communication_indices.append(index)
+                communication_grads.append(field_grad)
+            elif policy is _DSv4TPBackwardPolicy.NO_GRAD:
+                local_field_grads[index] = field_grad.new_zeros(
+                    local_rows, *field_grad.shape[1:]
+                )
+            else:
+                raise AssertionError(
+                    f"Invalid DSv4 TP policy {policy} for gather_sequence={ctx.gather_sequence}"
+                )
+
+        work = None
+        local_communicated_grad = None
+        if communication_grads:
+            communicated_grad = (
+                communication_grads[0]
+                if len(communication_grads) == 1
+                else torch.cat(communication_grads, dim=-1)
+            ).contiguous()
+            if ctx.gather_sequence:
+                local_communicated_grad = communicated_grad.new_empty(
+                    local_rows, *communicated_grad.shape[1:]
+                )
+                work = torch.distributed.reduce_scatter_tensor(
+                    local_communicated_grad,
+                    communicated_grad,
+                    group=ctx.tp_group,
+                    async_op=True,
+                )
+            else:
+                local_communicated_grad = communicated_grad
+                work = torch.distributed.all_reduce(
+                    local_communicated_grad,
+                    group=ctx.tp_group,
+                    async_op=True,
+                )
+
+        grad_q = (
+            _FusedMLARoPEInplace.backward(ctx, grad_query)[0]
+            if ctx.apply_fused_rope
+            else grad_query
+        )
+        if work is not None:
+            work.wait()
+        if local_communicated_grad is not None:
+            communicated_widths = [field_widths[index] for index in communication_indices]
+            for index, field_grad in zip(
+                communication_indices,
+                torch.split(local_communicated_grad, communicated_widths, dim=-1),
+            ):
+                local_field_grads[index] = field_grad
+
+        assert all(field_grad is not None for field_grad in local_field_grads)
+        return (
+            grad_q,
+            torch.cat(local_field_grads, dim=-1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _dsv4_tp_rope_exchange(
+    q,
+    fields: Sequence[_DSv4TPField],
+    cos,
+    sin,
+    nope_dim,
+    emb_dim,
+    cu_seqlens_q,
+    cp_rank,
+    cp_size,
+    tp_group,
+    gather_sequence,
+    is_thd,
+    apply_fused_rope,
+    remove_interleaving=True,
+):
+    """Normalize tensors to a CP-local layout and apply the configured TP backward contract.
+
+    ``PackedSeqParams`` is intentionally not passed through this adapter.  The TP collective
+    treats the packed token dimension as an ordinary contiguous leading dimension.  The only
+    packed-sequence metadata consumed by fused Q RoPE is ``cu_seqlens_q``; ``max_seqlen_q`` has
+    already been used by the caller to construct ``cos`` and ``sin``.  KV sequence metadata is
+    consumed later, after the CP boundary exchange, and therefore does not belong here.
+
+    For THD, TE's column-parallel Q up-projection has already gathered its sequence input, so
+    ``q`` is CP-local while the tensors in ``fields`` are SP-local when ``gather_sequence`` is
+    true.  This adapter gathers only the latter tensors and leaves Q's TP communication to TE.
+    """
+    assert fields, "DSv4 TP exchange requires at least one field"
+    assert tp_group is not None, "DSv4 TP exchange requires an explicit TP process group"
+    tp_size = get_pg_size(tp_group)
+    assert tp_size >= 1
+    assert cp_size >= 1 and 0 <= cp_rank < cp_size, (
+        f"Invalid CP coordinates: rank={cp_rank}, size={cp_size}"
+    )
+    assert not gather_sequence or tp_size > 1, (
+        "DSv4 sequence gather is only valid with tensor parallel size greater than one"
+    )
+
+    names = [field.name for field in fields]
+    assert len(names) == len(set(names)), f"DSv4 TP field names must be unique: {names}"
+    leading_shape = fields[0].tensor.shape[:-1]
+    for field in fields:
+        assert field.tensor.shape[:-1] == leading_shape, (
+            f"DSv4 TP field {field.name!r} has leading shape {field.tensor.shape[:-1]}, "
+            f"expected {leading_shape}"
+        )
+        assert field.tensor.size(-1) > 0, field.name
+
+    # Validate the format boundary explicitly.  This catches an accidental [T, 1, H] tensor
+    # before all-gather silently interprets the dummy packed batch dimension as real layout.
+    expected_local_tokens = fields[0].tensor.size(0)
+    expected_q_tokens = expected_local_tokens * (tp_size if gather_sequence else 1)
+    if is_thd:
+        assert q.ndim == 3, f"THD Q must have shape [T, H, D], got {tuple(q.shape)}"
+        assert all(field.tensor.ndim == 2 for field in fields), (
+            "THD TP fields must have shape [T, D]; remove the dummy batch dimension "
+            f"before exchange, got {[tuple(field.tensor.shape) for field in fields]}"
+        )
+        assert cu_seqlens_q is not None, "THD layout requires cu_seqlens_q"
+        assert cu_seqlens_q.ndim == 1, (
+            f"THD cu_seqlens_q must be one-dimensional, got {tuple(cu_seqlens_q.shape)}"
+        )
+        assert cu_seqlens_q.dtype in (torch.int32, torch.int64), (
+            f"THD cu_seqlens_q must be integral, got {cu_seqlens_q.dtype}"
+        )
+        assert cu_seqlens_q.device == q.device, (
+            f"THD cu_seqlens_q is on {cu_seqlens_q.device}, but Q is on {q.device}"
+        )
+    else:
+        assert q.ndim == 4, f"SBHD Q must have shape [S, B, H, D], got {tuple(q.shape)}"
+        assert all(field.tensor.ndim == 3 for field in fields), (
+            "SBHD TP fields must have shape [S, B, D], got "
+            f"{[tuple(field.tensor.shape) for field in fields]}"
+        )
+        assert q.size(1) == fields[0].tensor.size(1), (
+            f"Q batch size {q.size(1)} does not match TP field batch size "
+            f"{fields[0].tensor.size(1)}"
+        )
+    assert q.size(0) == expected_q_tokens, (
+        "TE column-parallel Q must already be CP-local, while TP fields must be "
+        f"{'SP-local' if gather_sequence else 'CP-local'}: Q has {q.size(0)} tokens, "
+        f"expected {expected_q_tokens} from field length {expected_local_tokens} and "
+        f"TP size {tp_size}"
+    )
+
+    local_tensor = (
+        fields[0].tensor
+        if len(fields) == 1
+        else torch.cat([field.tensor for field in fields], dim=-1)
+    )
+    field_specs = tuple(
+        (field.name, field.tensor.size(-1), field.backward_policy) for field in fields
+    )
+    allowed_policies = (
+        {
+            _DSv4TPBackwardPolicy.SCATTER,
+            _DSv4TPBackwardPolicy.REDUCE_SCATTER,
+            _DSv4TPBackwardPolicy.NO_GRAD,
+        }
+        if gather_sequence
+        else {
+            _DSv4TPBackwardPolicy.PASS_THROUGH,
+            _DSv4TPBackwardPolicy.ALL_REDUCE,
+            _DSv4TPBackwardPolicy.NO_GRAD,
+        }
+    )
+    for field in fields:
+        assert field.backward_policy in allowed_policies, (
+            f"Invalid policy {field.backward_policy} for DSv4 field {field.name!r} "
+            f"with gather_sequence={gather_sequence}"
+        )
+    query, exchanged = _DSv4TPRopeExchange.apply(
+        q,
+        local_tensor,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        tp_group,
+        field_specs,
+        gather_sequence,
+        apply_fused_rope,
+        remove_interleaving,
+    )
+    exchanged_fields = torch.split(
+        exchanged, [field.tensor.size(-1) for field in fields], dim=-1
+    )
+    result = {}
+    for field, exchanged_field in zip(fields, exchanged_fields):
+        if field.backward_policy is _DSv4TPBackwardPolicy.NO_GRAD:
+            exchanged_field = exchanged_field.detach()
+        result[field.name] = exchanged_field
+    return query, result
+##### FlagScale End #####
 
 
 @torch.compile
@@ -87,18 +413,32 @@ class DSv4HybridAttention(Attention):
         )
         self.config: MLATransformerConfig
 
-        assert (
-            get_pg_size(self.pg_collection.tp) == 1
-        ), "DSv4 Hybrid Attention only supports TP size 1."
-
+        ##### FlagScale Add #####
+        tp_size = get_pg_size(self.pg_collection.tp)
+        assert self.config.num_attention_heads % tp_size == 0, (
+            f"num_attention_heads ({self.config.num_attention_heads}) must be divisible by "
+            f"tensor parallel size ({tp_size})"
+        )
+        # DSv4 uses a single replicated MQA KV head.  The generic Attention
+        # value has GQA-specific semantics when num_query_groups < TP size, so
+        # it cannot describe the column-parallel Q projection on this path.
+        self.num_local_q_heads = self.config.num_attention_heads // tp_size
+        ##### FlagScale End #####
         assert (
             not self.checkpoint_core_attention
         ), "Checkpoint core attention is not supported in DSv4 Hybrid Attention."
         assert (
             not self.offload_qkv_linear
         ), "Offload qkv linear is not supported in DSv4 Hybrid Attention."
-
+        ##### FlagScale Add #####
+        # ColumnParallelLinear constructors take global dimensions and perform
+        # the TP division internally.  Keep Megatron's standard global meaning
+        # for query_projection_size and track the local width separately.
+        ##### FlagScale End #####
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
+        self.query_projection_size_per_partition = (
+            self.config.v_head_dim * self.num_local_q_heads
+        )   ##### FlagScale Add #####
 
         self.q_head_dim = self.config.v_head_dim
 
@@ -169,21 +509,42 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
-        self.o_local_groups = self.config.o_groups
-        assert (
-            self.query_projection_size % self.config.o_groups == 0
-        ), "num_attention_heads * v_head_dim must be divisible by o_groups"
-        group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
-
+        ##### FlagScale Add #####
+        assert self.config.o_groups % tp_size == 0, (
+            f"o_groups ({self.config.o_groups}) must be divisible by tensor parallel "
+            f"size ({tp_size})"
+        )
+        self.o_local_groups = self.config.o_groups // tp_size
+        assert self.query_projection_size_per_partition % self.o_local_groups == 0, (
+            "local_num_attention_heads * v_head_dim must be divisible by local o_groups"
+        )
+        group_proj_in_size = self.query_projection_size_per_partition // self.o_local_groups
+        group_proj_out_size = self.o_local_groups * self.config.o_lora_rank
+        ##### FlagScale End #####
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
             group_proj_in_size,
             device=torch.cuda.current_device(),
             dtype=self.config.params_dtype,
         )
-        self.config.init_method(_linear_o_group_proj)
+        ##### FlagScale Add #####
+        # This parameter is TP-sharded along its group/output axis.  Initialize
+        # it from the model-parallel RNG stream so TP ranks receive distinct
+        # local shards.  Forking also restores the default/DP RNG afterwards,
+        # preventing this TP-size-dependent tensor from shifting subsequent
+        # replicated parameter initialization (notably compressor ``ape``).
+        rng_tracker = get_cuda_rng_tracker()
+        assert rng_tracker.is_initialized(), (
+            "The CUDA RNG tracker must be initialized before constructing "
+            "DSv4HybridAttention.linear_o_group_proj"
+        )
+        with rng_tracker.fork():
+            self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        set_tensor_model_parallel_attributes(
+            self.linear_o_group_proj, is_parallel=True, dim=0, stride=1
+        )
+        ##### FlagScale End #####
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -218,6 +579,25 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    ##### FlagScale Add #####
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Shard the grouped output projection along its group/output axis."""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = super().sharded_state_dict(
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+        weight_key = f"{prefix}linear_o_group_proj"
+        sharded_state_dict[weight_key] = make_tp_sharded_tensor_for_checkpoint(
+            self.linear_o_group_proj,
+            weight_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+        return sharded_state_dict
+    ##### FlagScale End #####
 
     def forward(
         self,
@@ -271,15 +651,6 @@ class DSv4HybridAttention(Attention):
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
         self.pg_collection.cp = cp_group
 
-        boundary_hidden = None
-        if use_thd_cp:
-            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
-
         # =====================
         # Query, Key, and Value
         # =====================
@@ -291,18 +662,30 @@ class DSv4HybridAttention(Attention):
             position_ids,
             packed_seq_params,
             inference_context=inference_context,
-            boundary_hidden=boundary_hidden,
         )
         if use_thd_cp:
-            query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
+            (
+                query,
+                key,
+                value,
+                q_compressed,
+                gathered_hidden_states,
+                boundary_hidden,
+                boundary_kv,
+            ) = qkv
         else:
-            query, key, value, q_compressed, kv_compressed = qkv
+            query, key, value, q_compressed, gathered_hidden_states = qkv
+            boundary_hidden = None
             boundary_kv = None
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
-        value = value.contiguous()
+        ##### FlagScale Add #####
+        # DSv4's single MQA tensor is shared by key and value. Preserve that
+        # alias instead of materializing the same contiguous tensor twice.
+        ##### FlagScale End #####
+        value = key
 
         # ==================================
         # core attention computation
@@ -318,12 +701,18 @@ class DSv4HybridAttention(Attention):
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
-                x=hidden_states,
+                x=gathered_hidden_states,
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
             )
-        forced_released_tensors = [query, key, value]
+        # ``value`` aliases ``key`` for DSv4 MQA. Do not place the same tensor
+        # in the offload release list twice: the release path clears its
+        # underlying storage, and duplicate releases are unnecessary and
+        # fragile if that path later stops being idempotent.
+        forced_released_tensors = [query, key]
+        if value is not key:
+            forced_released_tensors.append(value)
         if boundary_kv is not None:
             forced_released_tensors.append(boundary_kv)
         core_attn_out = core_attn_manager.group_offload(
@@ -344,7 +733,7 @@ class DSv4HybridAttention(Attention):
 
         # inverse RoPE on last qk_pos_emb_head_dim of each head
         seq_len = core_attn_out.size(0)
-        n_heads = self.num_attention_heads_per_partition
+        n_heads = self.num_local_q_heads
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = self.config.v_head_dim - pos_dim
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
@@ -552,8 +941,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
             name=(name + ".linear_q_up_proj") if name is not None else None,
+            skip_weight_param_allocation=False,
         )
-
+        ##### FlagScale Add #####
+        kv_proj_kwargs = {}
+        if submodules.linear_kv_proj in [TELinear]:
+            # The single MQA KV head is intentionally replicated.  Sharding
+            # v_head_dim would leave RoPE and CSA with only a partial head.
+            kv_proj_kwargs['parallel_mode'] = 'duplicated'
+        else:
+            raise ValueError(f"Unsupported linear_kv_proj: {submodules.linear_kv_proj}")
+        ##### FlagScale End #####
         self.linear_kv_proj = build_module(
             submodules.linear_kv_proj,
             self.config.hidden_size,
@@ -565,8 +963,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
-            tp_group=pg_collection.tp,
+            tp_group=None,
             name=(name + ".linear_kv_proj") if name is not None else None,
+            **kv_proj_kwargs,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
@@ -589,14 +988,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         inference_context=None,
         *,
         inference_params=None,
-        boundary_hidden=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
 
         Returns:
-            Tuple of ``(query, key, value, q_compressed, kv_compressed)``. The THD CP
-            path appends ``boundary_kv`` carrying the projected left-boundary rows.
+            Tuple of ``(query, key, value, q_compressed, hidden_states)``. The THD CP
+            path appends ``boundary_hidden`` and projected ``boundary_kv`` rows.
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
         # Attention heads [s, b, n*h]
@@ -661,20 +1059,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # q_compressed: [s, b, q_lora_rank]
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
-        # Despite their legacy names, these are hidden-state inputs to linear_kv_proj;
-        # DSv4's actual compressed KV is produced later by the CSA compressor.
-        kv_compressed = hidden_states
+        # ``hidden_for_tp`` is flattened only while crossing TE/TP operators.
+        # CSA receives the dummy THD batch axis again after TP communication.
+        hidden_for_tp = hidden_states
         k_pos_emb = None
-        boundary_kv_compressed = boundary_hidden
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
-            kv_compressed = kv_compressed.squeeze(1)
-            if boundary_kv_compressed is not None:
-                boundary_kv_compressed = boundary_kv_compressed.squeeze(1)
+            hidden_for_tp = hidden_for_tp.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -690,11 +1085,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
         def qkv_up_proj_and_rope_apply(
             q_compressed,
-            kv_compressed,
+            hidden_for_tp,
             k_pos_emb,
             rotary_pos_emb,
             cp_group,
-            boundary_kv_compressed=None,
         ):
             """
             Apply the up projection and RoPE to the query and key.
@@ -705,41 +1099,95 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
             q, _ = self.linear_q_up_proj(q_compressed)
-
+            ##### FlagScale Add #####
             # q: [num_tokens, n, q_head_dim]
-            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+            assert q.size(-1) == self.query_projection_size_per_partition, (
+                f"local Q projection width ({q.size(-1)}) must equal "
+                "num_local_q_heads * q_head_dim "
+                f"({self.query_projection_size_per_partition})"
+            )
+            q = q.view(*q.size()[:-1], self.num_local_q_heads, self.q_head_dim)
+            ##### FlagScale End #####
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
-            boundary_rows = 0
-            if boundary_kv_compressed is not None:
-                boundary_rows = boundary_kv_compressed.shape[0]
-                kv_projection_input = torch.cat([boundary_kv_compressed, kv_compressed], dim=0)
-            else:
-                kv_projection_input = kv_compressed
-
-            kv, _ = self.linear_kv_proj(kv_projection_input)
-            kv = self.kv_layernorm(kv)
-            boundary_kv = None
+            kv, _ = self.linear_kv_proj(hidden_for_tp)
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             cp_size = cp_group.size()
+            cp_rank = cp_group.rank()
+            tp_size = get_pg_size(self.pg_collection.tp)
+            sp_enabled = self.config.sequence_parallel and tp_size > 1
+            if sp_enabled:
+                fields = (
+                    _DSv4TPField(
+                        "hidden_states", hidden_for_tp, _DSv4TPBackwardPolicy.SCATTER
+                    ),
+                    _DSv4TPField("kv", kv, _DSv4TPBackwardPolicy.REDUCE_SCATTER),
+                    _DSv4TPField(
+                        "q_compressed", q_compressed, _DSv4TPBackwardPolicy.NO_GRAD
+                    ),
+                )
+            else:
+                kv_policy = (
+                    _DSv4TPBackwardPolicy.ALL_REDUCE
+                    if tp_size > 1
+                    else _DSv4TPBackwardPolicy.PASS_THROUGH
+                )
+                fields = (_DSv4TPField("kv", kv, kv_policy),)
+
+            # Do not pass PackedSeqParams as an opaque object across this boundary.  At this
+            # point its Q-side contract is fully represented by ``packed_seq`` (layout) and
+            # ``cu_seqlens_q`` (fused RoPE); the remaining metadata is used by KV/CP below.
+            query, exchanged = _dsv4_tp_rope_exchange(
+                q=q,
+                fields=fields,
+                cos=rotary_pos_cos,
+                sin=rotary_pos_sin,
+                nope_dim=self.config.qk_head_dim,
+                emb_dim=self.config.qk_pos_emb_head_dim,
+                cu_seqlens_q=cu_seqlens_q,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                tp_group=self.pg_collection.tp,
+                gather_sequence=sp_enabled,
+                is_thd=packed_seq,
+                apply_fused_rope=self.config.apply_rope_fusion,
+            )
+            kv = exchanged["kv"]
+            if sp_enabled:
+                hidden_for_tp = exchanged["hidden_states"]
+                q_compressed = exchanged["q_compressed"]
+
+            gathered_hidden_states = (
+                hidden_for_tp.unsqueeze(1) if packed_seq else hidden_for_tp
+            )
+            boundary_hidden = None
+            boundary_kv = None
+            boundary_rows = 0
+            if cp_size > 1 and packed_seq:
+                boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                    gathered_hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    cp_group,
+                )
+                boundary_kv_raw = cp_utils.exchange_cp_boundary_hidden(
+                    kv,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    cp_group,
+                )
+                boundary_rows = boundary_kv_raw.shape[0]
+                kv = torch.cat((boundary_kv_raw, kv), dim=0)
+
+            kv = self.kv_layernorm(kv)
             if self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
-                    cp_rank = cp_group.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
                     global_start = cp_rank * q.shape[0]
-                    query = cp_utils.apply_thd_cp_local_rope_fused(
-                        q,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        self.config.qk_head_dim,
-                        self.config.qk_pos_emb_head_dim,
-                        cu_seqlens_q,
-                        global_start,
-                    )
                     kv = kv.unsqueeze(-2)
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
                         kv,
@@ -750,22 +1198,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cu_seqlens_q,
                         global_start - boundary_rows,
                     )
-                    if boundary_kv_compressed is not None:
-                        boundary_kv = kv[:boundary_rows]
-                        kv = kv[boundary_rows:]
+                    boundary_kv = kv[:boundary_rows]
+                    kv = kv[boundary_rows:]
                 else:
-                    cp_rank = cp_group.rank()
-                    query = fused_mla_rope_inplace(
-                        q,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        self.config.qk_head_dim,
-                        self.config.qk_pos_emb_head_dim,
-                        cu_seqlens_q,
-                        cp_rank,
-                        cp_size,
-                        remove_interleaving=True,
-                    )
                     kv = kv.unsqueeze(-2)
                     kv = fused_mla_rope_inplace(
                         kv,
@@ -801,9 +1236,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         global_start - boundary_rows,
                         self.config,
                     )
-                    if boundary_kv_compressed is not None:
-                        boundary_kv = kv[:boundary_rows]
-                        kv = kv[boundary_rows:]
+                    boundary_kv = kv[:boundary_rows]
+                    kv = kv[boundary_rows:]
                     key = value = kv
                 else:
                     q_len = q.size()[0]
@@ -860,52 +1294,35 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 boundary_kv = boundary_kv.contiguous()
 
             if boundary_kv is None:
-                return query, key, value
-            return query, key, value, boundary_kv
+                return query, key, value, q_compressed, gathered_hidden_states
+            return (
+                query,
+                key,
+                value,
+                q_compressed,
+                gathered_hidden_states,
+                boundary_hidden,
+                boundary_kv,
+            )
 
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            if boundary_kv_compressed is None:
-                query, key, value = self.qkv_up_checkpoint.checkpoint(
-                    qkv_up_proj_and_rope_apply,
-                    q_compressed,
-                    kv_compressed,
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    self.pg_collection.cp,
-                )
-                boundary_kv = None
-            else:
-                query, key, value, boundary_kv = self.qkv_up_checkpoint.checkpoint(
-                    qkv_up_proj_and_rope_apply,
-                    q_compressed,
-                    kv_compressed,
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    self.pg_collection.cp,
-                    boundary_kv_compressed,
-                )
-        else:
-            if boundary_kv_compressed is None:
-                query, key, value = qkv_up_proj_and_rope_apply(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, self.pg_collection.cp
-                )
-                boundary_kv = None
-            else:
-                query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(
-                    q_compressed,
-                    kv_compressed,
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    self.pg_collection.cp,
-                    boundary_kv_compressed,
-                )
-
-        result = (query, key, value, q_compressed, kv_compressed)
-        if boundary_kv is not None:
-            return result + (boundary_kv,)
-        return result
+            return self.qkv_up_checkpoint.checkpoint(
+                qkv_up_proj_and_rope_apply,
+                q_compressed,
+                hidden_for_tp,
+                k_pos_emb,
+                rotary_pos_emb,
+                self.pg_collection.cp,
+            )
+        return qkv_up_proj_and_rope_apply(
+            q_compressed,
+            hidden_for_tp,
+            k_pos_emb,
+            rotary_pos_emb,
+            self.pg_collection.cp,
+        )
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""
