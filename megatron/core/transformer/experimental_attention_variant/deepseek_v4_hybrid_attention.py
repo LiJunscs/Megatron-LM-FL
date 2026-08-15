@@ -271,14 +271,17 @@ def _dsv4_tp_rope_exchange(
         )
         assert field.tensor.size(-1) > 0, field.name
 
-    # Validate the format boundary explicitly.  This catches an accidental [T, 1, H] tensor
-    # before all-gather silently interprets the dummy packed batch dimension as real layout.
+    # Linear/adapter layout contract. Linear layers and TP collectives preserve
+    # arbitrary leading dimensions, so both SBHD and THD fields keep their
+    # three-dimensional activation layout here. Only Q has been normalized at
+    # the RoPE boundary already: THD removes its dummy batch axis before this
+    # call, and fused RoPE (when enabled) executes inside the adapter.
     expected_local_tokens = fields[0].tensor.size(0)
     expected_q_tokens = expected_local_tokens * (tp_size if gather_sequence else 1)
     if is_thd:
         assert q.ndim == 3, f"THD Q must have shape [T, H, D], got {tuple(q.shape)}"
-        assert all(field.tensor.ndim == 2 for field in fields), (
-            "THD TP fields must have shape [T, D]; remove the dummy batch dimension "
+        assert all(field.tensor.ndim == 3 and field.tensor.size(1) == 1 for field in fields), (
+            "THD TP fields must preserve the linear layout [T,1,D], "
             f"before exchange, got {[tuple(field.tensor.shape) for field in fields]}"
         )
         assert cu_seqlens_q is not None, "THD layout requires cu_seqlens_q"
@@ -949,6 +952,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # The single MQA KV head is intentionally replicated.  Sharding
             # v_head_dim would leave RoPE and CSA with only a partial head.
             kv_proj_kwargs['parallel_mode'] = 'duplicated'
+            kv_proj_kwargs['skip_weight_param_allocation'] = False
         else:
             raise ValueError(f"Unsupported linear_kv_proj: {submodules.linear_kv_proj}")
         ##### FlagScale End #####
@@ -958,7 +962,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             self.config.v_head_dim,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
             bias=False,
             skip_bias_add=False,
             is_expert=False,
@@ -1059,24 +1062,18 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # q_compressed: [s, b, q_lora_rank]
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
-        # ``hidden_for_tp`` is flattened only while crossing TE/TP operators.
-        # CSA receives the dummy THD batch axis again after TP communication.
+        # Linear layers and TP communication are agnostic to the trailing
+        # leading dimensions. Keep SBHD [S,B,D] and THD [T,1,D] unchanged;
+        # only RoPE converts Q/KV to TE's packed attention layout.
         hidden_for_tp = hidden_states
         k_pos_emb = None
-
-        if packed_seq_params is not None:
-            # If sequence packing, TE expect [t, h, d] shaped qkv input.
-            # In Megatron-Core, the qkv shape is [t, 1, h, d].
-            # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
-            q_compressed = q_compressed.squeeze(1)
-            hidden_for_tp = hidden_for_tp.squeeze(1)
 
         # =========================================
         # Apply norm
         # =========================================
 
         if self.config.q_lora_rank is not None:
-            # q_compressed: [num_tokens, q_lora_rank]
+            # q_compressed: [S,B,R] for SBHD or [T,1,R] for THD.
             q_compressed = apply_module(self.q_layernorm)(q_compressed)
 
         # =========================================
@@ -1092,12 +1089,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         ):
             """
             Apply the up projection and RoPE to the query and key.
-            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
-            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
-            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+            Linear inputs preserve [S,B,D] for SBHD and [T,1,D] for THD.
+            RoPE alone converts projected THD Q/KV to TE's packed attention layout.
             """
-            # q_compressed: [num_tokens, q_lora_rank]
-            # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+            # q_compressed: [..., q_lora_rank]
+            # q: [..., n * (qk_head_dim + qk_pos_emb_head_dim)]
             q, _ = self.linear_q_up_proj(q_compressed)
             ##### FlagScale Add #####
             # q: [num_tokens, n, q_head_dim]
@@ -1109,6 +1105,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             q = q.view(*q.size()[:-1], self.num_local_q_heads, self.q_head_dim)
             ##### FlagScale End #####
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            # RoPE/attention layout contract: THD Q has no batch axis.
+            if packed_seq:
+                assert q.ndim == 4 and q.size(1) == 1, (
+                    f"THD Q projection must be [T,1,H,D] before RoPE, got {tuple(q.shape)}"
+                )
+                q = q.squeeze(1)
 
             kv, _ = self.linear_kv_proj(hidden_for_tp)
 
@@ -1161,9 +1163,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 hidden_for_tp = exchanged["hidden_states"]
                 q_compressed = exchanged["q_compressed"]
 
-            gathered_hidden_states = (
-                hidden_for_tp.unsqueeze(1) if packed_seq else hidden_for_tp
-            )
+            gathered_hidden_states = hidden_for_tp
+            gathered_q_compressed = q_compressed
             boundary_hidden = None
             boundary_kv = None
             boundary_rows = 0
@@ -1184,6 +1185,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv = torch.cat((boundary_kv_raw, kv), dim=0)
 
             kv = self.kv_layernorm(kv)
+            # RoPE/attention layout contract: linear/adapter KV is [T,1,D]
+            # for THD. Remove only the dummy batch axis here; the following
+            # unsqueeze creates the MQA head axis expected by attention.
+            if packed_seq:
+                assert kv.ndim == 3 and kv.size(1) == 1, (
+                    f"THD KV projection must be [T,1,D] before RoPE, got {tuple(kv.shape)}"
+                )
+                kv = kv.squeeze(1)
             if self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
@@ -1294,12 +1303,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 boundary_kv = boundary_kv.contiguous()
 
             if boundary_kv is None:
-                return query, key, value, q_compressed, gathered_hidden_states
+                return query, key, value, gathered_q_compressed, gathered_hidden_states
             return (
                 query,
                 key,
                 value,
-                q_compressed,
+                gathered_q_compressed,
                 gathered_hidden_states,
                 boundary_hidden,
                 boundary_kv,

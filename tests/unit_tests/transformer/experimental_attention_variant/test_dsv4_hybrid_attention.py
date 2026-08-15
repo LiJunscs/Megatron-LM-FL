@@ -168,9 +168,9 @@ class TestDSv4TPRopeExchange:
         tp_rank = pg.tp.rank()
         device = torch.device('cuda', torch.cuda.current_device())
         q = torch.ones(4, 1, 3, device=device, requires_grad=True)
-        hidden = torch.full((2, 2), float(tp_rank + 1), device=device, requires_grad=True)
-        kv = torch.ones(2, 3, device=device, requires_grad=True)
-        q_compressed = torch.ones(2, 1, device=device, requires_grad=True)
+        hidden = torch.full((2, 1, 2), float(tp_rank + 1), device=device, requires_grad=True)
+        kv = torch.ones(2, 1, 3, device=device, requires_grad=True)
+        q_compressed = torch.ones(2, 1, 1, device=device, requires_grad=True)
         fields = (
             dsv4_attention._DSv4TPField(
                 "hidden_states", hidden, dsv4_attention._DSv4TPBackwardPolicy.SCATTER

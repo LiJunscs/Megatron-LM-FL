@@ -348,9 +348,9 @@ class TransformerConfig(ModelParallelConfig):
     disabled."""
 
     apply_dsa_kernel_fusion: bool = False
-    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
-    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
-    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
+    """If True, prefer FlashMLA forward plus cuDNN DSA backward/indexer kernels. On SM90,
+    fall back to Triton when either legacy backend is unavailable; the Triton fallback does not
+    support context parallelism. When False, use unfused PyTorch implementations."""
 
     ####################
     # linear attention
@@ -1611,7 +1611,22 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
                 indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
-                if sm[0] == 9:
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    get_fused_dsa_legacy_availability,
+                )
+
+                _flash_mla_available, _cudnn_dsa_available = (
+                    get_fused_dsa_legacy_availability()
+                )
+                use_legacy_dsa = _flash_mla_available and _cudnn_dsa_available
+
+                if sm[0] == 9 and not use_legacy_dsa:
+                    if self.context_parallel_size > 1 or self.dynamic_context_parallel:
+                        raise ValueError(
+                            "SM90 Triton fused DSA fallback does not support context "
+                            "parallelism. Install both FlashMLA and cuDNN Frontend DSA, "
+                            "or disable DSA kernel fusion."
+                        )
                     try:
                         import triton  # noqa: F401
                     except ImportError as e:
@@ -1619,29 +1634,11 @@ class TransformerConfig(ModelParallelConfig):
                             "apply_dsa_kernel_fusion on SM90 requires Triton; install "
                             "triton>=3.0 or disable DSA kernel fusion."
                         ) from e
-                    if (
-                        self.context_parallel_size > 1 or self.dynamic_context_parallel
-                    ) and uses_ratio4_indexer:
-                        raise ValueError(
-                            "SM90 Triton fused DSA does not yet support CP-relative indexer "
-                            "causal offsets; disable DSA fusion for ratio-4 CP."
-                        )
                 else:
                     assert self.tensor_model_parallel_size == 1, (
-                        "The SM100+ FlashMLA/cuDNN fused DSA path does not yet support "
+                        "The FlashMLA/cuDNN fused DSA path does not yet support "
                         "tensor parallelism; disable DSA kernel fusion when TP > 1."
                     )
-                    _flash_mla_available = True
-                    try:
-                        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-                    except ImportError:
-                        _flash_mla_available = False
-
-                    _cudnn_dsa_available = True
-                    try:
-                        from cudnn import DSA  # noqa: F401
-                    except ImportError:
-                        _cudnn_dsa_available = False
 
                     if not _flash_mla_available or not _cudnn_dsa_available:
                         missing = []
@@ -1653,13 +1650,24 @@ class TransformerConfig(ModelParallelConfig):
                         if not _cudnn_dsa_available:
                             missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
                         raise ValueError(
-                            f"apply_dsa_kernel_fusion on SM100+ requires fused DSA kernels, "
+                            f"apply_dsa_kernel_fusion requires fused DSA kernels, "
                             f"but the following packages are unavailable: {', '.join(missing)}."
                         )
 
-                if sm[0] >= 10 and (
+                if use_legacy_dsa and sm[0] == 9 and uses_ratio4_indexer and (
+                    indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss
+                ):
+                    raise ValueError(
+                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
+                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
+                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                    )
+
+                if use_legacy_dsa and (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
                 ) and uses_ratio4_indexer:
+                    from cudnn import DSA
+
                     required_wrappers = [DSA.indexer_forward_wrapper]
                     if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
                         required_wrappers.extend(

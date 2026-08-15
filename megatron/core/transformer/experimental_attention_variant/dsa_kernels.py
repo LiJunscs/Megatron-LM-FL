@@ -38,6 +38,25 @@ _flash_mla_sparse_fwd = None
 _DSA = None
 
 
+def get_fused_dsa_legacy_availability() -> Tuple[bool, bool]:
+    """Return availability of the FlashMLA forward and cuDNN DSA backends."""
+    try:
+        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+
+        flash_mla_available = True
+    except ImportError:
+        flash_mla_available = False
+
+    try:
+        from cudnn import DSA  # noqa: F401
+
+        cudnn_dsa_available = True
+    except ImportError:
+        cudnn_dsa_available = False
+
+    return flash_mla_available, cudnn_dsa_available
+
+
 def _ensure_flash_mla():
     """Lazily import the FlashMLA sparse-forward kernel.
 
@@ -1892,6 +1911,7 @@ __all__ = [
     "build_flat_topk_idxs",
     "local_to_global_flat",
     "dsa_sparse_attn",
+    "get_fused_dsa_legacy_availability",
     "indexer_topk",
     "fused_indexer_sparse_attn",
 ]

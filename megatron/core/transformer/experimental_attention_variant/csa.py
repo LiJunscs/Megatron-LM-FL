@@ -62,14 +62,19 @@ _dsa_backend_sm = None
 
 
 def _ensure_dsa_kernel_backend() -> None:
-    """Select Triton on SM90 and cuDNN/FlashMLA on SM100+."""
+    """Prefer FlashMLA/cuDNN DSA and fall back to Triton on SM90."""
     global _dsa_backend_sm
     global build_flat_topk_idxs, dsa_sparse_attn, fused_indexer_sparse_attn, indexer_topk
 
     sm_major = torch.cuda.get_device_capability()[0]
     if _dsa_backend_sm == sm_major:
         return
-    if sm_major == 9:
+    from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+        get_fused_dsa_legacy_availability,
+    )
+
+    flash_mla_available, cudnn_dsa_available = get_fused_dsa_legacy_availability()
+    if sm_major == 9 and not (flash_mla_available and cudnn_dsa_available):
         from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
             build_flat_topk_idxs as triton_build_flat_topk_idxs,
             dsa_sparse_attn as triton_dsa_sparse_attn,
@@ -1998,7 +2003,8 @@ class CompressedSparseAttention(MegatronModule):
 
         Args:
             query:  [sq, b, np, v_head_dim]
-            key:    [sq, b, 1, v_head_dim]  (single-head MQA; head dim squeezed internally)
+            key:    [sq, b, 1, v_head_dim] for SBHD or [total_q, 1, v_head_dim]
+                for THD (single-head MQA; the head dim is squeezed internally).
             value:  unused (key == value in MQA)
             attention_mask: attention mask (may be None for causal).
             x:      [sq, b, hidden_size]  original hidden states.
@@ -2012,16 +2018,20 @@ class CompressedSparseAttention(MegatronModule):
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.compressor is not None:
             assert x is not None, "CSA requires the SP-gathered hidden states for compression"
-        assert key.ndim == 4, f"CSA expects a 4-D MQA key, got {tuple(key.shape)}"
         if x is not None:
             assert x.ndim == 3, f"CSA hidden states must be 3-D, got {tuple(x.shape)}"
             assert x.size(-1) == self.config.hidden_size, (
                 f"CSA hidden size must be {self.config.hidden_size}, got {x.size(-1)}"
             )
         expected_query_ndim = 3 if is_thd else 4
+        expected_key_ndim = 3 if is_thd else 4
         assert query.ndim == expected_query_ndim, (
             f"CSA {'THD' if is_thd else 'SBHD'} query must have {expected_query_ndim} "
             f"dimensions, got {tuple(query.shape)}"
+        )
+        assert key.ndim == expected_key_ndim, (
+            f"CSA {'THD' if is_thd else 'SBHD'} MQA key must have {expected_key_ndim} "
+            f"dimensions, got {tuple(key.shape)}"
         )
         assert query.size(-2) == self.n_local_heads, (
             f"query has {query.size(-2)} local heads, expected {self.n_local_heads} "
@@ -2055,9 +2065,7 @@ class CompressedSparseAttention(MegatronModule):
                 assert x.size(1) == 1, (
                     f"THD hidden states must be [T,1,H], got {tuple(x.shape)}"
                 )
-            assert key.size(1) == 1 and key.size(2) == 1, (
-                f"THD MQA key must be [T,1,1,D], got {tuple(key.shape)}"
-            )
+            assert key.size(1) == 1, f"THD MQA key must be [T,1,D], got {tuple(key.shape)}"
             if qr is not None:
                 assert qr.size(1) == 1, (
                     f"THD q_compressed must be [T,1,H], got {tuple(qr.shape)}"
@@ -2545,9 +2553,53 @@ class CompressedSparseAttention(MegatronModule):
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
 
+        # The TP/SP adapter and the Q/KV RoPE path must have normalized every
+        # tensor before CP starts. TE's THD convention removes the batch axis
+        # from Q/KV, while hidden/indexer inputs retain Megatron's dummy batch
+        # axis. Boundary tensors follow the layout of the source they extend.
+        assert query.ndim == 3, (
+            f"THD CP query must be [T,H,D], got {tuple(query.shape)}"
+        )
+        assert key.ndim == 3 and key.size(1) == 1, (
+            f"THD CP MQA key must be [T,1,D], got {tuple(key.shape)}"
+        )
+        assert x is not None and x.ndim == 3 and x.size(1) == 1, (
+            "THD CP hidden states must be [T,1,H], got "
+            f"{None if x is None else tuple(x.shape)}"
+        )
+        if self.indexer is not None:
+            assert qr is not None and qr.ndim == 3 and qr.size(1) == 1, (
+                "THD CP indexer input must be [T,1,R], got "
+                f"{None if qr is None else tuple(qr.shape)}"
+            )
+        assert boundary_hidden is not None and boundary_hidden.ndim == 3, (
+            "THD CP boundary hidden states must be [W,1,H], got "
+            f"{None if boundary_hidden is None else tuple(boundary_hidden.shape)}"
+        )
+        assert boundary_hidden.size(1) == 1 and boundary_hidden.size(-1) == x.size(-1), (
+            f"THD CP boundary hidden states must be [W,1,{x.size(-1)}], "
+            f"got {tuple(boundary_hidden.shape)}"
+        )
+        assert boundary_kv is not None and boundary_kv.ndim == 3, (
+            "THD CP boundary KV must be [W,1,D], got "
+            f"{None if boundary_kv is None else tuple(boundary_kv.shape)}"
+        )
+        assert boundary_kv.size(1) == 1 and boundary_kv.size(-1) == key.size(-1), (
+            f"THD CP boundary KV must be [W,1,{key.size(-1)}], "
+            f"got {tuple(boundary_kv.shape)}"
+        )
+        assert boundary_hidden.size(0) == boundary_kv.size(0), (
+            "THD CP boundary hidden/KV row counts must match, got "
+            f"{boundary_hidden.size(0)}/{boundary_kv.size(0)}"
+        )
+
         l_local = query.shape[0]
-        if l_local != key.shape[0]:
+        if l_local != key.shape[0] or l_local != x.shape[0]:
             raise RuntimeError("DSv4 THD CP path currently supports self-attention only.")
+        if qr is not None:
+            assert qr.size(0) == l_local, (
+                f"THD CP q_compressed has {qr.size(0)} rows, expected {l_local}"
+            )
         cu_seqlens = (
             packed_seq_params.cu_seqlens_q_padded
             if packed_seq_params.cu_seqlens_q_padded is not None
@@ -2557,13 +2609,8 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 2: local CP rows, local KV, and boundary tensors ------------
         global_start = cp_rank * l_local
-        kv_local = key.squeeze(-2).squeeze(1)
-        if boundary_hidden is None or boundary_kv is None:
-            raise RuntimeError(
-                "DSv4 THD CP path requires boundary_hidden and boundary_kv from "
-                "the hidden-only boundary exchange and boundary KV projection path."
-            )
-        boundary_kv = boundary_kv.squeeze(-2).squeeze(1)
+        kv_local = key.squeeze(1)
+        boundary_kv = boundary_kv.squeeze(1)
         d_window = boundary_hidden.shape[0]
         # Window-only defaults; compression fills the rank-major KV buffer.
         compressed_kv_rank_major = kv_local.new_empty((0, kv_local.shape[-1]))
@@ -2808,7 +2855,7 @@ class CompressedSparseAttention(MegatronModule):
     def _forward_thd(
         self,
         query: torch.Tensor,  # (total_q, np, hn)        TE THD convention
-        key: torch.Tensor,  # (total_kv, 1, 1, hn)     packed, MQA
+        key: torch.Tensor,  # (total_kv, 1, hn)        packed, MQA
         x: torch.Tensor,  # (total_q, 1, hidden_size)
         qr: torch.Tensor,  # (total_q, 1, q_lora_rank)
         packed_seq_params: PackedSeqParams,
@@ -2829,9 +2876,8 @@ class CompressedSparseAttention(MegatronModule):
         """
         # ---- Inputs / shape contract ----------------------------------------
         # query    : (total_q, np, hn)        multi-head Q (TE THD convention)
-        # key      : (total_kv, 1, 1, hn)     packed single-head MQA KV (the
-        #            DSv4 hybrid adds a dummy batch dim to keep the MQA-head
-        #            unsqueeze symmetric with SBHD)
+        # key      : (total_kv, 1, hn)        packed single-head MQA KV; THD
+        #            omits the SBHD batch axis and keeps only the MQA head axis
         # x, qr    : (total_q, 1, *)
         total_q, _np, _ = query.shape
 
@@ -2848,9 +2894,9 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q = int(packed_seq_params.max_seqlen_q)
         max_seqlen_kv = int(packed_seq_params.max_seqlen_kv)
 
-        # Squeeze the dummy b=1 and MQA head-dim to get the KV-flat layout.
-        # (key arrives as (total_kv, 1, 1, hn) for MQA.)
-        kv_thd = key.squeeze(-2).squeeze(1)  # (total_kv, hn)
+        # Squeeze the MQA head dimension to get the KV-flat layout.
+        # (THD has no batch axis; key arrives as (total_kv, 1, hn).)
+        kv_thd = key.squeeze(1)  # (total_kv, hn)
 
         # ---- Step 2: per-segment compression --------------------------------
         if self.compressor is not None and self.compress_ratio > 1:

@@ -4865,7 +4865,7 @@ def _add_experimental_attention_variant_args(parser):
     group.add_argument(
         '--no-dsa-kernel-fusion',
         action='store_false',
-        help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA) '
+        help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA or Triton) '
         'and fall back to unfused PyTorch implementations.',
         dest='apply_dsa_kernel_fusion',
     )

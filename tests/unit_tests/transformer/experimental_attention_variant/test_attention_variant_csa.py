@@ -233,6 +233,11 @@ def _make_mla_config(
     dsa_indexer_loss_coeff=0.0,
     dsa_indexer_use_sparse_loss=False,
     rope_type='rope',
+    context_parallel_size=1,
+    dynamic_context_parallel=False,
+    sequence_packing_scheduler=None,
+    cp_partition_mode='zigzag',
+    apply_dsa_kernel_fusion=False,
 ):
     """Helper to create MLATransformerConfig for CSA tests."""
     if csa_compress_ratios is None:
@@ -246,6 +251,10 @@ def _make_mla_config(
         params_dtype=torch.bfloat16,
         tensor_model_parallel_size=tensor_model_parallel_size,
         sequence_parallel=sequence_parallel,
+        context_parallel_size=context_parallel_size,
+        dynamic_context_parallel=dynamic_context_parallel,
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        cp_partition_mode=cp_partition_mode,
         q_lora_rank=64,
         kv_lora_rank=64,
         qk_head_dim=v_head_dim - qk_pos_emb_head_dim,
@@ -264,7 +273,45 @@ def _make_mla_config(
         dsa_indexer_topk=dsa_indexer_topk,
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
     )
+
+
+class TestFusedDSABackendRouting:
+    """Validate SM90 legacy preference and Triton CP fallback policy."""
+
+    @patch("torch.cuda.get_device_capability", return_value=(9, 0))
+    @patch("torch.cuda.is_available", return_value=True)
+    @patch(
+        "megatron.core.transformer.experimental_attention_variant.dsa_kernels."
+        "get_fused_dsa_legacy_availability",
+        return_value=(True, True),
+    )
+    def test_sm90_legacy_backend_accepts_cp(self, _availability, _cuda, _capability):
+        config = _make_mla_config(
+            context_parallel_size=2,
+            sequence_packing_scheduler="dp_balanced",
+            cp_partition_mode="contiguous",
+            apply_dsa_kernel_fusion=True,
+        )
+
+        assert config.apply_dsa_kernel_fusion
+
+    @patch("torch.cuda.get_device_capability", return_value=(9, 0))
+    @patch("torch.cuda.is_available", return_value=True)
+    @patch(
+        "megatron.core.transformer.experimental_attention_variant.dsa_kernels."
+        "get_fused_dsa_legacy_availability",
+        return_value=(False, False),
+    )
+    def test_sm90_triton_fallback_rejects_cp(self, _availability, _cuda, _capability):
+        with pytest.raises(ValueError, match="Triton fused DSA fallback does not support"):
+            _make_mla_config(
+                context_parallel_size=2,
+                sequence_packing_scheduler="dp_balanced",
+                cp_partition_mode="contiguous",
+                apply_dsa_kernel_fusion=True,
+            )
 
 
 def _make_compressor_submodules():
@@ -1741,7 +1788,7 @@ class TestCompressedSparseAttentionThd:
         np_ = self.config.num_attention_heads
         hn = self.config.v_head_dim
         query = torch.randn(total, np_, hn, dtype=torch.bfloat16, device='cuda')
-        key = torch.randn(total, 1, 1, hn, dtype=torch.bfloat16, device='cuda')
+        key = torch.randn(total, 1, hn, dtype=torch.bfloat16, device='cuda')
         value = key.clone()
         x = torch.randn(total, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda')
         qr = torch.randn(total, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device='cuda')
@@ -1914,8 +1961,8 @@ class TestCompressedSparseAttentionThd:
             packed = _make_packed_seq_params_thd([sq])
             out_thd = csa(
                 query=query.squeeze(1),
-                key=key,
-                value=value,
+                key=key.squeeze(1),
+                value=value.squeeze(1),
                 attention_mask=None,
                 x=x,
                 qr=qr,
@@ -2382,9 +2429,12 @@ class TestCSATensorSequenceParallel:
             else (seq_len, 1, local_heads, self.config.v_head_dim)
         )
         query = torch.randn(query_shape, dtype=torch.bfloat16, device='cuda').requires_grad_(True)
-        key = torch.randn(
-            seq_len, 1, 1, self.config.v_head_dim, dtype=torch.bfloat16, device='cuda'
-        ).requires_grad_(True)
+        key_shape = (
+            (seq_len, 1, self.config.v_head_dim)
+            if layout == "thd"
+            else (seq_len, 1, 1, self.config.v_head_dim)
+        )
+        key = torch.randn(key_shape, dtype=torch.bfloat16, device='cuda').requires_grad_(True)
         x = torch.randn(
             seq_len, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
         ).requires_grad_(True)
@@ -2454,9 +2504,12 @@ class TestCSATensorSequenceParallel:
             torch.randn(query_shape, dtype=torch.bfloat16, device='cuda')
             + 0.125 * self.pg_collection.tp.rank()
         ).requires_grad_(True)
-        key = torch.randn(
-            seq_len, 1, 1, config.v_head_dim, dtype=torch.bfloat16, device='cuda'
-        ).requires_grad_(True)
+        key_shape = (
+            (seq_len, 1, config.v_head_dim)
+            if layout == "thd"
+            else (seq_len, 1, 1, config.v_head_dim)
+        )
+        key = torch.randn(key_shape, dtype=torch.bfloat16, device='cuda').requires_grad_(True)
         x = torch.randn(
             seq_len, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
         ).requires_grad_(True)
