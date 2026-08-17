@@ -823,6 +823,47 @@ def _compute_attn_target(
     return target
 
 
+def compute_sparse_attn_target_head_sum(
+    q_attn: Tensor,
+    k_attn: Tensor,
+    lse: Tensor,
+    topk_indices: Tensor,
+    softmax_scale: float,
+) -> Tensor:
+    """Compute the unnormalised sparse-attention target mass over local heads.
+
+    The returned tensor must be summed across tensor-parallel ranks before it
+    is L1-normalised.  Both THD ``[T, H, D]`` and BSHD ``[B, S, H, D]``
+    layouts are accepted; ``topk_indices`` addresses ``k_attn`` directly.
+    """
+    is_thd = q_attn.ndim == 3
+    if is_thd:
+        q_attn = q_attn.unsqueeze(0)
+        k_attn = k_attn.unsqueeze(0)
+        lse = lse.unsqueeze(0)
+        topk_indices = topk_indices.unsqueeze(0)
+
+    assert q_attn.ndim == 4 and k_attn.ndim == 3
+    assert lse.shape == q_attn.shape[:3]
+    assert topk_indices.ndim == 3 and topk_indices.shape[:2] == q_attn.shape[:2]
+
+    safe_indices = topk_indices.long().clamp_min(0)
+    batch_indices = torch.arange(q_attn.size(0), device=k_attn.device)[:, None, None]
+    selected_k = k_attn.float()[batch_indices, safe_indices]
+    scores = torch.einsum("bqhd,bqtd->bqht", q_attn.float(), selected_k)
+    probabilities = torch.exp(scores * softmax_scale - lse.float().unsqueeze(-1))
+    head_sum = probabilities.sum(dim=2)
+    head_sum = head_sum.masked_fill(topk_indices < 0, 0.0)
+    return head_sum.squeeze(0) if is_thd else head_sum
+
+
+def _all_reduce_tp_target_mass(target_mass: Tensor, tp_group) -> Tensor:
+    """Sum unnormalised target mass over TP ranks in place."""
+    if tp_group is not None and tp_group.size() > 1:
+        torch.distributed.all_reduce(target_mass, group=tp_group)
+    return target_mass
+
+
 def _kl_loss_from_target_predict(
     target: Tensor,
     predict: Tensor,
@@ -1544,6 +1585,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         max_seqlen_q: int,
         indexer_layout: Tuple[Tensor, Tensor, Tensor],
         q_padding_mask: Optional[Tensor] = None,
+        tp_group=None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -1581,15 +1623,26 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             predict = _DSA.sparse_indexer_score_recompute_wrapper(
                 q_bshd, k_bsd, w_bsh, topk_bst, qhead_per_kv_head=idx_nh, topk_indices_global=True
             )["predict"].squeeze(0)
-            target = _compute_attn_target(
-                query.detach(),
-                compressed_kv.detach(),
-                lse_indexer.detach(),
-                indexer_topk_idxs_for_loss,
-                softmax_scale,
-                qhead_per_kv_head=np_,
-                topk_indices_global=True,
-            )
+            if tp_group is not None and tp_group.size() > 1:
+                target_mass = compute_sparse_attn_target_head_sum(
+                    query.detach(),
+                    compressed_kv.detach(),
+                    lse_indexer.detach(),
+                    indexer_topk_idxs_for_loss,
+                    softmax_scale,
+                )
+                _all_reduce_tp_target_mass(target_mass, tp_group)
+                target = target_mass / target_mass.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            else:
+                target = _compute_attn_target(
+                    query.detach(),
+                    compressed_kv.detach(),
+                    lse_indexer.detach(),
+                    indexer_topk_idxs_for_loss,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                    topk_indices_global=True,
+                )
             raw_local_loss = _kl_loss_from_target_predict(
                 target,
                 predict,
@@ -1643,6 +1696,9 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 max_seqlen_kv=max_seqlen_k,
                 q_causal_offsets=q_causal_offsets,
             )
+            if tp_group is not None and tp_group.size() > 1:
+                _all_reduce_tp_target_mass(attn_score, tp_group)
+                attn_l1norm = attn_score.sum(dim=-1)
             if q_padding_mask is not None:
                 attn_score = attn_score.masked_fill(q_padding_mask.unsqueeze(-1), 0)
                 attn_l1norm = attn_l1norm.masked_fill(q_padding_mask, 0)
@@ -1744,6 +1800,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_q_indexer * grad_loss,
             saved_grad_k_indexer * grad_loss,
             saved_grad_weights * grad_loss,
+            None,
             None,
             None,
             None,

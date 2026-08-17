@@ -696,6 +696,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     _max_seqlen_q: int,
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
+    tp_group=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -763,6 +764,8 @@ def _unfused_indexer_sparse_attn_from_topk(
             exp_sink = torch.exp(sink - scores_max)
             target = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
             target = (target * row_valid.unsqueeze(1).float()).sum(dim=1)
+            if tp_group is not None and tp_group.size() > 1:
+                torch.distributed.all_reduce(target, group=tp_group)
             eps = torch.finfo(torch.float32).tiny
             target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
             target = target.clamp(min=eps)
@@ -820,6 +823,8 @@ def _unfused_indexer_sparse_attn_from_topk(
     exp_sink = torch.exp(sink - scores_max)
     attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
     target = attn_probs.sum(dim=1)
+    if tp_group is not None and tp_group.size() > 1:
+        torch.distributed.all_reduce(target, group=tp_group)
     target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
     target = target * row_valid.float()
 
@@ -2824,6 +2829,7 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_q,
                 indexer_layout,
                 q_padding_mask,
+                self.pg_collection.tp,
             )
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(

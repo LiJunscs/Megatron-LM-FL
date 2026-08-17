@@ -1193,7 +1193,11 @@ class TestDSv4HybridAttentionTHDTPSPCP:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused_rope", "unfused_rope"])
-    @pytest.mark.parametrize("layer_number", [1, 3], ids=["window_only", "compressor"])
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["window_only", "ratio_4_indexer", "compressor"],
+    )
     def test_forward_backward_matches_tp1_sp_off_reference(
         self, apply_rope_fusion, layer_number
     ):
@@ -1202,7 +1206,7 @@ class TestDSv4HybridAttentionTHDTPSPCP:
             context_parallel_size=self.cp_size,
             tensor_model_parallel_size=self.tp_size,
             sequence_parallel=True,
-            dsa_indexer_loss_coeff=0.0,
+            dsa_indexer_loss_coeff=1.0,
             apply_dsa_kernel_fusion=False,
             apply_rope_fusion=apply_rope_fusion,
         )
@@ -1210,7 +1214,7 @@ class TestDSv4HybridAttentionTHDTPSPCP:
             context_parallel_size=self.cp_size,
             tensor_model_parallel_size=1,
             sequence_parallel=False,
-            dsa_indexer_loss_coeff=0.0,
+            dsa_indexer_loss_coeff=1.0,
             apply_dsa_kernel_fusion=False,
             apply_rope_fusion=apply_rope_fusion,
         )
