@@ -74,6 +74,7 @@ class _DSv4TPRopeExchange(torch.autograd.Function):
         nope_dim,
         emb_dim,
         cu_seqlens_q,
+        position_ids,
         cp_rank,
         cp_size,
         tp_group,
@@ -110,6 +111,7 @@ class _DSv4TPRopeExchange(torch.autograd.Function):
                 False,
                 False,
                 remove_interleaving,
+                position_ids,
             )
         else:
             query = q
@@ -207,6 +209,7 @@ class _DSv4TPRopeExchange(torch.autograd.Function):
         return (
             grad_q,
             torch.cat(local_field_grads, dim=-1),
+            None,
             None,
             None,
             None,
@@ -337,6 +340,20 @@ def _dsv4_tp_rope_exchange(
             f"Invalid policy {field.backward_policy} for DSv4 field {field.name!r} "
             f"with gather_sequence={gather_sequence}"
         )
+
+    # DSv4 THD CP owns one consecutive interval of the globally packed rows.  Give the
+    # fused Q RoPE kernel explicit positions for that interval so it does not fall back
+    # to the generic zigzag CP mapping.  Q is already CP-local here; the optional TP/SP
+    # all-gather below only restores ``fields`` to that same layout and therefore does
+    # not affect Q's position mapping.  SBHD and CP-size-one keep the kernel's original
+    # position handling and do not need explicit position ids.
+    position_ids = None
+    if apply_fused_rope and is_thd and cp_size > 1:
+        position_ids = cp_utils.get_thd_cp_position_ids(
+            cu_seqlens_q,
+            global_start=cp_rank * q.size(0),
+            local_rows=q.size(0),
+        )
     query, exchanged = _DSv4TPRopeExchange.apply(
         q,
         local_tensor,
@@ -345,6 +362,7 @@ def _dsv4_tp_rope_exchange(
         nope_dim,
         emb_dim,
         cu_seqlens_q,
+        position_ids,
         cp_rank,
         cp_size,
         tp_group,

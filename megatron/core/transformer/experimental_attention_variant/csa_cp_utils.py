@@ -22,7 +22,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 # =============================================================================
 
 
-def _thd_cp_position_ids(
+def get_thd_cp_position_ids(
     cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
 ) -> torch.Tensor:
     """Map a consecutive CP row interval to positions within packed sequences."""
@@ -52,7 +52,7 @@ def apply_thd_cp_local_rope_fused(
     inverse: bool = False,
 ) -> torch.Tensor:
     """Apply fused non-interleaved RoPE to local THD CP rows."""
-    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    position_ids = get_thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
     squeezed_head = x.ndim == 2
@@ -90,7 +90,7 @@ def apply_thd_cp_local_rope_unfused(
     inverse: bool = False,
 ) -> torch.Tensor:
     """Apply unfused RoPE to a consecutive interval of packed CP rows."""
-    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    position_ids = get_thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
     freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1

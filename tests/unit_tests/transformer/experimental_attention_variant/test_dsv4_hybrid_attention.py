@@ -249,6 +249,54 @@ class TestDSv4TPRopeExchange:
         torch.testing.assert_close(q.grad, torch.full_like(q, 2))
         torch.testing.assert_close(kv.grad, torch.full_like(kv, 3))
 
+    def test_thd_cp_fused_rope_uses_contiguous_position_ids(self):
+        from megatron.core.transformer.experimental_attention_variant import (
+            deepseek_v4_hybrid_attention as dsv4_attention,
+        )
+
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        device = torch.device('cuda', torch.cuda.current_device())
+        captured = {}
+
+        class CaptureFusedRope:
+            @staticmethod
+            def forward(ctx, q, *args):
+                captured["position_ids"] = args[-1]
+                return q
+
+            @staticmethod
+            def backward(ctx, grad_query):
+                return (grad_query,)
+
+        q = torch.ones(4, 1, 3, device=device, requires_grad=True)
+        kv = torch.ones(4, 1, 2, device=device, requires_grad=True)
+        field = dsv4_attention._DSv4TPField(
+            "kv", kv, dsv4_attention._DSv4TPBackwardPolicy.ALL_REDUCE
+        )
+        cu_seqlens_q = torch.tensor([0, 3, 8], dtype=torch.int32, device=device)
+
+        with patch.object(dsv4_attention, '_FusedMLARoPEInplace', CaptureFusedRope):
+            dsv4_attention._dsv4_tp_rope_exchange(
+                q,
+                (field,),
+                torch.empty(0, device=device),
+                torch.empty(0, device=device),
+                0,
+                0,
+                cu_seqlens_q,
+                1,
+                2,
+                pg.tp,
+                gather_sequence=False,
+                is_thd=True,
+                apply_fused_rope=True,
+            )
+
+        torch.testing.assert_close(
+            captured["position_ids"],
+            torch.tensor([1, 2, 3, 4], dtype=torch.int32, device=device),
+        )
+
 
 # ===========================================================================
 # Constructor tests
