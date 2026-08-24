@@ -85,6 +85,7 @@ def _mla_rope_fwd_inplace_kernel(
     batch_size,
     seq_num,
     cu_seqlens_q,
+    position_ids,
     stride_x_seq,
     stride_x_nheads,
     stride_cos_seq,
@@ -111,7 +112,10 @@ def _mla_rope_fwd_inplace_kernel(
     pid_m = tl.program_id(axis=0)
     pid_head = tl.program_id(axis=1)
 
-    if cu_seqlens_q is None:
+    if position_ids is not None:
+        position_row = pid_m // batch_size if cu_seqlens_q is None else pid_m
+        token_idx = tl.load(position_ids + position_row)
+    elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
@@ -180,6 +184,7 @@ def _mla_rope_bwd_inplace_kernel(
     batch_size,
     seq_num,
     cu_seqlens_q,
+    position_ids,
     stride_x_seq,
     stride_x_nheads,
     stride_cos_seq,
@@ -204,7 +209,10 @@ def _mla_rope_bwd_inplace_kernel(
     pid_m = tl.program_id(axis=0)
     pid_head = tl.program_id(axis=1)
 
-    if cu_seqlens_q is None:
+    if position_ids is not None:
+        position_row = pid_m // batch_size if cu_seqlens_q is None else pid_m
+        token_idx = tl.load(position_ids + position_row)
+    elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
@@ -269,6 +277,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         rotary_interleaved=False,
         inverse=False,
         remove_interleaving=False,
+        position_ids=None,
     ):
         """
         Forward function for _FusedMLARoPEInplace.
@@ -288,12 +297,16 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         if cu_seqlens_q is None:
             # sbhd
             max_seqlen, batch_size, nheads, headdim = q.shape
+            if position_ids is not None:
+                assert position_ids.shape == (max_seqlen,)
             q = q.view(-1, nheads, headdim)
             total_seqlen = q.shape[0]
         else:
             # thd
             total_seqlen, nheads, headdim = q.shape
             seq_num = len(cu_seqlens_q) - 1
+            if position_ids is not None:
+                assert position_ids.shape == (total_seqlen,)
         assert q.stride(-1) == 1
         assert cos.stride(-1) == 1
         assert sin.stride(-1) == 1
@@ -311,6 +324,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             batch_size,
             seq_num,
             cu_seqlens_q,
+            position_ids,
             q.stride(0),
             q.stride(1),
             cos.stride(0),
@@ -320,7 +334,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             INVERSE=inverse,
             REMOVE_INTERLEAVING=remove_interleaving,
         )
-        ctx.save_for_backward(cos, sin)
+        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
+        ctx.has_position_ids = position_ids is not None
         ctx.nope_dim = nope_dim
         ctx.emb_dim = emb_dim
         ctx.cu_seqlens_q = cu_seqlens_q
@@ -342,7 +357,11 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
                 or [total_seq_len, head_num, nope_dim + emb_dim]
         """
-        cos, sin = ctx.saved_tensors
+        if ctx.has_position_ids:
+            cos, sin, position_ids = ctx.saved_tensors
+        else:
+            cos, sin = ctx.saved_tensors
+            position_ids = None
         max_seqlen = None
         batch_size = None
         seq_num = None
@@ -352,6 +371,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             total_seqlen = grad.shape[0]
         else:
             seq_num = len(ctx.cu_seqlens_q) - 1
+            if ctx.has_position_ids:
+                grad = grad.contiguous()
             total_seqlen, nheads, headdim = grad.shape
         assert grad.stride(-1) == 1
 
@@ -366,6 +387,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             batch_size,
             seq_num,
             ctx.cu_seqlens_q,
+            position_ids,
             grad.stride(0),
             grad.stride(1),
             cos.stride(0),
@@ -377,7 +399,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         )
         if ctx.cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
-        return grad, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None
 
 
 def fused_mla_rope_inplace(
@@ -392,6 +414,7 @@ def fused_mla_rope_inplace(
     rotary_interleaved: bool = False,
     inverse: bool = False,
     remove_interleaving: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
 ):
     """
     Fused RoPE applied inplace to the trailing emb_dim elements of a tensor,
@@ -413,6 +436,9 @@ def fused_mla_rope_inplace(
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
         inverse: if True, apply the inverse rotation
         remove_interleaving: if True, output RoPE dims in non-interleaved layout
+        position_ids: optional explicit position for every sequence row. For SBHD,
+            the same ``[seq_len]`` positions are shared across the batch. When
+            omitted, the existing SBHD/THD CP mapping is used.
 
     Returns:
         t: inplace modified input tensor
@@ -429,6 +455,7 @@ def fused_mla_rope_inplace(
         rotary_interleaved,
         inverse,
         remove_interleaving,
+        position_ids,
     )
 
 

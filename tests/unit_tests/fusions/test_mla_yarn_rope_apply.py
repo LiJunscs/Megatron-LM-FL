@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -63,7 +64,9 @@ class FakeCPGroup:
         return 0
 
 
-def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
+def _test_fused_mla_rope_inplace(
+    input_format, inverse=False, remove_interleaving=False, explicit_positions=False
+):
     assert fused_mla_rope_inplace is not None
     seed = 1234 + (input_format == "thd") + 2 * inverse + 4 * remove_interleaving
     torch.manual_seed(seed)
@@ -112,23 +115,46 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
             (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
         )
 
+    position_ids = None
+    if explicit_positions:
+        leading_rows = pytorch_fwd_input.shape[0]
+        available_positions = freqs.shape[0]
+        position_ids = torch.arange(
+            leading_rows - 1, -1, -1, dtype=torch.long, device="cuda"
+        ).remainder(available_positions)
+
     pytorch_fwd_input.requires_grad_(True)
     fused_fwd_input = pytorch_fwd_input.detach()
     fused_fwd_input.requires_grad_(True)
     fused_bwd_input = pytorch_bwd_input.detach()
 
     no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
-    pe_output = apply_rotary_pos_emb(
-        pe,
-        freqs,
-        transformer_config,
-        cu_seqlens=cu_seqlens,
-        mscale=mscale,
-        cp_group=FakeCPGroup(),
-        mla_rotary_interleaved=True,
-        inverse=inverse,
-        mla_output_remove_interleaving=remove_interleaving,
-    )
+    if position_ids is None:
+        pe_output = apply_rotary_pos_emb(
+            pe,
+            freqs,
+            transformer_config,
+            cu_seqlens=cu_seqlens,
+            mscale=mscale,
+            cp_group=FakeCPGroup(),
+            mla_rotary_interleaved=True,
+            inverse=inverse,
+            mla_output_remove_interleaving=remove_interleaving,
+        )
+    else:
+        is_thd = input_format == "thd"
+        pe_input = pe.unsqueeze(1) if is_thd else pe
+        pe_output = _apply_rotary_pos_emb_bshd(
+            pe_input,
+            torch.index_select(freqs, 0, position_ids),
+            rotary_interleaved=transformer_config.rotary_interleaved,
+            mscale=mscale,
+            mla_rotary_interleaved=True,
+            inverse=inverse,
+            mla_output_remove_interleaving=remove_interleaving,
+        )
+        if is_thd:
+            pe_output = pe_output.squeeze(1)
     pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
 
@@ -141,6 +167,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         cu_seqlens_q=cu_seqlens,
         inverse=inverse,
         remove_interleaving=remove_interleaving,
+        position_ids=position_ids,
     )
     fused_output.backward(fused_bwd_input, retain_graph=True)
 
@@ -304,6 +331,15 @@ class TestFusedMLARope:
     def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving):
         _test_fused_mla_rope_inplace(
             input_format, inverse=inverse, remove_interleaving=remove_interleaving
+        )
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_explicit_position_ids(self, input_format, inverse):
+        _test_fused_mla_rope_inplace(
+            input_format,
+            inverse=inverse,
+            remove_interleaving=True,
+            explicit_positions=True,
         )
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
