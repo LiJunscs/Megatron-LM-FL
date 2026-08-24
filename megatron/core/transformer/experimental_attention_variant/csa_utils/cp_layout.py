@@ -602,8 +602,23 @@ def build_attention_indices(
             compact_cols = window_count.unsqueeze(1) + torch.arange(
                 compressed_width, device=device, dtype=torch.int64
             ).unsqueeze(0)
-            valid_mask = comp_valid
+            # Fallback rows (outside every sequence) carry an unbounded
+            # window_count; their writes are always -1 and are overridden by
+            # the fallback override below, so route those columns to a
+            # padding column (total_width) that is sliced off after the
+            # scatter (mirroring mode 0).
+            compact_cols = torch.where(
+                fallback_rows.unsqueeze(1),
+                compact_cols.clamp_max(total_width),
+                compact_cols,
+            )
+            topk_idxs = torch.cat(
+                (topk_idxs, torch.full((l_local, 1), -1, dtype=torch.int32, device=device)),
+                dim=1,
+            )
             topk_idxs = topk_idxs.scatter(1, compact_cols, comp_phys)
+            topk_idxs = topk_idxs[:, :total_width]
+            valid_mask = comp_valid
 
     # Rows outside every sequence mirror the CuTe kernel's ``elif``:
     # topk_length = 1 and index 0 (when total_width > 0).

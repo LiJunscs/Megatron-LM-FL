@@ -24,6 +24,11 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.plugin.platform import get_platform
+from tests.unit_tests.transformer.experimental_attention_variant import dsv4_parity_gate
+
+# Frozen Phase-0 oracle gate: canonical case tables, seed and diagnostic.
+ATTENTION_INDEX_CASES = dsv4_parity_gate.ATTENTION_INDEX_CASES
+COMPACT_CASES = dsv4_parity_gate.COMPACT_CASES
 
 
 # ===========================================================================
@@ -66,23 +71,12 @@ def _compact_to_source_naive(cu_seqlens, global_start, l_local, ratio, d_comp, c
 
 
 @pytest.mark.parametrize(
-    "cu_seqlens, global_start, l_local, d_comp",
-    [
-        # single sequence starting at 0 (no boundary).
-        ([0, 32], 0, 16, 4),
-        # one sequence fully spanning multiple ranks.
-        ([0, 40], 8, 16, 4),
-        # two sequences; rank starts inside the first.
-        ([0, 14, 40], 8, 16, 4),
-        # ragged multiple sequences.
-        ([0, 5, 21, 40], 11, 18, 4),
-        # ratio-4 overlap needs d_comp=8.
-        ([0, 32], 8, 16, 8),
-    ],
+    "cu_seqlens, global_start, l_local, d_comp, ratio, c_cap",
+    COMPACT_CASES,
 )
-def test_compressor_input_compact_forward_matches_naive(cu_seqlens, global_start, l_local, d_comp):
-    ratio = 4
-    c_cap = 8  # fixed capacity
+def test_compressor_input_compact_forward_matches_naive(
+    cu_seqlens, global_start, l_local, d_comp, ratio, c_cap
+):
     cu = torch.tensor(cu_seqlens, dtype=torch.int32)
     src_expected, total = _compact_to_source_naive(
         cu, global_start, l_local, ratio, d_comp, c_cap
@@ -283,19 +277,25 @@ def _naive_build_indices(
 
 
 @pytest.mark.parametrize(
-    "cu_seqlens, global_start, l_local, d_window, window_size, ratio, compressed_width",
-    [
-        ([0, 32], 0, 16, 4, 4, 4, 2),
-        ([0, 40], 8, 16, 4, 4, 4, 2),
-        ([0, 5, 21, 40], 11, 18, 4, 4, 4, 2),
-        ([0, 32], 8, 16, 8, 8, 4, 3),
-        ([0, 40], 8, 16, 4, 4, 128, 1),
-    ],
+    "cu_seqlens, cu_seqlens_compressed, global_start, l_local, "
+    "d_window, window_size, ratio, compressed_width",
+    ATTENTION_INDEX_CASES,
 )
 def test_build_attention_indices_mode1_matches_naive(
-    cu_seqlens, global_start, l_local, d_window, window_size, ratio, compressed_width
+    cu_seqlens,
+    cu_seqlens_compressed,
+    global_start,
+    l_local,
+    d_window,
+    window_size,
+    ratio,
+    compressed_width,
 ):
     cu = torch.tensor(cu_seqlens, dtype=torch.int32)
+    if cu_seqlens_compressed is not None:
+        cu_compressed = torch.tensor(cu_seqlens_compressed, dtype=torch.int32)
+    else:
+        cu_compressed = None
     seq_major_rows = (l_local * 2) // ratio
     seq_to_rank_row = torch.arange(seq_major_rows, dtype=torch.int32).tolist() + [-1]
 
@@ -308,7 +308,7 @@ def test_build_attention_indices_mode1_matches_naive(
         ratio,
         compressed_width,
         compressed_topk=None,
-        cu_seqlens_compressed=None,
+        cu_seqlens_compressed=cu_compressed.tolist() if cu_compressed is not None else None,
         seq_to_rank_row=seq_to_rank_row,
     )
     topk_idxs, topk_length, _ = csa_utils.build_attention_indices(
@@ -320,6 +320,7 @@ def test_build_attention_indices_mode1_matches_naive(
         ratio,
         compressed_width,
         compressed_topk=None,
+        cu_seqlens_compressed=cu_compressed,
         seq_to_rank_row=torch.tensor(seq_to_rank_row, dtype=torch.int32),
     )
     assert topk_idxs.shape == (l_local, window_size + compressed_width)
@@ -330,15 +331,28 @@ def test_build_attention_indices_mode1_matches_naive(
 
 
 @pytest.mark.parametrize(
-    "cu_seqlens, global_start, l_local, d_window, window_size, ratio, compressed_width",
-    [([0, 40], 8, 16, 4, 4, 4, 2), ([0, 5, 21, 40], 11, 18, 4, 4, 4, 3)],
+    "cu_seqlens, cu_seqlens_compressed, global_start, l_local, "
+    "d_window, window_size, ratio, compressed_width",
+    ATTENTION_INDEX_CASES,
 )
 def test_build_attention_indices_mode0_matches_naive(
-    cu_seqlens, global_start, l_local, d_window, window_size, ratio, compressed_width
+    cu_seqlens,
+    cu_seqlens_compressed,
+    global_start,
+    l_local,
+    d_window,
+    window_size,
+    ratio,
+    compressed_width,
 ):
     cu = torch.tensor(cu_seqlens, dtype=torch.int32)
+    if cu_seqlens_compressed is not None:
+        cu_compressed = torch.tensor(cu_seqlens_compressed, dtype=torch.int32)
+    else:
+        cu_compressed = None
     seq_major_rows = (l_local * 2) // ratio
     seq_to_rank_row = torch.arange(seq_major_rows, dtype=torch.int32).tolist() + [-1]
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
     compressed_topk = torch.randint(-1, 3, (l_local, compressed_width), dtype=torch.int32)
 
     exp_idxs, exp_tlen = _naive_build_indices(
@@ -350,7 +364,7 @@ def test_build_attention_indices_mode0_matches_naive(
         ratio,
         compressed_width,
         compressed_topk=compressed_topk.tolist(),
-        cu_seqlens_compressed=None,
+        cu_seqlens_compressed=cu_compressed.tolist() if cu_compressed is not None else None,
         seq_to_rank_row=seq_to_rank_row,
     )
     topk_idxs, topk_length, _ = csa_utils.build_attention_indices(
@@ -368,6 +382,361 @@ def test_build_attention_indices_mode0_matches_naive(
         assert topk_length[row].item() == exp_tlen[row]
         for col in range(window_size + compressed_width):
             assert topk_idxs[row, col].item() == exp_idxs[row][col]
+
+
+def _naive_build_indices_mode2(
+    cu_seqlens,
+    global_start,
+    l_local,
+    d_window,
+    window_size,
+    ratio,
+    compressed_width,
+    compressed_topk,
+    cu_seqlens_compressed=None,
+    seq_to_rank_row=None,
+):
+    """Serial Python re-implementation of the CuTe mode-2 (indexer loss)
+    lowering: compressed ids first, then window ids; rank-major compressed
+    rows are returned separately for the indexer-loss gather."""
+    if cu_seqlens_compressed is None:
+        cu_seqlens_compressed = cu_seqlens
+    if seq_to_rank_row is None:
+        seq_to_rank_row = [-1]
+    base = d_window + l_local
+    total_width = window_size + compressed_width
+    topk_idxs = [[-1] * total_width for _ in range(l_local)]
+    indexer_rank_major = [[-1] * compressed_width for _ in range(l_local)]
+
+    def seq_of(qg):
+        for s in range(len(cu_seqlens) - 1):
+            if cu_seqlens[s] <= qg < cu_seqlens[s + 1]:
+                return s
+        return None
+
+    for row in range(l_local):
+        qg = global_start + row
+        seq = seq_of(qg)
+        if seq is None:
+            # Fallback (tail-padding / truncated) rows: mode 2 emits -1
+            # everywhere and never fabricates a window entry.
+            continue
+        seq_start = cu_seqlens[seq]
+        seq_comp_start = cu_seqlens_compressed[seq]
+        seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+
+        # Compressed ids first: only caller-selected ids inside the
+        # sequence's compressed extent that also lower to a rank-major row.
+        for c in range(compressed_width):
+            cid = compressed_topk[row][c]
+            if 0 <= cid < seq_comp_len:
+                seq_major = seq_comp_start + cid
+                if seq_major < len(seq_to_rank_row):
+                    rmr = seq_to_rank_row[seq_major]
+                    if rmr >= 0:
+                        topk_idxs[row][c] = base + rmr
+                        indexer_rank_major[row][c] = rmr
+
+        # Window ids after the compressed block, compacted at the front.
+        ws = max(qg - window_size + 1, seq_start)
+        wcount = qg - ws + 1
+        for wcol in range(wcount):
+            pos = ws + wcol
+            topk_idxs[row][compressed_width + wcol] = (
+                pos - (global_start - d_window)
+                if pos < global_start
+                else d_window + pos - global_start
+            )
+    return topk_idxs, indexer_rank_major
+
+
+@pytest.mark.parametrize(
+    "cu_seqlens, cu_seqlens_compressed, global_start, l_local, "
+    "d_window, window_size, ratio, compressed_width",
+    ATTENTION_INDEX_CASES,
+)
+def test_build_attention_indices_mode2_matches_naive(
+    cu_seqlens,
+    cu_seqlens_compressed,
+    global_start,
+    l_local,
+    d_window,
+    window_size,
+    ratio,
+    compressed_width,
+):
+    """Mode 2 (indexer loss) lowering must match the serial CuTe reference."""
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32)
+    if cu_seqlens_compressed is not None:
+        cu_compressed = torch.tensor(cu_seqlens_compressed, dtype=torch.int32)
+    else:
+        cu_compressed = None
+    seq_major_rows = (l_local * 2) // ratio
+    seq_to_rank_row = torch.arange(seq_major_rows, dtype=torch.int32).tolist() + [-1]
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    compressed_topk = torch.randint(-1, 4, (l_local, compressed_width), dtype=torch.int32)
+
+    exp_idxs, exp_rank_major = _naive_build_indices_mode2(
+        cu.tolist(),
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        compressed_topk.tolist(),
+        cu_seqlens_compressed=cu_compressed.tolist() if cu_compressed is not None else None,
+        seq_to_rank_row=seq_to_rank_row,
+    )
+
+    topk_idxs, topk_length, indexer_rank_major = csa_utils.build_attention_indices(
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        compressed_topk=compressed_topk,
+        cu_seqlens_compressed=cu_compressed,
+        seq_to_rank_row=torch.tensor(seq_to_rank_row, dtype=torch.int32),
+        for_indexer_loss=True,
+    )
+    assert topk_length is None, "mode 2 does not produce a topk_length"
+    assert topk_idxs.shape == (l_local, window_size + compressed_width)
+    dsv4_parity_gate.assert_index_parity(
+        topk_idxs,
+        torch.tensor(exp_idxs, dtype=torch.int32),
+        topology=f"cpu-oracle:cu_seqlens={cu_seqlens}",
+        layer_mode="mode2-indexer-loss",
+        shape=(l_local, window_size + compressed_width),
+    )
+    dsv4_parity_gate.assert_index_parity(
+        indexer_rank_major,
+        torch.tensor(exp_rank_major, dtype=torch.int32),
+        topology=f"cpu-oracle:cu_seqlens={cu_seqlens}",
+        layer_mode="mode2-indexer-loss",
+        shape=(l_local, compressed_width),
+    )
+
+
+def test_build_attention_indices_mode2_unlowerable_rank_rows():
+    """Mode 2 must skip compressed rows that cannot lower to a rank-major
+    row while still placing later valid rows and the window block."""
+    cu = torch.tensor([0, 5, 21, 40], dtype=torch.int32)
+    cu_compressed = torch.tensor([0, 1, 4, 8], dtype=torch.int32)
+    global_start, l_local, d_window, window_size, ratio, compressed_width = (
+        11,
+        18,
+        4,
+        4,
+        4,
+        3,
+    )
+    # Rows 1, 3 and 6 of the sequence-major compressed buffer are unavailable
+    # on this rank (owned elsewhere / padding).
+    seq_to_rank_row = [0, -1, 2, -1, 3, 4, -1, 5]
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    compressed_topk = torch.randint(0, 5, (l_local, compressed_width), dtype=torch.int32)
+
+    exp_idxs, exp_rank_major = _naive_build_indices_mode2(
+        cu.tolist(),
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        compressed_topk.tolist(),
+        cu_seqlens_compressed=cu_compressed.tolist(),
+        seq_to_rank_row=seq_to_rank_row,
+    )
+    topk_idxs, _, indexer_rank_major = csa_utils.build_attention_indices(
+        cu,
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        compressed_topk=compressed_topk,
+        cu_seqlens_compressed=cu_compressed,
+        seq_to_rank_row=torch.tensor(seq_to_rank_row, dtype=torch.int32),
+        for_indexer_loss=True,
+    )
+    dsv4_parity_gate.assert_index_parity(
+        topk_idxs,
+        torch.tensor(exp_idxs, dtype=torch.int32),
+        topology="cpu-oracle:unlowerable-rank-rows",
+        layer_mode="mode2-indexer-loss",
+        shape=(l_local, window_size + compressed_width),
+    )
+    dsv4_parity_gate.assert_index_parity(
+        indexer_rank_major,
+        torch.tensor(exp_rank_major, dtype=torch.int32),
+        topology="cpu-oracle:unlowerable-rank-rows",
+        layer_mode="mode2-indexer-loss",
+        shape=(l_local, compressed_width),
+    )
+
+
+# ===========================================================================
+# build_flat_topk_idxs / local_to_global_flat reference (flat index packing)
+# ===========================================================================
+
+
+def _naive_global_sbhd(idxs_combined, batch_size):
+    """Serial SBHD-flat conversion: global row = local * B + b."""
+    b, sq, topk = idxs_combined.shape
+    out = [[-1] * topk for _ in range(sq * b)]
+    for i in range(b):
+        for s in range(sq):
+            for k in range(topk):
+                v = int(idxs_combined[i, s, k])
+                out[s * b + i][k] = v * b + i if v >= 0 else -1
+    return out
+
+
+def _naive_global_thd(idxs_combined, cu_seqlens_q, cu_seqlens_kv):
+    """Serial THD-flat conversion: global row = cu_seqlens_kv[batch(q)] + local.
+
+    Query rows beyond ``cu_seqlens_q[-1]`` (padded capacity) clamp to the
+    last segment, mirroring ``batch_of_row``.
+    """
+    total_q, topk = idxs_combined.shape
+    n_seq = len(cu_seqlens_q) - 1
+
+    def batch_of(q):
+        seq = n_seq - 1
+        for s in range(n_seq):
+            if q < cu_seqlens_q[s + 1]:
+                seq = s
+                break
+        return seq
+
+    out = [[-1] * topk for _ in range(total_q)]
+    for q in range(total_q):
+        bq = batch_of(q)
+        offset = cu_seqlens_kv[bq]
+        for k in range(topk):
+            v = int(idxs_combined[q, k])
+            out[q][k] = v + offset if v >= 0 else -1
+    return out
+
+
+@pytest.mark.parametrize("b, sq, topk_1, topk_2", dsv4_parity_gate.FLAT_INDEX_SBHD_CASES)
+def test_build_flat_topk_idxs_sbhd_matches_naive(b, sq, topk_1, topk_2):
+    """SBHD flat packing must match the serial reference, preserving -1."""
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    group_1 = torch.randint(-1, 3, (b, sq, topk_1), dtype=torch.int32)
+    group_2 = torch.randint(-1, 5, (b, sq, topk_2), dtype=torch.int32)
+    combined = torch.cat((group_1, group_2), dim=-1)
+
+    flat, length = csa_utils.build_flat_topk_idxs(
+        group_1, group_2, batch_size=b, compact=False
+    )
+    assert length is None
+    assert flat.shape == (sq * b, topk_1 + topk_2)
+    expected = torch.tensor(_naive_global_sbhd(combined, b), dtype=torch.int32)
+    dsv4_parity_gate.assert_index_parity(
+        flat,
+        expected,
+        topology=f"cpu-oracle:sbhd-flat:b={b}:sq={sq}",
+        layer_mode="flat-index-packing",
+        shape=(sq * b, topk_1 + topk_2),
+    )
+
+
+@pytest.mark.parametrize(
+    "cu_seqlens, total_q, topk", dsv4_parity_gate.FLAT_INDEX_THD_CASES
+)
+def test_build_flat_topk_idxs_thd_matches_naive(cu_seqlens, total_q, topk):
+    """THD flat packing (per-sequence KV offsets, orphan-row clamping)."""
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    cu_q = torch.tensor(cu_seqlens, dtype=torch.int32)
+    idxs = torch.randint(-1, 7, (total_q, topk), dtype=torch.int32)
+
+    flat, length = csa_utils.build_flat_topk_idxs(
+        idxs,
+        batch_size=0,
+        compact=False,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_q,
+    )
+    assert length is None
+    assert flat.shape == (total_q, topk)
+    expected = torch.tensor(
+        _naive_global_thd(idxs.tolist(), cu_seqlens, cu_seqlens), dtype=torch.int32
+    )
+    dsv4_parity_gate.assert_index_parity(
+        flat,
+        expected,
+        topology=f"cpu-oracle:thd-flat:cu_seqlens={cu_seqlens}:total_q={total_q}",
+        layer_mode="flat-index-packing",
+        shape=(total_q, topk),
+    )
+
+
+def test_build_flat_topk_idxs_thd_uses_kv_boundaries():
+    """THD packing offsets by cu_seqlens_kv, which may differ from Q."""
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    cu_q = torch.tensor([0, 4, 12], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 6, 18], dtype=torch.int32)
+    idxs = torch.randint(-1, 5, (12, 4), dtype=torch.int32)
+
+    flat, _ = csa_utils.build_flat_topk_idxs(
+        idxs,
+        batch_size=0,
+        compact=False,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+    )
+    expected = torch.tensor(
+        _naive_global_thd(idxs.tolist(), [0, 4, 12], [0, 6, 18]), dtype=torch.int32
+    )
+    dsv4_parity_gate.assert_index_parity(
+        flat,
+        expected,
+        topology="cpu-oracle:thd-flat:distinct-kv-boundaries",
+        layer_mode="flat-index-packing",
+        shape=(12, 4),
+    )
+
+
+def test_build_flat_topk_idxs_compact_prefix_contract():
+    """compact=True must move valid entries to a row prefix and report the
+    exact prefix length (no power-of-two padding lanes)."""
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    b, sq, topk_1, topk_2 = 2, 8, 4, 3
+    group_1 = torch.randint(-1, 3, (b, sq, topk_1), dtype=torch.int32)
+    group_2 = torch.randint(-1, 5, (b, sq, topk_2), dtype=torch.int32)
+
+    flat, length = csa_utils.build_flat_topk_idxs(
+        group_1, group_2, batch_size=b, compact=True
+    )
+    expected = torch.tensor(_naive_global_sbhd(torch.cat((group_1, group_2), dim=-1), b))
+    assert flat.shape == expected.shape
+    assert length.shape == (sq * b,)
+    for row in range(sq * b):
+        valid = expected[row] >= 0
+        count = int(valid.sum().item())
+        assert length[row].item() == count
+        # Valid entries keep their original relative order at the prefix
+        # (compaction moves them to the front, it never reorders them).
+        assert torch.equal(flat[row, :count], expected[row][valid])
+        # The suffix is exactly -1 and never carries a padding lane.
+        suffix = torch.full((flat.shape[1] - count,), -1, dtype=flat.dtype)
+        assert torch.equal(flat[row, count:], suffix)
+
+
+def test_build_flat_topk_idxs_invalid_row_all_minus_one():
+    """A fully invalid row must produce length 0 and all -1 entries."""
+    torch.manual_seed(dsv4_parity_gate.PARITY_SEED)
+    b, sq, topk = 1, 4, 5
+    idxs = torch.full((b, sq, topk), -1, dtype=torch.int32)
+    flat, length = csa_utils.build_flat_topk_idxs(idxs, batch_size=b, compact=True)
+    assert torch.equal(flat, torch.full((sq, topk), -1, dtype=torch.int32))
+    assert torch.equal(length, torch.zeros(sq, dtype=torch.int32))
 
 
 # ===========================================================================

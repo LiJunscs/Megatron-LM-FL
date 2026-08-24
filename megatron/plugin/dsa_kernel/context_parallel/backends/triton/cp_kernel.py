@@ -231,7 +231,9 @@ if _TRITON_AVAILABLE:
                         seq_major_rows - 1,
                     )
                     rank_row_0 = tl.load(
-                        seq_to_rank_row_ptr + safe_major_0, mask=cmask_0, other=-1
+                        seq_to_rank_row_ptr + safe_major_0,
+                        mask=cmask_0 & (safe_major_0 >= 0),
+                        other=-1,
                     )
                     rank_valid_0 = (
                         comp_valid_0
@@ -444,18 +446,27 @@ class _TritonCompressorInputCompact(torch.autograd.Function):
             _launch_compaction_bwd(grad_compact, back_idx, grad_out)
         else:
             # Repeated source row (defensive): accumulating PyTorch reference.
+            # Contributions must be split by ownership first: local rows index
+            # ``grad_hidden`` and boundary rows index ``grad_boundary``; using
+            # the combined row map on either output would go out of bounds.
             contrib = grad_compact.index_select(0, compact_idx)
             is_boundary = srcs < range_start
-            local_row = (srcs - range_start).clamp_min(0).to(dtype=torch.int64)
-            boundary_row = (srcs - (range_start - d_window)).clamp_min(0).to(dtype=torch.int64)
+            local_row = (srcs[~is_boundary] - range_start).to(dtype=torch.int64)
+            boundary_row = (srcs[is_boundary] - (range_start - d_window)).to(
+                dtype=torch.int64
+            )
             grad_hidden = torch.zeros(
                 (l_local, W), dtype=grad_compact.dtype, device=grad_compact.device
             )
             grad_boundary = torch.zeros(
                 (d_window, W), dtype=grad_compact.dtype, device=grad_compact.device
             )
-            grad_hidden = grad_hidden.index_add(0, local_row, contrib)
-            grad_boundary = grad_boundary.index_add(0, boundary_row, contrib)
+            if local_row.numel():
+                grad_hidden = grad_hidden.index_add(0, local_row, contrib[~is_boundary])
+            if boundary_row.numel():
+                grad_boundary = grad_boundary.index_add(
+                    0, boundary_row, contrib[is_boundary]
+                )
             grad_out = torch.cat((grad_boundary, grad_hidden), dim=0)
 
         grad_hidden = grad_out[d_window:].reshape(ctx.hidden_shape)
