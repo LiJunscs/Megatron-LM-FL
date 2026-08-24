@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 # Imports
 # ---------------------------------------------------------------------------
 
-from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.kernels import (
     build_flat_topk_idxs,
     dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,
     fused_indexer_sparse_attn,
@@ -87,14 +87,14 @@ from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
     _kl_loss_from_target_predict,
     _kl_loss_from_dense_scores,
 )
-from megatron.plugin.dsa_kernel.triton_indexer_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.indexer import (
     sparse_indexer_score_recompute,
     sparse_attn_score_recompute,
     dense_indexer_score_recompute,
     dense_attn_score_recompute,
     fused_sparse_indexer_loss_and_backward,
 )
-from megatron.plugin.dsa_kernel.triton_dsa_utils import (
+from megatron.plugin.dsa_kernel.backends.triton.utils import (
     compute_ratio_causal_mask,
     topk_with_causal_mask,
 )
@@ -218,7 +218,7 @@ def _run_unfused_with_same_indices(inputs: dict) -> Tuple[Tensor, Tensor]:
     Returns:
         (output, combined_topk_idxs)
     """
-    from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+    from megatron.plugin.dsa_kernel.backends.triton.kernels import (
         _sbhd_to_bshd_indexer_inputs,
         _indexer_topk_bshd,
     )
@@ -472,7 +472,7 @@ class TestFusedIndexerSparseAttnBackward:
     @staticmethod
     def _run_unfused_with_grad(inputs: dict) -> dict:
         """Run unfused path with gradients enabled, return output + grads."""
-        from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+        from megatron.plugin.dsa_kernel.backends.triton.kernels import (
             _sbhd_to_bshd_indexer_inputs,
             _indexer_topk_bshd,
         )
@@ -1337,7 +1337,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.kernels import (
     dsa_sparse_attn as _triton_dsa_sparse_attn_raw,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -1367,7 +1367,7 @@ def _oom_guard():
 # The globals are populated during CSA construction.
 # ---------------------------------------------------------------------------
 
-from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.kernels import (
     dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,  # noqa: F401
 )
 
@@ -3864,7 +3864,7 @@ def _reference_dq_dkv(
     softmax_scale: float,
 ):
     """Reference PyTorch implementation of dQ and dKV (original BMM path)."""
-    from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import fused_exp_mask
+    from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import fused_exp_mask
 
     S, H, TopK = scores.shape
 
@@ -3966,7 +3966,7 @@ class TestFusedDQ:
     ])
     def test_numerical_accuracy(self, total_Sq, H, D, TopK, device):
         """Fused dQ matches reference BMM-based dQ."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import fused_dq
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import fused_dq
 
         data = _make_fused_bwd_tensors(total_Sq=total_Sq, H=H, D=D, TopK=TopK, device=device)
 
@@ -3990,7 +3990,7 @@ class TestFusedDQ:
 
     def test_no_nan_inf(self, device):
         """Fused dQ produces no NaN or Inf."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import fused_dq
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import fused_dq
 
         data = _make_fused_bwd_tensors(total_Sq=64, H=32, D=512, TopK=128, device=device)
         result = fused_dq(
@@ -4016,7 +4016,7 @@ class TestFusedDKV:
     ])
     def test_numerical_accuracy(self, total_Sq, H, D, TopK, device):
         """Fused dKV matches reference BMM-based dKV."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import fused_dkv
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import fused_dkv
 
         data = _make_fused_bwd_tensors(total_Sq=total_Sq, H=H, D=D, TopK=TopK, device=device)
 
@@ -4040,7 +4040,7 @@ class TestFusedDKV:
 
     def test_no_nan_inf(self, device):
         """Fused dKV produces no NaN or Inf."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import fused_dkv
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import fused_dkv
 
         data = _make_fused_bwd_tensors(total_Sq=64, H=32, D=512, TopK=128, device=device)
         result = fused_dkv(
@@ -4066,7 +4066,7 @@ class TestSortedScatterAdd:
     ])
     def test_numerical_accuracy(self, total_Sq, TopK, total_Skv, D, device):
         """Sorted scatter_add matches reference fused_mask_scatter_add."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import (
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import (
             sorted_scatter_add,
             fused_mask_scatter_add,
         )
@@ -4097,7 +4097,7 @@ class TestSortedScatterAdd:
 
     def test_high_contention(self, device):
         """Sorted scatter handles high-contention (many writes to same target)."""
-        from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import (
+        from megatron.plugin.dsa_kernel.backends.triton.sparse_attention_backward import (
             sorted_scatter_add,
             fused_mask_scatter_add,
         )
@@ -4138,7 +4138,7 @@ class TestFusedBackwardIntegration:
     ])
     def test_autograd_no_nan(self, total_Sq, H, D, TopK, total_Skv, device):
         """Full forward+backward via dsa_sparse_attn produces non-NaN gradients."""
-        from megatron.plugin.dsa_kernel.triton_dsa_kernels import dsa_sparse_attn
+        from megatron.plugin.dsa_kernel.backends.triton.kernels import dsa_sparse_attn
 
         torch.manual_seed(42)
 

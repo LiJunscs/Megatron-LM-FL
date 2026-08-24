@@ -42,14 +42,14 @@ _skip_unless_sm90 = pytest.mark.skipif(
     not _SM90_AVAILABLE, reason="SM90+ required for Triton DSA kernels"
 )
 
-from megatron.plugin.dsa_kernel.triton_indexer_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.indexer import (
     fused_sparse_indexer_loss_and_backward,
     fused_dense_indexer_loss_and_backward,
     compute_sparse_local_target_head_sum,
     compute_sparse_indexer_predict_state,
     sparse_indexer_kl_and_backward,
 )
-from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.kernels import (
     fused_indexer_sparse_attn,
     _sbhd_to_bshd_indexer_inputs,
     _indexer_topk_bshd,
@@ -422,10 +422,10 @@ class TestOverlapOrdering:
                 return FakeWork()
             return None
 
-        with patch("megatron.plugin.dsa_kernel.triton_dsa_kernels._DSA_TP_OVERLAP", True), \
-             patch("megatron.plugin.dsa_kernel.triton_dsa_kernels.compute_sparse_local_target_head_sum", tracked_target), \
-             patch("megatron.plugin.dsa_kernel.triton_dsa_kernels.compute_sparse_indexer_predict_state", tracked_predict), \
-             patch("megatron.plugin.dsa_kernel.triton_dsa_kernels.sparse_indexer_kl_and_backward", tracked_kl), \
+        with patch("megatron.plugin.dsa_kernel.backends.triton.kernels._DSA_TP_OVERLAP", True), \
+             patch("megatron.plugin.dsa_kernel.backends.triton.kernels.compute_sparse_local_target_head_sum", tracked_target), \
+             patch("megatron.plugin.dsa_kernel.backends.triton.kernels.compute_sparse_indexer_predict_state", tracked_predict), \
+             patch("megatron.plugin.dsa_kernel.backends.triton.kernels.sparse_indexer_kl_and_backward", tracked_kl), \
              patch("torch.distributed.all_reduce", mock_all_reduce):
 
             sq, b, np_, d = 64, 2, 4, 128
@@ -607,7 +607,7 @@ class TestDenseTPIntegration:
         S_k = inputs["S_k"]
         B = inputs["q_attn_bshd"].shape[0]
 
-        from megatron.plugin.dsa_kernel.triton_dsa_utils import compute_ratio_causal_mask
+        from megatron.plugin.dsa_kernel.backends.triton.utils import compute_ratio_causal_mask
 
         causal_mask_float = compute_ratio_causal_mask(S_q, S_k, ratio, self.device)
         causal_mask = (causal_mask_float == 0)
@@ -675,8 +675,8 @@ class TestDenseTPIntegration:
         # Simulated TP: manually compute global head sum then call with it
         # We can't easily mock the all-reduce here, but we can verify the math
         # by running with a local head slice and manually summing
-        from megatron.plugin.dsa_kernel.triton_dsa_utils import compute_ratio_causal_mask
-        from megatron.plugin.dsa_kernel.triton_indexer_kernels import _DENSE_BLOCK_Q
+        from megatron.plugin.dsa_kernel.backends.triton.utils import compute_ratio_causal_mask
+        from megatron.plugin.dsa_kernel.backends.triton.indexer import _DENSE_BLOCK_Q
 
         S_q = inputs["q_attn_bshd"].shape[1]
         S_k = inputs["S_k"]
@@ -982,7 +982,7 @@ class TestDistributedTPCorrectness:
         old_val = _os.environ.get("MEGATRON_DSA_TP_OVERLAP", "0")
         _os.environ["MEGATRON_DSA_TP_OVERLAP"] = "1" if overlap else "0"
         # Reload the module-level flag
-        import megatron.plugin.dsa_kernel.triton_dsa_kernels as _mod
+        import megatron.plugin.dsa_kernel.backends.triton.kernels as _mod
         _mod._DSA_TP_OVERLAP = overlap
 
         query_local, sink_local, np_local = _shard_for_rank(inputs, rank, tp_size)
@@ -1299,7 +1299,7 @@ class TestDistributedTPCorrectness:
         )
 
         # TP=N (dense)
-        import megatron.plugin.dsa_kernel.triton_dsa_kernels as _mod
+        import megatron.plugin.dsa_kernel.backends.triton.kernels as _mod
         _mod._DSA_TP_OVERLAP = False
 
         query_local, sink_local, np_local = _shard_for_rank(inputs, rank, tp_size)
@@ -1513,7 +1513,7 @@ class TestDistributedTPPerformance:
         }
 
     def _benchmark(self, module, inputs, overlap, backward=True, warmup=3, iters=10):
-        import megatron.plugin.dsa_kernel.triton_dsa_kernels as triton_dsa
+        import megatron.plugin.dsa_kernel.backends.triton.kernels as triton_dsa
 
         triton_dsa._DSA_TP_OVERLAP = overlap
 
@@ -1561,7 +1561,7 @@ class TestDistributedTPPerformance:
 
     def _measure_peak_memory(self, module, inputs, overlap):
         """Return the maximum per-rank incremental peak memory in MiB."""
-        import megatron.plugin.dsa_kernel.triton_dsa_kernels as triton_dsa
+        import megatron.plugin.dsa_kernel.backends.triton.kernels as triton_dsa
 
         triton_dsa._DSA_TP_OVERLAP = overlap
         leaves = {
@@ -1625,7 +1625,7 @@ class TestDistributedTPPerformance:
         self, case_name, compress_ratio, dsa_metrics
     ):
         """Validate full-module forward and backward against unfused CSA."""
-        import megatron.plugin.dsa_kernel.triton_dsa_kernels as triton_dsa
+        import megatron.plugin.dsa_kernel.backends.triton.kernels as triton_dsa
 
         triton_dsa._DSA_TP_OVERLAP = False
         inputs = self._make_inputs()
