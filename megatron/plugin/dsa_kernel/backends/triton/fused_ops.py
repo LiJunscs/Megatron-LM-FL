@@ -194,8 +194,11 @@ def _sbhd_to_bshd_indexer_inputs(
     q_bshd = q_indexer.permute(1, 0, 2, 3)   # (b, sq, nh, hd)
     k_bsd = k_indexer.permute(1, 0, 2)       # (b, sk, hd)
     w_bsh = weights.permute(1, 0, 2)         # (b, sq, nh)
-    # Scale weights
-    w_bsh_scaled = w_bsh * indexer_softmax_scale
+    # Scale weights in FP32 to match the unfused oracle, which pre-scales as
+    # ``weights_indexer_cp.float() * indexer.softmax_scale``.  Scaling in
+    # BF16 would round the scale factor itself and the product, shifting
+    # near-tie top-K boundaries against the oracle.
+    w_bsh_scaled = w_bsh.float() * indexer_softmax_scale
     return q_bshd, k_bsd, w_bsh, w_bsh_scaled
 
 

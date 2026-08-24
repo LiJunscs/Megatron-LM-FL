@@ -4,7 +4,7 @@
 
 This module owns non-CP backend operations. Shared flat-index semantics are
 delegated to ``csa_utils.cp_layout``. CP-specific adapters live in the separate
-``dsa_kernel.cp.backends`` tree.
+``dsa_kernel.context_parallel.backends`` tree.
 """
 
 from typing import Optional, Tuple
