@@ -49,6 +49,20 @@ class TestBackendEnumeration:
             for operation in cuda_operations
         )
 
+    @pytest.mark.parametrize("backend", ("torch", "triton", "cuda"))
+    def test_cp_operations_resolve_from_the_cp_backend_tree(self, backend):
+        for operation in dsa_backend._CP_OPERATIONS:
+            module = dsa_backend._operation_module_name(operation, backend)
+            assert ".dsa_kernel.context_parallel.backends." in module
+
+    def test_non_cp_backends_do_not_export_cp_operations(self):
+        from megatron.plugin.dsa_kernel.backends import pytorch as pytorch_backend
+        from megatron.plugin.dsa_kernel.backends import triton as triton_backend
+
+        for backend in (pytorch_backend, triton_backend):
+            assert not hasattr(backend, "build_attention_indices")
+            assert not hasattr(backend, "compact_compressor_input")
+
 
 class TestBackendResolution:
     def test_auto_always_resolves_to_torch_when_no_accelerators(self, monkeypatch):
@@ -124,11 +138,13 @@ class TestSupportAndResolve:
         """An installed CUDA backend may still lack its optional CuTe DSL."""
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.backends import cudnn_flashmla as cuda_backend
-        from megatron.plugin.dsa_kernel.backends import triton as trt
+        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            cp_layout as pyt_cp_backend,
+        )
 
-        monkeypatch.setattr(cuda_backend, "supports", lambda op: False)
-        assert dsa_backend.resolve(operation) is getattr(trt, torch_attr)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: False)
+        assert dsa_backend.resolve(operation) is getattr(pyt_cp_backend, torch_attr)
 
     @pytest.mark.parametrize(
         "operation", ("compact_compressor_input", "build_attention_indices")
@@ -136,27 +152,26 @@ class TestSupportAndResolve:
     def test_cuda_cp_layout_resolves_to_restored_cute(self, monkeypatch, operation):
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.backends import cudnn_flashmla as cuda_backend
+        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
 
-        monkeypatch.setattr(cuda_backend, "supports", lambda op: True)
-        assert dsa_backend.resolve(operation) is getattr(cuda_backend, operation)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: True)
+        assert dsa_backend.resolve(operation) is getattr(cuda_cp_backend, operation)
 
     def test_cuda_cp_layout_prefers_triton_before_torch(self, monkeypatch):
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
         monkeypatch.setattr(dsa_backend, "_triton_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.backends import cudnn_flashmla as cuda_backend
-        from megatron.plugin.dsa_kernel.backends import triton as triton_backend
+        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
+        from megatron.plugin.dsa_kernel.context_parallel.backends import triton as triton_cp_backend
 
-        monkeypatch.setattr(cuda_backend, "supports", lambda op: False)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: False)
         assert dsa_backend.resolve("build_attention_indices") is (
-            triton_backend.build_attention_indices
+            triton_cp_backend.build_attention_indices
         )
 
 
 class TestBackendDelegationIntegration:
     def test_torch_sparse_attention_decodes_sequence_major_flat_rows(self, monkeypatch):
-        from megatron.plugin.dsa_kernel.backends.pytorch import kernels
         from megatron.plugin.dsa_kernel.backends import pytorch as pyt
 
         captured = {}
@@ -167,7 +182,7 @@ class TestBackendDelegationIntegration:
                 (query.shape[0], query.shape[1], query.shape[2] * query.shape[3])
             )
 
-        monkeypatch.setattr(kernels, "unfused_sparse_attn", fake_unfused)
+        monkeypatch.setattr(pyt, "unfused_sparse_attn", fake_unfused)
         # Flat query rows are ordered (s0,b0), (s0,b1), (s1,b0), (s1,b1).
         local_bsk = torch.tensor([[[1], [2]], [[3], [4]]], dtype=torch.int32)
         flat, _ = pyt.build_flat_topk_idxs(

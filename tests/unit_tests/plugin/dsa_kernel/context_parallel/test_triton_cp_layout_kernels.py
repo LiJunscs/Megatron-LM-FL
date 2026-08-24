@@ -17,7 +17,7 @@ import torch
 import pytest
 
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    utils as csa_utils,
+    cp_layout as csa_utils,
 )
 from megatron.plugin.dsa_kernel.backends.triton import cp_layout as tcl
 

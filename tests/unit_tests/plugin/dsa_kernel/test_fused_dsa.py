@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 # Imports
 # ---------------------------------------------------------------------------
 
-from megatron.plugin.dsa_kernel.backends.triton.kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
     build_flat_topk_idxs,
     dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,
     fused_indexer_sparse_attn,
@@ -218,7 +218,7 @@ def _run_unfused_with_same_indices(inputs: dict) -> Tuple[Tensor, Tensor]:
     Returns:
         (output, combined_topk_idxs)
     """
-    from megatron.plugin.dsa_kernel.backends.triton.kernels import (
+    from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
         _sbhd_to_bshd_indexer_inputs,
         _indexer_topk_bshd,
     )
@@ -472,7 +472,7 @@ class TestFusedIndexerSparseAttnBackward:
     @staticmethod
     def _run_unfused_with_grad(inputs: dict) -> dict:
         """Run unfused path with gradients enabled, return output + grads."""
-        from megatron.plugin.dsa_kernel.backends.triton.kernels import (
+        from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
             _sbhd_to_bshd_indexer_inputs,
             _indexer_topk_bshd,
         )
@@ -1337,7 +1337,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.plugin.dsa_kernel.backends.triton.kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
     dsa_sparse_attn as _triton_dsa_sparse_attn_raw,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -1367,7 +1367,7 @@ def _oom_guard():
 # The globals are populated during CSA construction.
 # ---------------------------------------------------------------------------
 
-from megatron.plugin.dsa_kernel.backends.triton.kernels import (
+from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
     dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,  # noqa: F401
 )
 
@@ -4138,7 +4138,7 @@ class TestFusedBackwardIntegration:
     ])
     def test_autograd_no_nan(self, total_Sq, H, D, TopK, total_Skv, device):
         """Full forward+backward via dsa_sparse_attn produces non-NaN gradients."""
-        from megatron.plugin.dsa_kernel.backends.triton.kernels import dsa_sparse_attn
+        from megatron.plugin.dsa_kernel.backends.triton.fused_ops import dsa_sparse_attn
 
         torch.manual_seed(42)
 

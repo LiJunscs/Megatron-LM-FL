@@ -1,18 +1,19 @@
 # Copyright (c) 2026 FlagOS / Megatron-LM-FL. All rights reserved.
 
-"""Portable PyTorch reference backend for DSv4 sparse attention.
+"""Portable PyTorch reference operations for DSv4 sparse attention.
 
-This module exposes the backend-callable surface while delegating shared
-flat-index and contiguous-CP layout semantics to the small core reference
-in ``csa_utils.utils``. Optional Triton and legacy CUDA implementations
-are validated against these operators.
+This module owns non-CP backend operations. Shared flat-index semantics are
+delegated to ``csa_utils.cp_layout``. CP-specific adapters live in the separate
+``dsa_kernel.cp.backends`` tree.
 """
 
 from typing import Optional, Tuple
 
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.csa_utils import utils as dsa_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout as dsa_layout,
+)
 
 # ---------------------------------------------------------------------------
 # Index helpers (pure PyTorch, shared with every backend)
@@ -33,61 +34,12 @@ def build_flat_topk_idxs(
     ``dsa_kernels.build_flat_topk_idxs`` (used only for shape assertions
     there) and ignored by the reference.
     """
-    return dsa_utils.build_flat_topk_idxs(
+    return dsa_layout.build_flat_topk_idxs(
         *idx_groups,
         batch_size=batch_size,
         compact=compact,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CP layout (legacy: CuTeDSL ``cp_layout_kernels``)
-# ---------------------------------------------------------------------------
-
-
-def compress_compressor_input(
-    hidden_local: torch.Tensor,
-    boundary_hidden: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    global_start: int,
-    ratio: int,
-    d_comp: int,
-    c_cap: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compress local+boundary hidden rows into fixed-capacity input (torch)."""
-    return dsa_utils.compressor_input_compact(
-        hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap
-    )
-
-
-def build_attention_indices(
-    cu_seqlens: torch.Tensor,
-    global_start: int,
-    l_local: int,
-    d_window: int,
-    window_size: int,
-    ratio: int,
-    compressed_width: int,
-    compressed_topk: Optional[torch.Tensor] = None,
-    cu_seqlens_compressed: Optional[torch.Tensor] = None,
-    seq_to_rank_row: Optional[torch.Tensor] = None,
-    for_indexer_loss: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Lower logical CP indices into physical attention indices (torch)."""
-    return dsa_utils.build_attention_indices(
-        cu_seqlens,
-        global_start,
-        l_local,
-        d_window,
-        window_size,
-        ratio,
-        compressed_width,
-        compressed_topk,
-        cu_seqlens_compressed,
-        seq_to_rank_row,
-        for_indexer_loss,
     )
 
 
@@ -183,12 +135,8 @@ def indexer_topk(
 
 
 __all__ = [
-    "build_attention_indices",
     "build_flat_topk_idxs",
-    "compress_compressor_input",
     "indexer_sparse_attn",
     "indexer_topk",
     "unfused_sparse_attn",
 ]
-
-

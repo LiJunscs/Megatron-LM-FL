@@ -14,6 +14,7 @@ from torch import Tensor
 __all__ = [
     "build_attention_indices",
     "build_flat_topk_idxs",
+    "compact_compressor_input",
     "compressor_input_compact",
 ]
 
@@ -167,7 +168,7 @@ def build_flat_topk_idxs(
     return global_idxs, topk_length_flat
 
 # =============================================================================
-# from LM: csa_utils/cp_layout_kernels.py (CuTeDSL) 鈥?pure-PyTorch CP layout
+# From LM: the CuTeDSL ``cp_kernel.py`` contract -> pure-PyTorch CP layout.
 # port. Keeps the tensor contracts used by the optional plugin kernels.
 # =============================================================================
 
@@ -290,7 +291,7 @@ class CompressorInputCompact(torch.autograd.Function):
     compressor input (pure-PyTorch reference).
 
     Drop-in tensor-contract replacement for
-    ``cp_layout_kernels.CompressorInputCompact``: forward returns
+    ``cp_kernel.CompressorInputCompact``: forward returns
     ``(hidden_compact, comp_ids)`` with ``hidden_compact`` of shape
     ``(c_cap * ratio, *trailing)``; backward scatters compact gradients back
     to the local and boundary hidden rows with accumulation.
@@ -397,6 +398,11 @@ def compressor_input_compact(
     )
 
 
+# Backend-neutral dispatcher contract. Keep the original name above for
+# compatibility with the core unfused path.
+compact_compressor_input = compressor_input_compact
+
+
 def build_attention_indices(
     cu_seqlens: torch.Tensor,
     global_start: int,
@@ -413,7 +419,7 @@ def build_attention_indices(
     """Build final sparse-attention / indexer-loss indices (PyTorch reference).
 
     Vectorized tensor-contract drop-in for
-    ``cp_layout_kernels.build_attention_indices``.
+    ``cp_kernel.build_attention_indices``.
 
     Three modes (mirroring the CuTe kernel's ``index_mode``):
 

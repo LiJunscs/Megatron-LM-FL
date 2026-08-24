@@ -1,9 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MCore-facing utilities for DSv4 contiguous context parallelism.
-
 The module owns SBHD/THD position handling, left-boundary exchange, and
 compressor-input metadata. Portable layout work delegates to the focused
-PyTorch reference in ``csa_utils.utils``.
+PyTorch reference in ``csa_utils.cp_layout``.
 """
 
 import math
@@ -15,7 +14,7 @@ import torch.distributed as dist
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
-from . import utils as csa_utils
+from . import cp_layout as csa_utils
 
 # =============================================================================
 # RoPE Wrappers
@@ -296,4 +295,3 @@ def prepare_cp_compressor_input(
         torch.int32
     )
     return hidden_compact, compressed_group_ids, seq_to_rank_row
-

@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unified backend selection for DSv4 sparse-attention kernels.
 
-Optional dependencies are isolated below backends/ and imported only after
+Optional dependencies are isolated below ``backends/`` for fused DSA and
+``cp/backends/`` for context-parallel operations. They are imported only after
 this module has probed their runtime requirements. Model code imports this
-package instead of importing Triton, cuDNN Frontend, or FlashMLA directly.
+package instead of importing Triton, CuTe DSL, cuDNN Frontend, or FlashMLA
+directly.
 """
 
 import importlib
@@ -19,6 +21,17 @@ _BACKEND_MODULES = {
     "torch": "megatron.plugin.dsa_kernel.backends.pytorch",
     "triton": "megatron.plugin.dsa_kernel.backends.triton",
     "cuda": "megatron.plugin.dsa_kernel.backends.cudnn_flashmla",
+}
+
+_CP_BACKEND_MODULES = {
+    "torch": "megatron.core.transformer.experimental_attention_variant.csa_utils.cp_layout",
+    "triton": "megatron.plugin.dsa_kernel.context_parallel.backends.triton",
+    "cuda": "megatron.plugin.dsa_kernel.context_parallel.backends.cute",
+}
+
+_CP_OPERATIONS = {
+    "build_attention_indices",
+    "compact_compressor_input",
 }
 
 
@@ -160,8 +173,9 @@ def available_backend(config: Optional[object] = None) -> str:
     raise DSAv4BackendError("The DSv4 PyTorch reference backend could not be imported.")
 
 
-# Operations actually consumed by the current model. Optional CUDA subkernels
-# (notably CuTe CP layout) are checked per operation and fall back to PyTorch.
+# Operations actually consumed by the current model. CP operations use the
+# core PyTorch oracle or an accelerator under ``cp.backends``; fused DSA
+# operations resolve through the top-level backend tree.
 _OP_BACKENDS = {
     "build_attention_indices": ("cuda", "triton", "torch"),
     "build_flat_topk_idxs": ("cuda", "triton", "torch"),
@@ -193,7 +207,7 @@ def _backend_supports_operation(operation: str, backend: str) -> bool:
         return False
     if backend != "torch" and not _backend_available(backend):
         return False
-    module = _import(_BACKEND_MODULES[backend])
+    module = _import(_operation_module_name(operation, backend))
     backend_supports = getattr(module, "supports", None)
     return backend_supports(operation) if backend_supports is not None else True
 
@@ -205,8 +219,14 @@ def _torch_fused_indexer_unavailable(*args, **kwargs):
     )
 
 
+def _operation_module_name(operation: str, backend: str) -> str:
+    """Return the implementation module for one operation/backend pair."""
+    modules = _CP_BACKEND_MODULES if operation in _CP_OPERATIONS else _BACKEND_MODULES
+    return modules[backend]
+
+
 def _op_callable(operation: str, backend: str):
-    module = _import(_BACKEND_MODULES[backend])
+    module = _import(_operation_module_name(operation, backend))
     if backend == "torch" and operation == "fused_indexer_sparse_attn":
         return _torch_fused_indexer_unavailable
     try:

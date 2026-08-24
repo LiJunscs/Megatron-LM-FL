@@ -35,8 +35,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout as csa_utils,
     cp_utils,
-    utils as csa_utils,
 )
 from megatron.plugin import dsa_kernel as dsa_backend
 #### FlagScale Add ####
@@ -51,7 +51,7 @@ from megatron.core.utils import (
 # ---------------------------------------------------------------------------
 # Backend dispatch: SM90 (Triton) vs SM100+ (FlashMLA + cuDNN)
 #
-# Each kernel file exposes the same high-level API so the dispatch here is
+# Each backend exposes the same high-level API so the dispatch here is
 # a simple import switch — no adapters or wrappers needed.
 # ---------------------------------------------------------------------------
 
@@ -823,7 +823,6 @@ class CompressedSparseAttention(MegatronModule):
         )
         return sharded_state_dict
     ##### FlagScale End #####
-
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------

@@ -3,7 +3,7 @@
 """Triton CP-layout kernels for the DSv4 THD context-parallel path (Stage 4 / M3).
 
 These are the operators that upstream implements with CuTeDSL
-(``csa_utils/cp_layout_kernels.py``): fixed-capacity compressor-input
+(``csa_utils`` and the CP kernel contract): fixed-capacity compressor-input
 compaction (forward + backward scatter) and final attention-index lowering.
 
 Design (plan §2.1)
@@ -11,7 +11,7 @@ Design (plan §2.1)
 The *semantic* logical-to-physical mappings --- which compact row copies which
 hidden row, which sequence a query row belongs to, window/compressed-id
 lowering rules --- are defined in the PyTorch/metadata layer (the portable
-reference in ``csa_utils/utils.py``) and are therefore host-side and CPU
+reference in ``csa_utils/cp_layout.py``) and are therefore host-side and CPU
 testable.  Triton executes the frozen local compute only: the masked
 column-wise data movement for compaction and the affine per-column index
 lowering for attention indices.  This is how the plan keeps "Triton as a
@@ -25,8 +25,8 @@ backward transparently falls back to the accumulating PyTorch
 ``index_add`` reference so gradient accumulation stays correct.
 
 Triton is optional and lazily imported: without ``triton`` (or on a non-GPU
-box) every entry point falls back to the pure-PyTorch reference in
-``pytorch_dsa_kernels``.  Public import of this module never requires Triton.
+box) every entry point falls back directly to the core PyTorch reference in
+``csa_utils.cp_layout``. Public import of this module never requires Triton.
 """
 
 import math
@@ -35,9 +35,8 @@ from typing import Optional, Tuple
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    utils as dsa_utils,
+    cp_layout as dsa_layout,
 )
-from ..pytorch import kernels as pytorch_dsa_kernels
 
 try:
     import triton
@@ -357,7 +356,7 @@ def _launch_compaction_bwd(
 class _TritonCompressorInputCompact(torch.autograd.Function):
     """Autograd compaction backed by the Triton forward/backward kernels.
 
-    Tensor contract matches ``cp_layout_kernels.CompressorInputCompact`` and the
+    Tensor contract matches ``cp_kernel.CompressorInputCompact`` and the
     pure-PyTorch ``CompressorInputCompact`` reference: forward returns
     ``(hidden_compact, comp_ids)`` and backward scatters compact gradients back
     to local and boundary hidden rows (accumulating when the source mapping is
@@ -389,10 +388,10 @@ class _TritonCompressorInputCompact(torch.autograd.Function):
         )
         ctx.save_for_backward(cu_seqlens)
 
-        src_global, comp_ids, valid = dsa_utils._compact_row_to_source(
+        src_global, comp_ids, valid = dsa_layout._compact_row_to_source(
             cu_seqlens, global_start, l_local, ratio, d_comp, c_cap
         )
-        flat = dsa_utils._flat_source_index(src_global, valid, global_start, d_window)
+        flat = dsa_layout._flat_source_index(src_global, valid, global_start, d_window)
 
         hidden_flat = hidden_local.reshape(l_local, W)
         boundary_flat = boundary_hidden.reshape(d_window, W)
@@ -417,7 +416,7 @@ class _TritonCompressorInputCompact(torch.autograd.Function):
         total_rows = l_local + d_window
         range_start = int(global_start)
 
-        src_global, _, valid = dsa_utils._compact_row_to_source(
+        src_global, _, valid = dsa_layout._compact_row_to_source(
             cu_seqlens, global_start, l_local, ratio, d_comp, compact_len // ratio
         )
         compact_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1).to(dtype=torch.int64)
@@ -476,11 +475,11 @@ def compress_compressor_input(
     """Compress local+boundary hidden rows into fixed-capacity compressor input.
 
     Uses the Triton compaction kernels when available; otherwise falls back to
-    the pure-PyTorch reference (``pytorch_dsa_kernels``), which is the portable
+    the core PyTorch reference (``csa_utils.cp_layout``), which is the portable
     correctness truth.
     """
     if not _TRITON_AVAILABLE:
-        return pytorch_dsa_kernels.compress_compressor_input(
+        return dsa_layout.compact_compressor_input(
             hidden_local,
             boundary_hidden,
             cu_seqlens,
@@ -560,14 +559,13 @@ def build_attention_indices(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Lower logical CP indices into physical attention indices (Triton).
 
-    Same contract as ``pytorch_dsa_kernels.build_attention_indices``
-    (``csa_utils.utils.build_attention_indices``) and the CuTeDSL kernel: three
-    modes (0 selected top-k, 1 all visible compressed rows, 2 indexer loss),
+    Same contract as ``csa_utils.cp_layout.build_attention_indices`` and the
+    CuTeDSL kernel: three modes (0 selected top-k, 1 all visible compressed rows, 2 indexer loss),
     physical space ``cat((boundary, local, compressed_rank_major))``.  Falls
     back to the PyTorch reference when Triton is unavailable.
     """
     if not _TRITON_AVAILABLE:
-        return pytorch_dsa_kernels.build_attention_indices(
+        return dsa_layout.build_attention_indices(
             cu_seqlens,
             global_start,
             l_local,

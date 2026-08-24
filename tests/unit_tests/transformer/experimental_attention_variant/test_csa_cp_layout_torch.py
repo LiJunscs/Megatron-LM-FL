@@ -3,7 +3,7 @@
 """Unit tests for the pure-PyTorch DSv4 THD-CP layout reference.
 
 These tests exercise the portable correctness reference in
-``csa_utils/utils.py`` (the CP-layout section) and the backend-neutral
+``csa_utils/cp_layout.py`` and the backend-neutral
 dispatchers in ``csa_utils/cp_utils.py``. They run on CPU (no
 CuTe/FlashMLA/cuDNN needed), which is exactly the cross-platform contract M1
 establishes.
@@ -19,7 +19,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     _apply_rope,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils import utils as csa_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout as csa_utils,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.plugin.platform import get_platform
 
