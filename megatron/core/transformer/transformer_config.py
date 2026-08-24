@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass, field
 from functools import wraps
@@ -370,6 +371,7 @@ class TransformerConfig(ModelParallelConfig):
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks."""
 
+
     ####################
     # DSA
     ####################
@@ -424,11 +426,14 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_dsa_kernel_fusion: bool = False
     ##### FlagScale Begin #####
-    """If True, use fused DSA sparse-attention kernels. On SM100+ (Blackwell), uses FlashMLA
-    forward + cuDNN DSA backward (requires ``flash_mla`` and ``nvidia-cudnn-frontend``).
-    On SM90 (Hopper), uses Triton-based fused kernels (requires ``triton>=3.0``).
-    When False, falls back to unfused PyTorch implementations."""
+    """If True, use fused DSA sparse-attention kernels. ``auto`` selects FlashMLA +
+    cuDNN DSA on SM100+ and Triton on SM90; an explicit Triton request is also
+    supported on SM100+. When False, use the unfused PyTorch implementation."""
     ##### FlagScale End #####
+
+    dsv4_kernel_backend: Optional[Literal["auto", "torch", "triton", "cuda"]] = None
+    """DSv4 fused-kernel backend. ``None`` allows ``DSV4_KERNEL_BACKEND`` to
+    override the default ``auto`` selection; explicit backends fail fast."""
 
     ####################
     # linear attention
@@ -1371,6 +1376,15 @@ class TransformerConfig(ModelParallelConfig):
             if self.cp_partition_mode not in ("zigzag", "contiguous"):
                 raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
+            if self.cp_partition_mode == "contiguous" and (
+                self.context_parallel_size > 1 or self.dynamic_context_parallel
+            ):
+                if self.sequence_packing_scheduler is None:
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism requires THD "
+                        "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
+                    )
+
             if self.context_parallel_size > 1:
                 if (
                     self.experimental_attention_variant == "dsv4_hybrid"
@@ -1396,12 +1410,39 @@ class TransformerConfig(ModelParallelConfig):
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
 
-                if sm[0] >= 10:
+                requested_dsa_backend = self.dsv4_kernel_backend
+                if requested_dsa_backend is None:
+                    requested_dsa_backend = os.environ.get("DSV4_KERNEL_BACKEND", "auto")
+                requested_dsa_backend = str(requested_dsa_backend).lower()
+                if requested_dsa_backend not in {"auto", "torch", "triton", "cuda"}:
+                    raise ValueError(
+                        f"Unsupported dsv4_kernel_backend: {requested_dsa_backend!r}"
+                    )
+                if requested_dsa_backend == "torch":
+                    raise ValueError(
+                        "apply_dsa_kernel_fusion=True cannot use the torch backend because "
+                        "the reference path does not implement fused_indexer_sparse_attn; "
+                        "disable DSA kernel fusion for the PyTorch oracle."
+                    )
+
+                resolved_family = requested_dsa_backend
+                if resolved_family == "auto":
+                    # Dependency and per-operation fallback are owned by the
+                    # dispatcher. Do not reject auto before it can try Triton.
+                    pass
+                elif resolved_family == "cuda":
+                    if sm[0] < 10:
+                        raise ValueError(
+                            "dsv4_kernel_backend='cuda' requires SM100+ for the "
+                            "FlashMLA + cuDNN DSA backend."
+                        )
                     # SM100+ (Blackwell): require FlashMLA + cuDNN DSA
+                    ##### FlagScale Add #####
                     assert self.tensor_model_parallel_size == 1, (
                         "DSv4 Hybrid TP indexer-target reduction is currently supported "
-                        "only by the SM90 Triton backend"
-                    )  ##### FlagScale Add #####
+                        "only by the Triton backend"
+                    )
+                    ##### FlagScale End #####
                     _flash_mla_available = True
                     try:
                         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
@@ -1431,12 +1472,12 @@ class TransformerConfig(ModelParallelConfig):
                             f"PyTorch fallback."
                         )
                 else:
-                    # SM90 (Hopper): require Triton-based fused kernels
+                    # Triton is supported on SM90+ and may be requested on SM100+.
                     try:
                         import triton  # noqa: F401
                     except ImportError as e:
                         raise ImportError(
-                            "apply_dsa_kernel_fusion on SM90 requires Triton for the "
+                            "The requested DSv4 Triton backend requires Triton for the "
                             "fused sparse-attention kernels. Install triton>=3.0 or "
                             "pass --no-dsa-kernel-fusion to use the unfused PyTorch fallback."
                         ) from e

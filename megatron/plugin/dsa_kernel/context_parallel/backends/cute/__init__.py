@@ -23,8 +23,14 @@ def compact_compressor_input(
     )
 
 
-def supports(operation: str) -> bool:
+def supports(
+    operation: str, *, device=None, dtype=None, layout=None, features=None
+) -> bool:
     """Return whether the optional CuTe DSL runtime is available."""
+    if device is not None and not str(device).startswith("cuda"):
+        return False
+    if layout is not None and str(layout).lower() not in {"sbhd", "thd"}:
+        return False
     return (
         operation in {"build_attention_indices", "compact_compressor_input"}
         and _CUTE_AVAILABLE

@@ -55,23 +55,14 @@ from megatron.core.utils import (
 # a simple import switch — no adapters or wrappers needed.
 # ---------------------------------------------------------------------------
 
-_dsa_sparse_attn = None
-_fused_indexer_sparse_attn = None
-_indexer_topk = None
-_build_flat_topk_idxs_fn = None
-
-
 def _ensure_dsa_kernels(config=None):
-    """Lazily resolve optional fused operators through the backend registry."""
-    global _dsa_sparse_attn, _fused_indexer_sparse_attn, _indexer_topk, _build_flat_topk_idxs_fn
-    if _dsa_sparse_attn is not None:
-        return
-    _dsa_sparse_attn = dsa_backend.resolve("indexer_sparse_attn", config=config)
-    _fused_indexer_sparse_attn = dsa_backend.resolve(
-        "fused_indexer_sparse_attn", config=config
+    """Resolve fused operators for one CSA instance and backend request."""
+    return (
+        dsa_backend.resolve("indexer_sparse_attn", config=config),
+        dsa_backend.resolve("fused_indexer_sparse_attn", config=config),
+        dsa_backend.resolve("indexer_topk", config=config),
+        dsa_backend.resolve("build_flat_topk_idxs", config=config),
     )
-    _indexer_topk = dsa_backend.resolve("indexer_topk", config=config)
-    _build_flat_topk_idxs_fn = dsa_backend.resolve("build_flat_topk_idxs", config=config)
 ##### FlagScale End #####
 
 # ---------------------------------------------------------------------------
@@ -765,7 +756,12 @@ class CompressedSparseAttention(MegatronModule):
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         ##### FlagScale Begin #####
         if self.apply_dsa_kernel_fusion:
-            _ensure_dsa_kernels(config)
+            (
+                self._dsa_sparse_attn,
+                self._fused_indexer_sparse_attn,
+                self._indexer_topk,
+                self._build_flat_topk_idxs_fn,
+            ) = _ensure_dsa_kernels(config)
         ##### FlagScale End #####
 
         # Learnable attention sink per head (TP-sharded along head dim)  ##### FlagScale Add #####
@@ -964,17 +960,17 @@ class CompressedSparseAttention(MegatronModule):
             compress_topk_idxs = get_compress_topk_idxs(
                 self.compress_ratio, b, sq, offset, query.device
             )
-            flat_idxs, _ = _build_flat_topk_idxs_fn(                ##### FlagScale Begin #####
+            flat_idxs, _ = self._build_flat_topk_idxs_fn(           ##### FlagScale Begin #####
                 window_idxs, compress_topk_idxs, batch_size=b, seqlen_kv=kv_full.shape[0]
             )
         else:
-            flat_idxs, _ = _build_flat_topk_idxs_fn(                ##### FlagScale Begin #####
+            flat_idxs, _ = self._build_flat_topk_idxs_fn(           ##### FlagScale Begin #####
                 window_idxs, batch_size=b, seqlen_kv=kv_full.shape[0]
             )
         nvtx_range_pop("compressed_indices")
 
         nvtx_range_push("sparse_attn_kernel")
-        output = _dsa_sparse_attn(                                  ##### FlagScale Begin #####
+        output = self._dsa_sparse_attn(                             ##### FlagScale Begin #####
             query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -1000,7 +996,7 @@ class CompressedSparseAttention(MegatronModule):
         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
             x_det, qr_det, packed_seq_params
         )
-        topk_indices_cmp, _ = _indexer_topk(        ##### FlagScale Begin #####
+        topk_indices_cmp, _ = self._indexer_topk(   ##### FlagScale Begin #####
             q_indexer,
             k_indexer,
             weights_indexer,
@@ -1009,13 +1005,13 @@ class CompressedSparseAttention(MegatronModule):
             indexer_softmax_scale=self.indexer.softmax_scale,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
-        flat_idxs, flat_tlen = _build_flat_topk_idxs_fn(            ##### FlagScale Begin #####
+        flat_idxs, flat_tlen = self._build_flat_topk_idxs_fn(       ##### FlagScale Begin #####
             window_idxs, compress_topk_idxs, batch_size=b, seqlen_kv=kv_full.shape[0], compact=True
         )
         nvtx_range_pop("compressed_indices")
 
         nvtx_range_push("sparse_attn_kernel")
-        output = _dsa_sparse_attn(          ##### FlagScale Begin #####
+        output = self._dsa_sparse_attn(     ##### FlagScale Begin #####
             query,
             kv_full,
             self.attn_sink.float(),
@@ -1052,7 +1048,7 @@ class CompressedSparseAttention(MegatronModule):
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
 
         nvtx_range_push("sparse_attn_kernel")
-        output, indexer_loss = _fused_indexer_sparse_attn(          ##### FlagScale Begin #####
+        output, indexer_loss = self._fused_indexer_sparse_attn(     ##### FlagScale Begin #####
             query,
             kv_full,
             self.attn_sink.float(),

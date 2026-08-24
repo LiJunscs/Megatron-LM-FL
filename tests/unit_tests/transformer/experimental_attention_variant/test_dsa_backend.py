@@ -12,9 +12,10 @@ import torch
 
 from megatron.plugin import dsa_kernel as dsa_backend
 
+
 @pytest.fixture(autouse=True)
 def reset_backend_cache():
-    """Reset the one-time backend resolution cache before each test."""
+    """Reset dispatcher diagnostics before each test."""
     dsa_backend._resolved_backend = None
     dsa_backend._fallback_warned = set()
     yield
@@ -87,8 +88,9 @@ class TestBackendResolution:
 class TestSupportAndResolve:
     def test_supports_known_ops_on_torch(self, monkeypatch):
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "torch")
-        for op in dsa_backend._OP_BACKENDS:
+        for op in dsa_backend._OP_BACKENDS.keys() - {"fused_indexer_sparse_attn"}:
             assert dsa_backend.supports(op) is True
+        assert dsa_backend.supports("fused_indexer_sparse_attn") is False
 
     def test_supports_unknown_op(self, monkeypatch):
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "torch")
@@ -123,28 +125,22 @@ class TestSupportAndResolve:
         # The PyTorch reference exposes the fused indexer as separate ops
         # (Stage 6); a single callable must not silently mis-dispatch.
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "torch")
-        fn = dsa_backend.resolve("fused_indexer_sparse_attn")
         with pytest.raises(dsa_backend.DSAv4BackendError):
-            fn()
+            dsa_backend.resolve("fused_indexer_sparse_attn")
 
     @pytest.mark.parametrize(
-        ("operation", "torch_attr"),
-        (
-            ("compact_compressor_input", "compact_compressor_input"),
-            ("build_attention_indices", "build_attention_indices"),
-        ),
+        "operation", ("compact_compressor_input", "build_attention_indices")
     )
-    def test_cuda_cp_layout_falls_back_without_cute(self, monkeypatch, operation, torch_attr):
-        """An installed CUDA backend may still lack its optional CuTe DSL."""
+    def test_explicit_cuda_cp_layout_fails_without_cute(self, monkeypatch, operation):
+        """Explicit backend selection must not hide a missing CuTe operation."""
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
-        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-            cp_layout as pyt_cp_backend,
+        from megatron.plugin.dsa_kernel.context_parallel.backends import (
+            cute as cuda_cp_backend,
         )
-
-        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: False)
-        assert dsa_backend.resolve(operation) is getattr(pyt_cp_backend, torch_attr)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op, **kwargs: False)
+        with pytest.raises(dsa_backend.DSAv4BackendError):
+            dsa_backend.resolve(operation)
 
     @pytest.mark.parametrize(
         "operation", ("compact_compressor_input", "build_attention_indices")
@@ -152,22 +148,60 @@ class TestSupportAndResolve:
     def test_cuda_cp_layout_resolves_to_restored_cute(self, monkeypatch, operation):
         monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
+        from megatron.plugin.dsa_kernel.context_parallel.backends import (
+            cute as cuda_cp_backend,
+        )
 
-        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: True)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op, **kwargs: True)
         assert dsa_backend.resolve(operation) is getattr(cuda_cp_backend, operation)
 
     def test_cuda_cp_layout_prefers_triton_before_torch(self, monkeypatch):
-        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "auto")
+        monkeypatch.setattr(dsa_backend, "_device_preference", lambda: "cuda")
         monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
         monkeypatch.setattr(dsa_backend, "_triton_backend_available", lambda: True)
-        from megatron.plugin.dsa_kernel.context_parallel.backends import cute as cuda_cp_backend
-        from megatron.plugin.dsa_kernel.context_parallel.backends import triton as triton_cp_backend
+        from megatron.plugin.dsa_kernel.context_parallel.backends import (
+            cute as cuda_cp_backend,
+            triton as triton_cp_backend,
+        )
 
-        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op: False)
+        monkeypatch.setattr(cuda_cp_backend, "supports", lambda op, **kwargs: False)
         assert dsa_backend.resolve("build_attention_indices") is (
             triton_cp_backend.build_attention_indices
         )
+
+    def test_backend_resolution_is_not_process_wide_cached(self, monkeypatch):
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "torch")
+        assert dsa_backend.available_backend() == "torch"
+
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "auto")
+        monkeypatch.setattr(dsa_backend, "_device_preference", lambda: "triton")
+        monkeypatch.setattr(dsa_backend, "_triton_backend_available", lambda: True)
+        assert dsa_backend.available_backend() == "triton"
+
+    def test_auto_sm100_tp_prefers_triton(self, monkeypatch):
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "auto")
+        monkeypatch.setattr(dsa_backend, "_device_preference", lambda: "cuda")
+        monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
+        monkeypatch.setattr(dsa_backend, "_triton_backend_available", lambda: True)
+        config = type("Config", (), {"tensor_model_parallel_size": 2})()
+        assert dsa_backend.available_backend(config) == "triton"
+
+    def test_auto_sm100_tp_never_falls_back_to_cuda(self, monkeypatch):
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "auto")
+        monkeypatch.setattr(dsa_backend, "_device_preference", lambda: "cuda")
+        monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
+        monkeypatch.setattr(dsa_backend, "_triton_backend_available", lambda: False)
+        monkeypatch.setattr(dsa_backend, "_torch_backend_available", lambda: True)
+        config = type("Config", (), {"tensor_model_parallel_size": 2})()
+        assert dsa_backend.available_backend(config) == "torch"
+
+    def test_explicit_cuda_rejects_tensor_parallel_config(self, monkeypatch):
+        monkeypatch.setenv("DSV4_KERNEL_BACKEND", "cuda")
+        monkeypatch.setattr(dsa_backend, "_cuda_backend_available", lambda: True)
+        config = type("Config", (), {"tensor_model_parallel_size": 2})()
+        with pytest.raises(dsa_backend.DSAv4BackendError):
+            dsa_backend.available_backend(config)
 
 
 class TestBackendDelegationIntegration:

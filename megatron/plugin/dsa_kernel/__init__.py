@@ -2,10 +2,10 @@
 """Unified backend selection for DSv4 sparse-attention kernels.
 
 Optional dependencies are isolated below ``backends/`` for fused DSA and
-``cp/backends/`` for context-parallel operations. They are imported only after
-this module has probed their runtime requirements. Model code imports this
-package instead of importing Triton, CuTe DSL, cuDNN Frontend, or FlashMLA
-directly.
+``context_parallel/backends/`` for context-parallel operations. They are
+imported only after this module has probed their runtime requirements. Model
+code imports this package instead of importing Triton, CuTe DSL, cuDNN
+Frontend, or FlashMLA directly.
 """
 
 import importlib
@@ -71,6 +71,10 @@ def _triton_backend_available() -> bool:
     if not _has_accelerator() or not _has_module("triton"):
         return False
     try:
+        import torch
+
+        if torch.cuda.get_device_capability()[0] < 9:
+            return False
         _import(_BACKEND_MODULES["triton"])
         return True
     except Exception:
@@ -86,6 +90,10 @@ def _cuda_backend_available() -> bool:
     ):
         return False
     try:
+        import torch
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            return False
         cudnn = _import("cudnn")
         if not hasattr(cudnn, "DSA"):
             return False
@@ -98,6 +106,15 @@ def _cuda_backend_available() -> bool:
 def _backend_available(backend: str) -> bool:
     """Run the current probe, keeping probes replaceable in tests."""
     return globals()[f"_{backend}_backend_available"]()
+
+
+def _backend_allowed_for_config(backend: str, config: Optional[object]) -> bool:
+    """Apply model-level restrictions that dependency probes cannot express."""
+    return not (
+        backend == "cuda"
+        and config is not None
+        and getattr(config, "tensor_model_parallel_size", 1) > 1
+    )
 
 
 def _device_preference() -> Optional[str]:
@@ -130,18 +147,24 @@ def requested_backend(config: Optional[object] = None) -> str:
     return value
 
 
+# Kept as last-resolution diagnostics for compatibility with existing tests.
+# It is deliberately not used as a cache: one process may construct models
+# with different backend requests or switch CUDA devices for parity testing.
 _resolved_backend: Optional[str] = None
 _fallback_warned: set = set()
 
 
 def available_backend(config: Optional[object] = None) -> str:
-    """Resolve one process-wide backend, with PyTorch as the final fallback."""
+    """Resolve the backend for the current request and active device."""
     global _resolved_backend
-    if _resolved_backend is not None:
-        return _resolved_backend
 
     requested = requested_backend(config)
     if requested != "auto":
+        if not _backend_allowed_for_config(requested, config):
+            raise DSAv4BackendError(
+                f"Requested dsv4_kernel_backend={requested!r} is incompatible "
+                "with tensor_model_parallel_size > 1."
+            )
         if not _backend_available(requested):
             raise DSAv4BackendError(
                 f"Requested dsv4_kernel_backend={requested!r}, but its dependencies "
@@ -151,6 +174,15 @@ def available_backend(config: Optional[object] = None) -> str:
         return requested
 
     preferred = _device_preference()
+    if (
+        preferred == "cuda"
+        and config is not None
+        and getattr(config, "tensor_model_parallel_size", 1) > 1
+    ):
+        # The FlashMLA + cuDNN aggregate does not yet own the TP reduction
+        # contract. Auto may choose Triton; an explicit CUDA request is
+        # rejected by TransformerConfig validation.
+        preferred = "triton"
     if preferred is None:
         if _backend_available("torch"):
             _resolved_backend = "torch"
@@ -165,6 +197,8 @@ def available_backend(config: Optional[object] = None) -> str:
         if backend != preferred
     ]
     for backend in order:
+        if not _backend_allowed_for_config(backend, config):
+            continue
         if _backend_available(backend):
             _resolved_backend = backend
             logger.info("DSv4 kernel backend auto-resolved to %r.", backend)
@@ -198,18 +232,45 @@ def supports(
     if operation not in _OP_BACKENDS:
         return False
     active = available_backend(config)
-    return _backend_supports_operation(operation, active)
+    return _backend_supports_operation(
+        operation,
+        active,
+        device=device,
+        dtype=dtype,
+        layout=layout,
+        features=features,
+    )
 
 
-def _backend_supports_operation(operation: str, backend: str) -> bool:
-    """Probe one operation without changing the process-wide backend choice."""
+def _backend_supports_operation(
+    operation: str,
+    backend: str,
+    *,
+    device: Optional[str] = None,
+    dtype: Optional[str] = None,
+    layout: Optional[str] = None,
+    features: Optional[set] = None,
+) -> bool:
+    """Probe one operation and its requested capability dimensions."""
     if backend not in _OP_BACKENDS[operation]:
+        return False
+    if backend == "torch" and operation == "fused_indexer_sparse_attn":
         return False
     if backend != "torch" and not _backend_available(backend):
         return False
     module = _import(_operation_module_name(operation, backend))
+    if not hasattr(module, operation):
+        return False
     backend_supports = getattr(module, "supports", None)
-    return backend_supports(operation) if backend_supports is not None else True
+    if backend_supports is None:
+        return True
+    return backend_supports(
+        operation,
+        device=device,
+        dtype=dtype,
+        layout=layout,
+        features=features,
+    )
 
 
 def _torch_fused_indexer_unavailable(*args, **kwargs):
@@ -238,15 +299,27 @@ def _op_callable(operation: str, backend: str):
 
 
 def resolve(operation: str, config: Optional[object] = None):
-    """Resolve one operation and fall back to its PyTorch reference."""
+    """Resolve one operation; only ``auto`` may fall back across backends."""
     if operation not in _OP_BACKENDS:
         raise DSAv4BackendError(f"Unknown DSv4 backend operation {operation!r}.")
 
+    requested = requested_backend(config)
     active = available_backend(config)
+    if requested != "auto":
+        if not _backend_supports_operation(operation, active):
+            raise DSAv4BackendError(
+                f"Explicitly requested backend {active!r} does not support "
+                f"DSv4 operation {operation!r}; explicit backend selection does not fallback."
+            )
+        logger.info("DSv4 operation %r resolved to explicit backend %r.", operation, active)
+        return _op_callable(operation, active)
+
     candidates = (active,) + tuple(
         backend for backend in _OP_BACKENDS[operation] if backend != active
     )
     for backend in candidates:
+        if not _backend_allowed_for_config(backend, config):
+            continue
         if not _backend_supports_operation(operation, backend):
             continue
         if backend != active:
@@ -259,6 +332,7 @@ def resolve(operation: str, config: Optional[object] = None):
                     active,
                     backend,
                 )
+        logger.info("DSv4 operation %r resolved to backend %r.", operation, backend)
         return _op_callable(operation, backend)
 
     raise DSAv4BackendError(

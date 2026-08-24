@@ -1,21 +1,13 @@
-"""Triton backend exports and its dependency boundary."""
+"""Triton backend for non-CP fused DSA operations."""
 
 import importlib.util
 
-from .cp_layout import build_attention_indices, compress_compressor_input
+__all__ = []
 
-compact_compressor_input = compress_compressor_input
-
-__all__ = [
-    "build_attention_indices",
-    "compact_compressor_input",
-]
-
-# Keep the CP-layout reference importable on CPU-only installations.  The
-# unified registry imports this backend for fused operations only after this
-# dependency probe succeeds.
+# Keep the package importable on CPU-only installations. The unified registry
+# imports fused operations only after this dependency probe succeeds.
 if importlib.util.find_spec("triton") is not None:
-    from .kernels import (
+    from .fused_ops import (
         build_flat_topk_idxs,
         dsa_sparse_attn_sbhd,
         fused_indexer_sparse_attn,
@@ -29,3 +21,20 @@ if importlib.util.find_spec("triton") is not None:
         "indexer_sparse_attn",
         "indexer_topk",
     ]
+
+
+def supports(
+    operation: str, *, device=None, dtype=None, layout=None, features=None
+) -> bool:
+    """Report exported Triton operations and their current layout boundary."""
+    if device is not None and not str(device).startswith("cuda"):
+        return False
+    if layout is not None and str(layout).lower() != "sbhd":
+        return False
+    if dtype is not None and operation != "build_flat_topk_idxs":
+        if str(dtype).lower() not in {"bf16", "bfloat16", "torch.bfloat16"}:
+            return False
+    return operation in __all__
+
+
+__all__.append("supports")
