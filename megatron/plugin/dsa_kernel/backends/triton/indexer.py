@@ -29,7 +29,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
-from megatron.plugin.dsa_kernel.triton_dsa_utils import (
+from .utils import (
     compute_ratio_causal_mask,
     topk_with_causal_mask,
 )
@@ -581,6 +581,7 @@ def dense_indexer_backward(
     )
 
 
+##### FlagScale Add #####
 # ---------------------------------------------------------------------------
 # Decomposed sparse indexer helpers (for TP overlap)
 # ---------------------------------------------------------------------------
@@ -768,6 +769,7 @@ def sparse_indexer_kl_and_backward(
     )
 
 
+##### FlagScale End #####
 # ---------------------------------------------------------------------------
 # Fused sparse indexer loss + backward (P0 optimization)
 # ---------------------------------------------------------------------------
@@ -916,7 +918,7 @@ def fused_dense_indexer_loss_and_backward(
     ratio: int = 1,
     calculate_per_token_loss: bool = False,
     idx_nh: int = 1,
-    tp_group=None,
+    tp_group=None,  ##### FlagScale Add #####
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """One-pass fused dense: indexer score + attn score + KL loss + backward.
 
@@ -924,10 +926,12 @@ def fused_dense_indexer_loss_and_backward(
     ``_kl_loss_from_dense_scores`` + ``dense_indexer_backward`` into a single
     tiled pass over Q blocks.
 
+    ##### FlagScale Add #####
     When ``tp_group`` is provided with size > 1, each query block's attention
     head-sum target is synchronously all-reduced before normalization. This
     preserves the original bounded-memory behavior; overlap is sparse-only.
 
+    ##### FlagScale End #####
     Args:
         q_idx_bshd: ``(B, S_q, H_q, D_idx)`` bf16 — indexer queries.
         k_idx_bsd: ``(B, S_k, D_idx)`` bf16 — indexer keys (compressed range).
@@ -942,7 +946,7 @@ def fused_dense_indexer_loss_and_backward(
         ratio: compression ratio for causal mask.
         calculate_per_token_loss: if True, use sum instead of mean.
         idx_nh: number of indexer heads.
-        tp_group: TP process group for target all-reduce. None means TP=1.
+        tp_group: TP process group for target all-reduce. None means TP=1.  ##### FlagScale Add #####
 
     Returns:
         (indexer_loss, grad_q_indexer, grad_k_indexer, grad_weights)
@@ -963,12 +967,14 @@ def fused_dense_indexer_loss_and_backward(
     # Row validity from topk_indices
     row_valid = (topk_indices_cmp >= 0).any(dim=-1)  # (B, S_q)
 
+    ##### FlagScale Add #####
     # Determine TP size
     _tp_size = tp_group.size() if tp_group is not None and hasattr(tp_group, 'size') else 1
     _need_tp_reduce = _tp_size > 1
 
     # Keep the dense path memory-bounded. Each Q block is reduced synchronously;
     # sparse loss is the only path that enables communication overlap for now.
+    ##### FlagScale End #####
     grad_q = torch.empty(B, S_q, H_q, D_idx, dtype=torch.float32, device=q_idx_bshd.device)
     grad_k = torch.zeros(B, S_k, D_idx, dtype=torch.float32, device=k_idx_bsd.device)
     grad_w = torch.empty(B, S_q, H_q, dtype=torch.float32, device=w_bsh.device)
@@ -995,8 +1001,9 @@ def fused_dense_indexer_loss_and_backward(
         index_lse = torch.logsumexp(combined, dim=-1)  # (B, block)
         index_score = combined  # keep for KL
 
-        # --- Attention scores (teacher target) ---
+        # --- Attention scores (teacher target) ---  ##### FlagScale Add #####
         attn_per_head = torch.einsum("bqhd,bkd->bqhk", q_attn_block, k_attn) * softmax_scale
+        ##### FlagScale Add #####
         attn_per_head = attn_per_head.masked_fill(
             ~mask_block.unsqueeze(0).unsqueeze(2), float("-inf")
         )
@@ -1005,13 +1012,16 @@ def fused_dense_indexer_loss_and_backward(
             ~mask_block.unsqueeze(0).unsqueeze(2), 0.0
         )
         attn_score = attn_probs.sum(dim=2).contiguous()
+        ##### FlagScale End #####
         attn_score = attn_score.masked_fill(~mask_block.unsqueeze(0), 0.0)
+        ##### FlagScale Add #####
         if _need_tp_reduce:
             torch.distributed.all_reduce(
                 attn_score,
                 op=torch.distributed.ReduceOp.SUM,
                 group=tp_group,
             )
+        ##### FlagScale End #####
         attn_l1norm = attn_score.sum(dim=-1)  # (B, block)
 
         # --- KL loss for this block ---

@@ -14,7 +14,7 @@ Training requirements (always satisfied):
   - H >= 16, H % 16 == 0, D % 16 == 0, d_v % 16 == 0
 
 Non-HP fallback (forward/backward) uses PyTorch BMM in
-``megatron.plugin.dsa_kernel.legacy.pytorch_sparse_attn``.
+``megatron.plugin.dsa_kernel.backends.pytorch.sparse_attention``.
 """
 
 from __future__ import annotations
@@ -397,7 +397,7 @@ def triton_sparse_attn_fwd(
         RuntimeWarning,
         stacklevel=2,
     )
-    from megatron.plugin.dsa_kernel.legacy.pytorch_sparse_attn import (
+    from ..pytorch.sparse_attention import (
         pytorch_sparse_attn_fwd,
     )
     return pytorch_sparse_attn_fwd(
@@ -430,7 +430,7 @@ def triton_sparse_attn_bwd(
     Returns:
         dict with keys: ``dq``, ``dkv``, ``d_sink``.
     """
-    from megatron.plugin.dsa_kernel.legacy.pytorch_sparse_attn import (
+    from ..pytorch.sparse_attention import (
         pytorch_sparse_attn_bwd,
     )
     dq, dkv, d_sink = pytorch_sparse_attn_bwd(
@@ -443,7 +443,7 @@ def triton_sparse_attn_bwd(
 # Fused backward utilities (Triton epilogue kernels for bf16 BMM path)
 # ---------------------------------------------------------------------------
 
-from megatron.plugin.dsa_kernel.triton_sparse_attn_bwd import (
+from .sparse_attention_backward import (
     fused_mask_scatter_add,
     fused_exp_mask,
     fused_dq,
