@@ -2,7 +2,7 @@
 
 import copy
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Optional, Tuple, Union
 
 import torch
@@ -10,10 +10,12 @@ import torch.nn as nn
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.plugin.platform import get_platform
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 #### FlagScale Add ####
-from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region, gather_from_sequence_parallel_region
 from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
@@ -32,6 +34,11 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    utils as csa_utils,
+)
+from megatron.plugin import dsa_kernel as dsa_backend
 #### FlagScale Add ####
 from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
@@ -54,41 +61,17 @@ _indexer_topk = None
 _build_flat_topk_idxs_fn = None
 
 
-def _ensure_dsa_kernels():
-    """Lazily resolve the correct kernel backend based on GPU SM version.
-
-    SM90 (Hopper): Triton-based kernels from megatron.plugin.dsa_kernel.
-    SM100+ (Blackwell): FlashMLA + cuDNN kernels from dsa_kernels.py.
-    """
+def _ensure_dsa_kernels(config=None):
+    """Lazily resolve optional fused operators through the backend registry."""
     global _dsa_sparse_attn, _fused_indexer_sparse_attn, _indexer_topk, _build_flat_topk_idxs_fn
     if _dsa_sparse_attn is not None:
         return
-
-    sm = torch.cuda.get_device_capability()
-    if sm[0] >= 10:
-        # SM100+: use the cuDNN/FlashMLA implementations.
-        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-            build_flat_topk_idxs,
-            dsa_sparse_attn,
-            fused_indexer_sparse_attn,
-            indexer_topk,
-        )
-        _dsa_sparse_attn = dsa_sparse_attn
-        _fused_indexer_sparse_attn = fused_indexer_sparse_attn
-        _indexer_topk = indexer_topk
-        _build_flat_topk_idxs_fn = build_flat_topk_idxs
-    else:
-        # SM90: use the Triton plugin implementations.
-        from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
-            build_flat_topk_idxs as _triton_build_flat_topk_idxs,
-            dsa_sparse_attn_sbhd as _triton_dsa_sparse_attn_sbhd,
-            fused_indexer_sparse_attn as _triton_fused,
-            indexer_topk as _triton_topk,
-        )
-        _dsa_sparse_attn = _triton_dsa_sparse_attn_sbhd
-        _fused_indexer_sparse_attn = _triton_fused
-        _indexer_topk = _triton_topk
-        _build_flat_topk_idxs_fn = _triton_build_flat_topk_idxs
+    _dsa_sparse_attn = dsa_backend.resolve("indexer_sparse_attn", config=config)
+    _fused_indexer_sparse_attn = dsa_backend.resolve(
+        "fused_indexer_sparse_attn", config=config
+    )
+    _indexer_topk = dsa_backend.resolve("indexer_topk", config=config)
+    _build_flat_topk_idxs_fn = dsa_backend.resolve("build_flat_topk_idxs", config=config)
 ##### FlagScale End #####
 
 # ---------------------------------------------------------------------------
@@ -158,14 +141,17 @@ def _apply_rope(
     rotary_seq_len: int,
     ratio: int = 1,
     cp_group: torch.distributed.ProcessGroup = None,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``qk_pos_emb_head_dim`` dims, leaving the rest unchanged.
 
     Accepts both 3-D ``[seq, batch, head_dim]`` and 4-D ``[seq, batch, heads, head_dim]``
     inputs.  When the input is 3-D a temporary head dimension is inserted for
-    ``apply_rotary_pos_emb`` and removed before returning.
+    ``apply_rotary_pos_emb`` and removed before returning. ``position_ids``
+    are internal CSA layout metadata (for example compressed group positions),
+    not the public attention ``forward(position_ids)`` argument.
     """
-    if ratio == 1:
+    if position_ids is not None or ratio == 1:
         total_seq_len = rotary_seq_len
     else:
         total_seq_len = rotary_seq_len * ratio
@@ -182,7 +168,12 @@ def _apply_rope(
         # rotation as the unfused split-rotate path (DSv4 "pure
         # rotation" contract).
         rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-            total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
+            total_seq_len,
+            dtype=x.dtype,
+            # Explicit positions must index a full table. ``packed_seq=True``
+            # suppresses the RoPE module's legacy zigzag CP sharding.
+            packed_seq=position_ids is not None,
+            mscale=mscale,
         )
         rotary_pos_emb = None
         assert (
@@ -195,16 +186,21 @@ def _apply_rope(
         # returns a single tensor. Unpack either form uniformly; the
         # caller-side ``mscale=1.0`` keeps the yarn concentration factor
         # out of the rotation.
-        result = rotary_pos_emb_module(total_seq_len, packed_seq=False)
+        result = rotary_pos_emb_module(
+            total_seq_len,
+            # Explicit positions are generated from contiguous CSA metadata
+            # and therefore must index the unsharded global RoPE table.
+            packed_seq=position_ids is not None,
+        )
         if isinstance(result, tuple):
             rotary_pos_emb = result[0]
         else:
             rotary_pos_emb = result
-    if rotary_pos_emb is not None and ratio > 1:
+    if position_ids is None and rotary_pos_emb is not None and ratio > 1:
         rotary_pos_emb = rotary_pos_emb[:total_seq_len:ratio][:rotary_seq_len]
-    if rotary_pos_cos is not None and ratio > 1:
+    if position_ids is None and rotary_pos_cos is not None and ratio > 1:
         rotary_pos_cos = rotary_pos_cos[:total_seq_len:ratio][:rotary_seq_len]
-    if rotary_pos_sin is not None and ratio > 1:
+    if position_ids is None and rotary_pos_sin is not None and ratio > 1:
         rotary_pos_sin = rotary_pos_sin[:total_seq_len:ratio][:rotary_seq_len]
 
     squeeze_head = x.dim() == 3
@@ -218,22 +214,33 @@ def _apply_rope(
             nope_dim,
             pos_dim,
             None,
-            cp_group.rank(),
-            cp_group.size(),
+            cp_group.rank() if cp_group is not None else 0,
+            cp_group.size() if cp_group is not None else 1,
             remove_interleaving=True,
+            position_ids=position_ids,
         )
     else:
         x_nope, x_pe = torch.split(x, [nope_dim, pos_dim], dim=-1)
-        x_pe = apply_rotary_pos_emb(
-            x_pe,
-            rotary_pos_emb,
-            config=config,
-            cu_seqlens=None,
-            mscale=mscale,
-            cp_group=cp_group,
-            mla_rotary_interleaved=True,
-            mla_output_remove_interleaving=True,
-        )
+        if position_ids is None:
+            x_pe = apply_rotary_pos_emb(
+                x_pe,
+                rotary_pos_emb,
+                config=config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=cp_group,
+                mla_rotary_interleaved=True,
+                mla_output_remove_interleaving=True,
+            )
+        else:
+            x_pe = _apply_rotary_pos_emb_bshd(
+                x_pe,
+                torch.index_select(rotary_pos_emb, 0, position_ids.long()),
+                rotary_interleaved=config.rotary_interleaved,
+                mscale=mscale,
+                mla_rotary_interleaved=True,
+                mla_output_remove_interleaving=True,
+            )
         out = torch.cat([x_nope, x_pe], dim=-1)
     if squeeze_head:
         out = out.squeeze(-2)
@@ -409,7 +416,10 @@ class Compressor(MegatronModule):
 
         # keep to high precision
         _ape = torch.empty(
-            compress_ratio, proj_out_dim, device=torch.cuda.current_device(), dtype=torch.float32
+            compress_ratio,
+            proj_out_dim,
+            device=get_platform().current_device(),
+            dtype=torch.float32,
         )
         #### FlagScale Add ####
         # ``ape`` is replicated across TP ranks. Initialize it explicitly from
@@ -445,7 +455,12 @@ class Compressor(MegatronModule):
         new_tensor[1:, :ratio] = tensor[:-1, :, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        compressed_group_ids: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
         """Compress hidden states into shorter KV sequence.
 
         Args:
@@ -488,16 +503,39 @@ class Compressor(MegatronModule):
 
         kv = self.norm(kv.to(x.dtype))
 
-        kv = _apply_rope(
-            kv,
-            self.head_dim - self.qk_pos_emb_head_dim,
-            self.qk_pos_emb_head_dim,
-            self.rotary_pos_emb,
-            self.config,
-            n_compressed,
-            ratio=ratio,
-            cp_group=self.pg_collection.cp,
-        )
+        if compressed_group_ids is None:
+            kv = _apply_rope(
+                kv,
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.rotary_pos_emb,
+                self.config,
+                n_compressed,
+                ratio=ratio,
+                cp_group=self.pg_collection.cp,
+            )
+        else:
+            if max_seqlen_q is None:
+                raise ValueError(
+                    "max_seqlen_q is required when compressed_group_ids are provided"
+                )
+            if compressed_group_ids.numel() != n_compressed:
+                raise ValueError(
+                    "compressed_group_ids must contain one entry per compressed row: "
+                    f"got {compressed_group_ids.numel()} ids for {n_compressed} rows"
+                )
+            position_ids = compressed_group_ids.clamp_min(0).long() * ratio
+            kv = _apply_rope(
+                kv,
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.rotary_pos_emb,
+                self.config,
+                int(max_seqlen_q),
+                ratio=ratio,
+                cp_group=self.pg_collection.cp,
+                position_ids=position_ids,
+            )
 
         if self.rotate:
             kv = rotate_activation(kv)
@@ -727,10 +765,10 @@ class CompressedSparseAttention(MegatronModule):
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         ##### FlagScale Begin #####
         if self.apply_dsa_kernel_fusion:
-            _ensure_dsa_kernels()
+            _ensure_dsa_kernels(config)
         ##### FlagScale End #####
 
-        # Learnable attention sink per head (TP-sharded along head dim) ##### FlagScale Add #####
+        # Learnable attention sink per head (TP-sharded along head dim)  ##### FlagScale Add #####
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
         set_tensor_model_parallel_attributes(
             self.attn_sink, is_parallel=True, dim=0, stride=1
@@ -766,6 +804,7 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+
     ##### FlagScale Add #####
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Represent the per-head attention sink as a TP-axis-0 shard."""
@@ -1058,6 +1097,9 @@ class CompressedSparseAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        boundary_hidden: Optional[torch.Tensor] = None,
+        boundary_kv: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -1072,10 +1114,27 @@ class CompressedSparseAttention(MegatronModule):
         Returns:
             output: [sq, b, np * v_head_dim]
         """
+        # Kept for the common attention API; DSv4 CP reconstructs positions
+        # from its contiguous SBHD/THD and compressor metadata.
+        del position_ids
         nvtx_range_push("compressed_sparse_attn")
-        assert (
-            packed_seq_params is None
-        ), "Packed sequence not supported for CompressedSparseAttention"
+        if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
+            if attention_mask is not None or attention_bias is not None:
+                raise RuntimeError(
+                    "DSv4 contiguous CP currently derives causal masking from position metadata "
+                    "and does not support an explicit attention mask or attention bias."
+                )
+            output = self._forward_cp(
+                query,
+                key,
+                x,
+                qr,
+                boundary_hidden,
+                boundary_kv,
+                packed_seq_params,
+            )
+            nvtx_range_pop("compressed_sparse_attn")
+            return  output
 
         sq, b, np, hn = query.size()
         ##### FlagScale Add #####
@@ -1135,3 +1194,334 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_pop("compressed_sparse_attn")
         return output
+
+    def _forward_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        boundary_hidden: Optional[torch.Tensor],
+        boundary_kv: Optional[torch.Tensor],
+        packed_seq_params: PackedSeqParams,
+    ) -> torch.Tensor:
+        """Run contiguous CP for both SBHD and packed THD inputs.
+
+        The training/data entry owns partitioning.  This method assumes rank
+        ``r`` holds the fixed row interval ``[r * local_rows, (r + 1) *
+        local_rows)`` and consumes global packed metadata without performing a
+        zigzag-to-contiguous conversion.
+        """
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if is_thd:
+            if query.dim() == 3:
+                query = query.unsqueeze(1)
+            if query.dim() != 4 or query.shape[1] != 1:
+                raise RuntimeError("DSv4 THD CP expects query in [T,H,D] or [T,1,H,D].")
+            if key.dim() == 2:
+                key = key.unsqueeze(1)
+            if x.dim() == 2:
+                x = x.unsqueeze(1)
+            if qr.dim() == 2:
+                qr = qr.unsqueeze(1)
+        elif query.dim() != 4 or key.dim() not in (3, 4) or x.dim() != 3 or qr.dim() != 3:
+            raise RuntimeError("DSv4 SBHD CP expects query/key/x/qr in SBHD layout.")
+
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
+        l_local, batch_size = query.shape[:2]
+        if key.shape[:2] != (l_local, batch_size):
+            raise RuntimeError("DSv4 SBHD CP currently supports self-attention only.")
+
+        global_seqlen = cp_size * l_local
+        global_start = cp_rank * l_local
+        if is_thd:
+            cu_seqlens = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            if cu_seqlens is None:
+                raise RuntimeError("DSv4 THD CP requires packed Q cu_seqlens metadata.")
+            max_rope_seqlen = packed_seq_params.max_seqlen_q
+            if max_rope_seqlen is None:
+                raise RuntimeError(
+                    "DSv4 THD contiguous CP requires packed_seq_params.max_seqlen_q; "
+                    "the model does not synchronize cu_seqlens back to the host to infer it."
+                )
+        else:
+            cu_seqlens = torch.tensor(
+                [0, global_seqlen], dtype=torch.int32, device=query.device
+            )
+            max_rope_seqlen = global_seqlen
+        local_position_ids = cp_utils.get_cp_position_ids(
+            l_local,
+            global_start,
+            query.device,
+            cu_seqlens_padded=cu_seqlens if is_thd else None,
+        )
+        kv_local = key.squeeze(-2) if key.dim() == 4 else key
+        if boundary_hidden is None or boundary_kv is None:
+            raise RuntimeError(
+                "DSv4 contiguous CP requires boundary_hidden and boundary_kv from the "
+                "contiguous boundary exchange."
+            )
+        boundary_kv = boundary_kv.squeeze(-2) if boundary_kv.dim() == 4 else boundary_kv
+        if boundary_hidden.shape[1] != batch_size or boundary_kv.shape[1] != batch_size:
+            raise RuntimeError("DSv4 CP boundary tensors must preserve the batch axis.")
+
+        d_window = boundary_hidden.shape[0]
+        ratio = self.compress_ratio
+        indexer = self.indexer
+        compressed_topk = None
+        seq_to_rank_row = None
+        cu_seqlens_compressed = None
+        indexer_loss = None
+        compressed_kv_rank_major = kv_local.new_empty((0, batch_size, kv_local.shape[-1]))
+
+        if self.compressor is not None and ratio > 1:
+            compressed_lens = torch.div(
+                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+            )
+            cu_seqlens_compressed = torch.cat(
+                (
+                    torch.zeros_like(cu_seqlens[:1]),
+                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
+                )
+            )
+            hidden_compact, compressed_group_ids, seq_to_rank_row = (
+                cp_utils.prepare_cp_compressor_input(
+                    x,
+                    boundary_hidden,
+                    cu_seqlens,
+                    cu_seqlens_compressed,
+                    global_start,
+                    cp_size,
+                    ratio,
+                    compact_fn=(
+                        partial(dsa_backend.compact_compressor_input, config=self.config)
+                        if self.apply_dsa_kernel_fusion
+                        else None
+                    ),
+                )
+            )
+            compressed_kv_local = self.compressor(
+                hidden_compact,
+                compressed_group_ids=compressed_group_ids,
+                max_seqlen_q=max_rope_seqlen,
+            )
+            compressed_kv_rank_major = gather_from_sequence_parallel_region(
+                compressed_kv_local, group=cp_group
+            )
+            compressed_kv_seq_major = torch.index_select(
+                compressed_kv_rank_major, 0, seq_to_rank_row.clamp_min(0).long()
+            )
+
+            if indexer is not None:
+                q_indexer_cp, _ = indexer.linear_wq_b(qr.detach())
+                q_indexer_cp = q_indexer_cp.reshape(
+                    l_local, batch_size, indexer.index_n_heads, indexer.index_head_dim
+                )
+                q_indexer_cp = _apply_rope(
+                    q_indexer_cp,
+                    indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                    indexer.qk_pos_emb_head_dim,
+                    indexer.rotary_pos_emb,
+                    self.config,
+                    max_rope_seqlen,
+                    cp_group=cp_group,
+                    position_ids=local_position_ids,
+                )
+                q_indexer_cp = rotate_activation(q_indexer_cp)
+                weights_indexer_cp, _ = indexer.linear_weights_proj(x.detach())
+                weights_indexer_cp = weights_indexer_cp * (indexer.index_n_heads**-0.5)
+
+                k_indexer_local = indexer.compressor(
+                    hidden_compact.detach(),
+                    compressed_group_ids=compressed_group_ids,
+                    max_seqlen_q=max_rope_seqlen,
+                )
+                k_indexer_rank_major = gather_from_sequence_parallel_region(
+                    k_indexer_local, group=cp_group
+                )
+                k_indexer_seq_major = torch.index_select(
+                    k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0).long()
+                )
+
+                compressed_count = k_indexer_seq_major.shape[0]
+                effective_topk = min(indexer.index_topk, compressed_count)
+                if effective_topk > 0:
+                    global_rows = global_start + torch.arange(
+                        l_local, device=query.device, dtype=cu_seqlens.dtype
+                    )
+                    query_sequence_ids = torch.bucketize(
+                        global_rows, cu_seqlens[1:], out_int32=True, right=True
+                    ).clamp_max(cu_seqlens.shape[0] - 2)
+                    query_positions = global_rows - cu_seqlens[query_sequence_ids]
+                    valid_queries = (
+                        (global_rows >= cu_seqlens[query_sequence_ids])
+                        & (global_rows < cu_seqlens[query_sequence_ids + 1])
+                    )
+                    visible_compressed = torch.div(
+                        query_positions + 1, ratio, rounding_mode="floor"
+                    )
+                    compressed_rows = torch.arange(
+                        compressed_count,
+                        device=query.device,
+                        dtype=cu_seqlens_compressed.dtype,
+                    )
+                    compressed_sequence_ids = torch.bucketize(
+                        compressed_rows,
+                        cu_seqlens_compressed[1:],
+                        out_int32=True,
+                        right=True,
+                    ).clamp_max(cu_seqlens_compressed.shape[0] - 2)
+                    compressed_positions = (
+                        compressed_rows
+                        - cu_seqlens_compressed[compressed_sequence_ids]
+                    )
+                    valid_compressed = (
+                        compressed_sequence_ids.view(1, 1, -1)
+                        == query_sequence_ids.view(1, -1, 1)
+                    ) & (
+                        compressed_positions.view(1, 1, -1)
+                        < visible_compressed.view(1, -1, 1)
+                    ) & valid_queries.view(1, -1, 1) & (
+                        compressed_rows < cu_seqlens_compressed[-1]
+                    ).view(1, 1, -1)
+                    causal_mask = torch.zeros(
+                        (batch_size, l_local, compressed_count),
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                    causal_mask.masked_fill_(~valid_compressed, float("-inf"))
+                    if self.training and torch.is_grad_enabled():
+                        key_for_loss = compressed_kv_seq_major.unsqueeze(2).expand(
+                            -1, -1, query.shape[2], -1
+                        )
+                        compressed_topk, indexer_loss = FusedDSAIndexerLoss.apply(
+                            q_indexer_cp,
+                            weights_indexer_cp.float() * indexer.softmax_scale,
+                            k_indexer_seq_major,
+                            query.detach(),
+                            key_for_loss.detach(),
+                            self.softmax_scale,
+                            effective_topk,
+                            self.config.dsa_indexer_loss_coeff or 0.0,
+                            causal_mask,
+                            self.config.dsa_indexer_use_sparse_loss,
+                            indexer.pg_collection,
+                            self.config.calculate_per_token_loss,
+                        )
+                    else:
+                        _, compressed_topk = fused_qk_topk_naive(
+                            q_indexer_cp,
+                            k_indexer_seq_major,
+                            weights_indexer_cp,
+                            effective_topk,
+                            causal_mask,
+                        )
+                    # Top-k is batch-specific: [B, S_local, K].
+                    if compressed_topk.shape[:2] != (batch_size, l_local):
+                        raise RuntimeError(
+                            "DSv4 SBHD CP indexer returned an unexpected top-k layout: "
+                            f"{tuple(compressed_topk.shape)}"
+                        )
+                    selected_rows = compressed_topk.long().clamp_min(0)
+                    selected_valid = torch.gather(
+                        valid_compressed.expand(batch_size, -1, -1),
+                        -1,
+                        selected_rows,
+                    )
+                    selected_ids = (
+                        compressed_positions[selected_rows] if is_thd else selected_rows
+                    )
+                    compressed_topk = torch.where(
+                        selected_valid,
+                        selected_ids,
+                        torch.full_like(selected_ids, -1),
+                    )
+                    compressed_topk = compressed_topk.to(torch.int32).contiguous()
+
+        kv_full = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
+        compressed_width = (
+            compressed_topk.shape[-1]
+            if compressed_topk is not None
+            else (
+                max_rope_seqlen // ratio
+                if self.compressor is not None and ratio > 1
+                else 0
+            )
+        )
+
+        def build_indices(selected_topk=None):
+            build_fn = (
+                dsa_backend.build_attention_indices
+                if self.apply_dsa_kernel_fusion
+                else csa_utils.build_attention_indices
+            )
+            return build_fn(
+                cu_seqlens,
+                global_start,
+                l_local,
+                d_window,
+                self.window_size,
+                ratio,
+                compressed_width,
+                selected_topk,
+                cu_seqlens_compressed=cu_seqlens_compressed,
+                seq_to_rank_row=seq_to_rank_row,
+                for_indexer_loss=False,
+                **({"config": self.config} if self.apply_dsa_kernel_fusion else {}),
+            )
+
+        if compressed_topk is None:
+            shared_indices, shared_lengths, _ = build_indices()
+            topk_idxs = shared_indices.unsqueeze(1).expand(-1, batch_size, -1).contiguous()
+            topk_length = shared_lengths.unsqueeze(1).expand(-1, batch_size).contiguous()
+        else:
+            # The layout kernel lowers one S-axis selection at a time.  Different
+            # sequences in an SBHD batch generally choose different compressed
+            # rows, so preserve that distinction instead of flattening B into S.
+            lowered = [build_indices(compressed_topk[b]) for b in range(batch_size)]
+            topk_idxs = torch.stack([item[0] for item in lowered], dim=1)
+            topk_length = torch.stack([item[1] for item in lowered], dim=1)
+
+        topk_bsk = topk_idxs.permute(1, 0, 2).contiguous()
+        if self.apply_dsa_kernel_fusion:
+            flat_topk_idxs, flat_topk_length = dsa_backend.build_flat_topk_idxs(
+                topk_bsk,
+                batch_size=batch_size,
+                seqlen_kv=kv_full.shape[0],
+                compact=True,
+                config=self.config,
+            )
+            output = dsa_backend.sparse_attention(
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                flat_topk_idxs,
+                self.softmax_scale,
+                topk_length=flat_topk_length,
+                config=self.config,
+            )
+        else:
+            output = unfused_compressed_sparse_attn(
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                topk_bsk,
+                self.softmax_scale,
+            )
+
+        if indexer_loss is not None:
+            if (self.config.dsa_indexer_loss_coeff or 0.0) > 0:
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=indexer_loss,
+                    layer_number=self.layer_number,
+                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    reduce_group=cp_group,
+                )
+            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        return output.squeeze(1) if is_thd else output

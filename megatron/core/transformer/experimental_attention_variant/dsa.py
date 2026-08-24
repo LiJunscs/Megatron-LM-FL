@@ -397,7 +397,9 @@ def fused_qk_topk_naive(
     # =========================================
     # Select top-k indices
     # =========================================
-    topk_k = min(index_topk, seqlen)
+    # Q and K can have different sequence lengths (notably compressed-KV CP).
+    # The top-k bound belongs to the key axis, not the query axis.
+    topk_k = min(index_topk, k.size(0))
     # [batch, seqlen, index_topk]
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 

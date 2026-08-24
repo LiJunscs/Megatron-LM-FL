@@ -367,6 +367,9 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
+
     ####################
     # DSA
     ####################
@@ -1364,6 +1367,23 @@ class TransformerConfig(ModelParallelConfig):
             ##### FlagScale End #####
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
+
+            if self.cp_partition_mode not in ("zigzag", "contiguous"):
+                raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+            if self.context_parallel_size > 1:
+                if (
+                    self.experimental_attention_variant == "dsv4_hybrid"
+                    and self.cp_partition_mode != "contiguous"
+                ):
+                    raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
+                if (
+                    self.experimental_attention_variant != "dsv4_hybrid"
+                    and self.cp_partition_mode != "zigzag"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                    )
 
             if self.apply_dsa_kernel_fusion:
                 assert (
