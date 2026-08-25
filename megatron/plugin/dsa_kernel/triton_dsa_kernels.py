@@ -290,7 +290,9 @@ def _masked_topk_from_scores(
 ) -> Tuple[Tensor, Tensor]:
     """Select a fixed-width top-K after applying per-sequence key lengths."""
     if valid_k_mask is not None:
-        scores = scores.masked_fill(~valid_k_mask[:, None, :], float("-inf"))
+        if valid_k_mask.ndim == 2:
+            valid_k_mask = valid_k_mask[:, None, :]
+        scores = scores.masked_fill(~valid_k_mask, float("-inf"))
     selected = min(topk, scores.shape[-1])
     if selected:
         values, indices = torch.topk(scores, selected, dim=-1, sorted=False)
@@ -652,6 +654,8 @@ def indexer_topk(
         topk: number of top-K indices to select.
         ratio: compression ratio for the causal mask.
         indexer_softmax_scale: scale applied to indexer scores.
+        q_causal_offsets: optional THD per-segment position of the first local
+            query. CP supplies this for segments that start after sequence row 0.
 
     Returns:
         topk_indices: ``(b, sq, topk)`` int32.
@@ -675,10 +679,6 @@ def indexer_topk(
         raise ValueError(
             "THD indexer_topk requires cu_seqlens_kv, max_seqlen_q, and max_seqlen_kv"
         )
-    if q_causal_offsets is not None:
-        raise AssertionError(
-            "The Triton THD indexer does not yet support CP-relative q_causal_offsets"
-        )
     if q_indexer.ndim != 3 or k_indexer.ndim != 2 or weights.ndim != 2:
         raise ValueError("THD indexer inputs must be [T,H,D], [Tk,D], and [T,H]")
 
@@ -691,8 +691,19 @@ def indexer_topk(
     _, _, scores = _indexer_topk_bshd(
         q_bshd, k_bsd, w_bsh_scaled, min(topk, int(max_seqlen_kv)), ratio
     )
+    q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     kv_lens = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-    valid_k = torch.arange(int(max_seqlen_kv), device=k_indexer.device)[None, :] < kv_lens[:, None]
+    q_positions = torch.arange(int(max_seqlen_q), device=q_indexer.device)[None, :]
+    if q_causal_offsets is not None:
+        q_positions = q_positions + q_causal_offsets[:, None]
+    visible_k = torch.div(q_positions + 1, ratio, rounding_mode="floor")
+    k_positions = torch.arange(int(max_seqlen_kv), device=k_indexer.device)[None, None, :]
+    valid_k = (
+        (k_positions < visible_k[:, :, None])
+        & (k_positions < kv_lens[:, None, None])
+        & (torch.arange(int(max_seqlen_q), device=q_indexer.device)[None, :, None]
+           < q_lens[:, None, None])
+    )
     topk_padded, length_padded = _masked_topk_from_scores(scores, topk, valid_k)
     total_q = q_indexer.shape[0]
     topk_thd = _padded_sb_to_packed(topk_padded.permute(1, 0, 2), cu_seqlens_q, total_q)
@@ -1242,6 +1253,189 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
 
+class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
+    """CP/THD sparse attention with caller-supplied compressed top-k.
+
+    Top-k selection and CP index lowering stay with the caller. This function
+    supplies the Triton sparse-attention forward/backward and sparse indexer
+    loss backward needed by the existing CP training path.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        topk_idxs: Tensor,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        indexer_topk_idxs: Tensor,
+        compressed_kv: Tensor,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        loss_divisor: float,
+        sparse_loss: bool,
+        ratio: int,
+        max_seqlen_q: int,
+        indexer_layout,
+        q_padding_mask: Optional[Tensor] = None,
+        tp_group=None,
+    ) -> Tuple[Tensor, Tensor]:
+        if not sparse_loss:
+            raise NotImplementedError(
+                "The Triton CP from-topk path currently supports sparse indexer loss only"
+            )
+
+        total_q, np_, d = query.shape
+        indexer_topk = indexer_topk_idxs.shape[-1]
+        shared_idxs = topk_idxs.unsqueeze(1) if topk_idxs.ndim == 2 else topk_idxs
+        expanded_idxs = shared_idxs.expand(-1, np_, -1)
+        out, lse, lse_indexer = triton_sparse_attn_forward(
+            query,
+            kv_full,
+            expanded_idxs,
+            softmax_scale,
+            d,
+            attn_sink,
+            indexer_topk=indexer_topk,
+        )
+
+        loss_topk = indexer_topk_idxs
+        if q_padding_mask is not None:
+            loss_topk = loss_topk.masked_fill(q_padding_mask.unsqueeze(-1), -1)
+
+        q_idx_bshd = q_indexer.unsqueeze(0)
+        k_idx_bsd = k_indexer.unsqueeze(0)
+        w_bsh_scaled = (weights.float() * indexer_softmax_scale).unsqueeze(0)
+        topk_bst = loss_topk.unsqueeze(0)
+        local_head_sum = compute_sparse_local_target_head_sum(
+            query.unsqueeze(0),
+            compressed_kv.unsqueeze(0),
+            lse_indexer.unsqueeze(0),
+            topk_bst,
+            softmax_scale=softmax_scale,
+        ).contiguous()
+        if tp_group is not None and tp_group.size() > 1:
+            torch.distributed.all_reduce(
+                local_head_sum,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+
+        predict_state = compute_sparse_indexer_predict_state(
+            q_idx_bshd, k_idx_bsd, w_bsh_scaled, topk_bst
+        )
+        effective_loss_coeff = loss_coeff / loss_divisor
+        indexer_loss, grad_q_indexer, grad_k_indexer, grad_weights = (
+            sparse_indexer_kl_and_backward(
+                local_head_sum,
+                predict_state,
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh_scaled,
+                loss_coeff=effective_loss_coeff,
+                calculate_per_token_loss=True,
+            )
+        )
+        grad_q_indexer = grad_q_indexer.squeeze(0)
+        grad_k_indexer = grad_k_indexer.squeeze(0)
+        grad_weights = grad_weights.squeeze(0) * indexer_softmax_scale
+        if q_padding_mask is not None:
+            grad_q_indexer = grad_q_indexer.masked_fill(
+                q_padding_mask[:, None, None], 0
+            )
+            grad_weights = grad_weights.masked_fill(q_padding_mask[:, None], 0)
+
+        out_for_backward = out.clone()
+        ctx.save_for_backward(
+            query,
+            kv_full,
+            attn_sink,
+            shared_idxs,
+            out_for_backward,
+            lse,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.d_v = out.shape[-1]
+        ctx.used_hp_fwd = (
+            expanded_idxs.stride(1) == 0
+            and np_ >= 16
+            and np_ % 16 == 0
+            and d % 16 == 0
+            and ctx.d_v % 16 == 0
+        )
+        return out.reshape(total_q, np_ * ctx.d_v), indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        (
+            query,
+            kv_full,
+            attn_sink,
+            shared_idxs,
+            out,
+            lse,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
+        ) = ctx.saved_tensors
+        dO = grad_output.reshape(query.shape[0], query.shape[1], ctx.d_v)
+        expanded_idxs = shared_idxs.expand(-1, query.shape[1], -1)
+        if ctx.used_hp_fwd:
+            dq, dkv, d_sink = _DSASparseAttnFunc._hp_bmm_backward(
+                dO,
+                query,
+                kv_full,
+                expanded_idxs,
+                out,
+                lse,
+                attn_sink,
+                ctx.softmax_scale,
+                ctx.d_v,
+            )
+        else:
+            result = triton_sparse_attn_backward(
+                dO,
+                query,
+                kv_full,
+                out,
+                lse,
+                expanded_idxs,
+                ctx.softmax_scale,
+                ctx.d_v,
+                attn_sink,
+            )
+            dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+
+        return (
+            dq,
+            dkv,
+            d_sink,
+            None,
+            grad_q_indexer * grad_loss,
+            grad_k_indexer * grad_loss,
+            grad_weights * grad_loss,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def fused_indexer_sparse_attn(
     query: Tensor,
     kv_full: Tensor,
@@ -1400,4 +1594,5 @@ __all__ = [
     "dsa_sparse_attn_sbhd",
     "indexer_topk",
     "fused_indexer_sparse_attn",
+    "FusedIndexerSparseAttnFromTopkFunc",
 ]

@@ -53,29 +53,34 @@ from megatron.core.utils import (
 
 # Keep the cuDNN/FlashMLA backend as the SM100+ default. Hopper uses the
 # vendored Triton implementation, whose public wrappers intentionally match
-# these three layout-aware functions for both SBHD and THD.
+# the layout-aware inference and training entry points used below.
 _cudnn_dsa_sparse_attn = dsa_sparse_attn
 _cudnn_fused_indexer_sparse_attn = fused_indexer_sparse_attn
+_cudnn_fused_indexer_sparse_attn_from_topk = FusedIndexerSparseAttnFromTopkFunc
 _cudnn_indexer_topk = indexer_topk
+_cudnn_cp_indexer_topk = cp_utils.indexer_topk
 _cudnn_build_flat_topk_idxs = build_flat_topk_idxs
-_dsa_backend_sm = None
+_dsa_backend_key = None
 
 
-def _ensure_dsa_kernel_backend() -> None:
+def _ensure_dsa_kernel_backend(tp_size: int = 1) -> None:
     """Prefer FlashMLA/cuDNN DSA and fall back to Triton on SM90."""
-    global _dsa_backend_sm
+    global _dsa_backend_key
+    global FusedIndexerSparseAttnFromTopkFunc
     global build_flat_topk_idxs, dsa_sparse_attn, fused_indexer_sparse_attn, indexer_topk
 
     sm_major = torch.cuda.get_device_capability()[0]
-    if _dsa_backend_sm == sm_major:
+    backend_key = (sm_major, tp_size > 1)
+    if _dsa_backend_key == backend_key:
         return
     from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
         get_fused_dsa_legacy_availability,
     )
 
     flash_mla_available, cudnn_dsa_available = get_fused_dsa_legacy_availability()
-    if sm_major == 9 and not (flash_mla_available and cudnn_dsa_available):
+    if sm_major == 9 and (tp_size > 1 or not (flash_mla_available and cudnn_dsa_available)):
         from megatron.plugin.dsa_kernel.triton_dsa_kernels import (
+            FusedIndexerSparseAttnFromTopkFunc as triton_fused_indexer_sparse_attn_from_topk,
             build_flat_topk_idxs as triton_build_flat_topk_idxs,
             dsa_sparse_attn as triton_dsa_sparse_attn,
             fused_indexer_sparse_attn as triton_fused_indexer_sparse_attn,
@@ -85,13 +90,17 @@ def _ensure_dsa_kernel_backend() -> None:
         build_flat_topk_idxs = triton_build_flat_topk_idxs
         dsa_sparse_attn = triton_dsa_sparse_attn
         fused_indexer_sparse_attn = triton_fused_indexer_sparse_attn
+        FusedIndexerSparseAttnFromTopkFunc = triton_fused_indexer_sparse_attn_from_topk
         indexer_topk = triton_indexer_topk
+        cp_utils.indexer_topk = triton_indexer_topk
     else:
         build_flat_topk_idxs = _cudnn_build_flat_topk_idxs
         dsa_sparse_attn = _cudnn_dsa_sparse_attn
         fused_indexer_sparse_attn = _cudnn_fused_indexer_sparse_attn
+        FusedIndexerSparseAttnFromTopkFunc = _cudnn_fused_indexer_sparse_attn_from_topk
         indexer_topk = _cudnn_indexer_topk
-    _dsa_backend_sm = sm_major
+        cp_utils.indexer_topk = _cudnn_cp_indexer_topk
+    _dsa_backend_key = backend_key
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -1650,7 +1659,7 @@ class CompressedSparseAttention(MegatronModule):
 
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         if self.apply_dsa_kernel_fusion:
-            _ensure_dsa_kernel_backend()
+            _ensure_dsa_kernel_backend(tp_size)
 
         # Query heads are column-parallel, so the sink follows the same TP head
         # shard. Keeping a global-sized sink here would broadcast the wrong

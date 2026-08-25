@@ -349,8 +349,8 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_dsa_kernel_fusion: bool = False
     """If True, prefer FlashMLA forward plus cuDNN DSA backward/indexer kernels. On SM90,
-    fall back to Triton when either legacy backend is unavailable; the Triton fallback does not
-    support context parallelism. When False, use unfused PyTorch implementations."""
+    use Triton when TP is enabled or either legacy backend is unavailable. The Triton CP path
+    supports sparse indexer loss. When False, use unfused PyTorch implementations."""
 
     ####################
     # linear attention
@@ -1618,14 +1618,20 @@ class TransformerConfig(ModelParallelConfig):
                 _flash_mla_available, _cudnn_dsa_available = (
                     get_fused_dsa_legacy_availability()
                 )
-                use_legacy_dsa = _flash_mla_available and _cudnn_dsa_available
+                use_legacy_dsa = (
+                    _flash_mla_available
+                    and _cudnn_dsa_available
+                    and not (sm[0] == 9 and self.tensor_model_parallel_size > 1)
+                )
 
                 if sm[0] == 9 and not use_legacy_dsa:
-                    if self.context_parallel_size > 1 or self.dynamic_context_parallel:
+                    uses_cp = self.context_parallel_size > 1 or self.dynamic_context_parallel
+                    if uses_cp and indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
                         raise ValueError(
-                            "SM90 Triton fused DSA fallback does not support context "
-                            "parallelism. Install both FlashMLA and cuDNN Frontend DSA, "
-                            "or disable DSA kernel fusion."
+                            "SM90 Triton fused DSA with context parallelism currently "
+                            "supports sparse indexer loss only. Enable "
+                            "dsa_indexer_use_sparse_loss, install FlashMLA and cuDNN "
+                            "Frontend DSA, or disable DSA kernel fusion."
                         )
                     try:
                         import triton  # noqa: F401
