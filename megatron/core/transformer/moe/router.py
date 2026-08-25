@@ -26,6 +26,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 
 
 @dataclass(frozen=True)
@@ -751,6 +752,11 @@ class TopKRouter(Router):
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h]
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
+        if self.config.sequence_parallel:
+            # In sequence parallel, the input_ids are sharded across the sequence dimension.
+            # We need to scatter the input_ids to sequence parallel region.
+            flat_ids = flat_ids.contiguous()
+            flat_ids = scatter_to_sequence_parallel_region(flat_ids, self.pg_collection.tp)
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
         if (
             self.config.moe_router_force_load_balancing

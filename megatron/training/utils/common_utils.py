@@ -584,6 +584,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device()
             )
             _broadcast(seq_len)
+        elif args.sft:
+            # SFT default-collate to [batch, totel_sequence_len]
+            _broadcast(torch.tensor(batch['tokens'].shape, dtype=torch.int32, device=torch.cuda.current_device()))
 
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
@@ -615,6 +618,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = seq_len.item()
+        elif args.sft:
+            shape = torch.empty(2, dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(shape)
+            shape = tuple(shape.tolist())
         else:
             shape = (args.micro_batch_size, args.seq_length)
 
