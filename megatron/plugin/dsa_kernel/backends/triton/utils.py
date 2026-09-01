@@ -114,7 +114,9 @@ def topk_with_causal_mask(
 
     # Apply ratio causal mask
     mask = compute_ratio_causal_mask(S_q, S_k, ratio, device, scores.dtype)
-    masked_scores = scores + mask.unsqueeze(0)  # (B, S_q, S_k)
+    masked_scores = scores.masked_fill(
+        torch.isneginf(mask).unsqueeze(0), float("-inf")
+    )  # (B, S_q, S_k)
 
     # Effective k — cannot exceed S_k
     effective_k = min(k, S_k)

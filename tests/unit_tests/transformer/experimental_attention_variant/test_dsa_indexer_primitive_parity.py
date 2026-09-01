@@ -137,7 +137,7 @@ def test_sbhd_to_bshd_weight_scaling_is_fp32():
 
     _, _, _, w_bsh_scaled = tri_fused_ops._sbhd_to_bshd_indexer_inputs(q, k, w, scale)
     assert w_bsh_scaled.dtype == torch.float32
-    assert torch.equal(w_bsh_scaled, w.float() * scale)
+    assert torch.equal(w_bsh_scaled, w.permute(1, 0, 2).float() * scale)
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +250,13 @@ def test_topk_tie_behavior_identical_to_oracle():
 
 
 def test_topk_nan_inf_behavior_matches_oracle():
-    """NaN rows propagate exactly like oracle top-k; -inf rows become -1."""
-    b, sq, sk, ratio, topk = 1, 4, 16, 4, 5
+    """Valid NaNs follow top-k; masked NaNs and -inf rows become invalid."""
+    b, sq, sk, ratio, topk = 1, 4, 16, 4, 16
     torch.manual_seed(_PARITY_SEED + 5)
     scores = torch.randn(b, sq, sk, dtype=torch.float32)
-    scores[0, 1, 7] = float("nan")  # NaN behaves as "largest" in both paths
+    scores[0, 1, 7] = float("nan")  # Invalid under ratio masking: must be overwritten.
     scores[0, 2, :] = float("-inf")  # fully masked row
+    scores[0, 3, 0] = float("nan")  # Valid NaN must remain a materialized lane.
 
     _, oracle_idxs, oracle_length = _oracle_topk_with_caller_conversion(
         scores, topk, ratio
@@ -264,13 +265,13 @@ def test_topk_nan_inf_behavior_matches_oracle():
 
     assert torch.equal(fused_idxs, oracle_idxs)
     assert torch.equal(fused_length, oracle_length)
-    # The NaN position must be selected (not silently dropped) and the fully
-    # masked row must be all -1 with length 0.  NaN is treated as larger than
-    # every number by ``torch.topk`` (the shared primitive of both paths), so
-    # the NaN column leads the row's selection and is never classified as an
-    # invalid -1 lane.
-    assert int((fused_idxs[0, 1] == 7).sum()) == 1
-    assert int(fused_idxs[0, 1][0]) == 7
+    # The invalid NaN is masked out rather than leaking through ``NaN + -inf``.
+    assert torch.equal(fused_idxs[0, 1], torch.full((topk,), -1, dtype=torch.int32))
+    # Materializing every column avoids imposing a device-specific ordering
+    # contract on NaNs while still proving that a valid NaN is not converted
+    # to an invalid lane.
+    assert int((fused_idxs[0, 3] == 0).sum()) == 1
+    assert int(fused_length[0, 3]) == 1
     assert torch.equal(fused_idxs[0, 2], torch.full((topk,), -1, dtype=torch.int32))
     assert int(fused_length[0, 2]) == 0
 
@@ -331,6 +332,7 @@ def test_loss_mean_vs_per_token_share_same_reduction(sparse):
         )
     else:
         kwargs = dict(
+            indexer_softmax_scale=64 ** -0.5,
             softmax_scale=64 ** -0.5,
             loss_coeff=loss_coeff,
             ratio=4,
