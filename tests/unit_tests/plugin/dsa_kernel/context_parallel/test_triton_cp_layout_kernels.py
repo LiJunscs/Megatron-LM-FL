@@ -298,9 +298,9 @@ def test_compaction_host_mapping_is_one_to_one_and_matches_reference():
 
         # Forward: manual gather must equal the reference compaction output.
         compact_len = c_cap * ratio
-        src_cat = torch.cat((boundary, hidden, torch.zeros(1, 5)), dim=0)
+        src_cat = torch.cat((boundary, hidden, torch.zeros(1, 5, device="cuda")), dim=0)
         gathered = torch.index_select(src_cat, 0, flat)
-        h_manual = torch.where(valid.unsqueeze(-1), gathered, torch.zeros(1, 5))
+        h_manual = torch.where(valid.unsqueeze(-1), gathered, torch.zeros(1, 5, device="cuda"))
         h_ref, _ = csa_utils.compressor_input_compact(
             hidden, boundary, cu, gs, ratio, d_comp, c_cap
         )
@@ -337,9 +337,10 @@ def test_compaction_backward_repeated_source_uses_index_add_fallback(monkeypatch
     """
     cu_seqlens, gs, ll, d_comp, ratio, c_cap = ([0, 32], 0, 16, 4, 4, 8)
     cu = torch.tensor(cu_seqlens, dtype=torch.int32, device="cuda")
+    original_compact_row_to_source = csa_utils._compact_row_to_source
 
     def duplicated_sources(*args, **kwargs):
-        src_global, comp_ids, valid = csa_utils._compact_row_to_source(*args, **kwargs)
+        src_global, comp_ids, valid = original_compact_row_to_source(*args, **kwargs)
         src_global = src_global.clone()
         # Compact rows 5 and 6 both reference global row 5 (both local rows).
         src_global[6] = src_global[5]

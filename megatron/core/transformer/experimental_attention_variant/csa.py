@@ -2,7 +2,7 @@
 
 import copy
 from dataclasses import dataclass
-from functools import lru_cache, partial
+from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
@@ -56,12 +56,12 @@ from megatron.core.utils import (
 # ---------------------------------------------------------------------------
 
 def _ensure_dsa_kernels(config=None):
-    """Resolve fused operators for one CSA instance and backend request."""
-    return (
-        dsa_backend.resolve("indexer_sparse_attn", config=config),
-        dsa_backend.resolve("fused_indexer_sparse_attn", config=config),
-        dsa_backend.resolve("indexer_topk", config=config),
-        dsa_backend.resolve("build_flat_topk_idxs", config=config),
+    """Resolve one complete non-CP fused bundle for a CSA instance."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    return dsa_backend.resolve_fused_bundle(
+        config=config,
+        device=device,
+        dtype=getattr(config, "params_dtype", None),
     )
 ##### FlagScale End #####
 
@@ -755,13 +755,37 @@ class CompressedSparseAttention(MegatronModule):
 
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         ##### FlagScale Begin #####
+        cp_group_size = (
+            self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
+        )
+        self._cp_bundle_required = bool(
+            cp_group_size > 1
+            or getattr(config, "context_parallel_size", 1) > 1
+            or getattr(config, "dynamic_context_parallel", False)
+        )
+        if self._cp_bundle_required:
+            self._cp_kernel_bundle = dsa_backend.resolve_cp_bundle(
+                config=config,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                dtype=getattr(config, "params_dtype", None),
+            )
+            self._compact_compressor_input = self._cp_kernel_bundle[
+                "compact_compressor_input"
+            ]
+            self._build_attention_indices = self._cp_kernel_bundle[
+                "build_attention_indices"
+            ]
+
         if self.apply_dsa_kernel_fusion:
-            (
-                self._dsa_sparse_attn,
-                self._fused_indexer_sparse_attn,
-                self._indexer_topk,
-                self._build_flat_topk_idxs_fn,
-            ) = _ensure_dsa_kernels(config)
+            self._dsa_kernel_bundle = _ensure_dsa_kernels(config)
+            self._dsa_sparse_attn = self._dsa_kernel_bundle["indexer_sparse_attn"]
+            self._fused_indexer_sparse_attn = self._dsa_kernel_bundle[
+                "fused_indexer_sparse_attn"
+            ]
+            self._indexer_topk = self._dsa_kernel_bundle["indexer_topk"]
+            self._build_flat_topk_idxs_fn = self._dsa_kernel_bundle[
+                "build_flat_topk_idxs"
+            ]
         ##### FlagScale End #####
 
         # Learnable attention sink per head (TP-sharded along head dim)  ##### FlagScale Add #####
@@ -1114,11 +1138,6 @@ class CompressedSparseAttention(MegatronModule):
         del position_ids
         nvtx_range_push("compressed_sparse_attn")
         if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
-            if attention_mask is not None or attention_bias is not None:
-                raise RuntimeError(
-                    "DSv4 contiguous CP currently derives causal masking from position metadata "
-                    "and does not support an explicit attention mask or attention bias."
-                )
             output = self._forward_cp(
                 query,
                 key,
@@ -1208,6 +1227,11 @@ class CompressedSparseAttention(MegatronModule):
         zigzag-to-contiguous conversion.
         """
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if not self._cp_bundle_required:
+            raise RuntimeError(
+                "DSv4 entered CP without resolving its atomic CP bundle; set "
+                "context_parallel_size or dynamic_context_parallel before model construction."
+            )
         if is_thd:
             if query.dim() == 3:
                 query = query.unsqueeze(1)
@@ -1294,11 +1318,7 @@ class CompressedSparseAttention(MegatronModule):
                     global_start,
                     cp_size,
                     ratio,
-                    compact_fn=(
-                        partial(dsa_backend.compact_compressor_input, config=self.config)
-                        if self.apply_dsa_kernel_fusion
-                        else None
-                    ),
+                    compact_fn=self._compact_compressor_input,
                 )
             )
             compressed_kv_local = self.compressor(
@@ -1451,11 +1471,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         def build_indices(selected_topk=None):
-            build_fn = (
-                dsa_backend.build_attention_indices
-                if self.apply_dsa_kernel_fusion
-                else csa_utils.build_attention_indices
-            )
+            build_fn = self._build_attention_indices
             return build_fn(
                 cu_seqlens,
                 global_start,
@@ -1468,7 +1484,6 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=False,
-                **({"config": self.config} if self.apply_dsa_kernel_fusion else {}),
             )
 
         if compressed_topk is None:
@@ -1485,21 +1500,19 @@ class CompressedSparseAttention(MegatronModule):
 
         topk_bsk = topk_idxs.permute(1, 0, 2).contiguous()
         if self.apply_dsa_kernel_fusion:
-            flat_topk_idxs, flat_topk_length = dsa_backend.build_flat_topk_idxs(
+            flat_topk_idxs, flat_topk_length = self._build_flat_topk_idxs_fn(
                 topk_bsk,
                 batch_size=batch_size,
                 seqlen_kv=kv_full.shape[0],
                 compact=True,
-                config=self.config,
             )
-            output = dsa_backend.sparse_attention(
+            output = self._dsa_sparse_attn(
                 query,
                 kv_full,
                 self.attn_sink.float(),
                 flat_topk_idxs,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
-                config=self.config,
             )
         else:
             output = unfused_compressed_sparse_attn(

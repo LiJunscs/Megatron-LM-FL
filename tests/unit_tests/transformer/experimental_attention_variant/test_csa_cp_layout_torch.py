@@ -376,6 +376,7 @@ def test_build_attention_indices_mode0_matches_naive(
         ratio,
         compressed_width,
         compressed_topk=compressed_topk,
+        cu_seqlens_compressed=cu_compressed,
         seq_to_rank_row=torch.tensor(seq_to_rank_row, dtype=torch.int32),
     )
     for row in range(l_local):
@@ -666,7 +667,7 @@ def test_build_flat_topk_idxs_thd_matches_naive(cu_seqlens, total_q, topk):
     assert length is None
     assert flat.shape == (total_q, topk)
     expected = torch.tensor(
-        _naive_global_thd(idxs.tolist(), cu_seqlens, cu_seqlens), dtype=torch.int32
+        _naive_global_thd(idxs, cu_seqlens, cu_seqlens), dtype=torch.int32
     )
     dsv4_parity_gate.assert_index_parity(
         flat,
@@ -692,7 +693,7 @@ def test_build_flat_topk_idxs_thd_uses_kv_boundaries():
         cu_seqlens_kv=cu_kv,
     )
     expected = torch.tensor(
-        _naive_global_thd(idxs.tolist(), [0, 4, 12], [0, 6, 18]), dtype=torch.int32
+        _naive_global_thd(idxs, [0, 4, 12], [0, 6, 18]), dtype=torch.int32
     )
     dsv4_parity_gate.assert_index_parity(
         flat,
