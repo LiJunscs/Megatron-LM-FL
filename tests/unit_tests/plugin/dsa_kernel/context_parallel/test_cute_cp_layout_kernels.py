@@ -5,7 +5,7 @@ from typing import List, Tuple
 import pytest
 import torch
 
-from megatron.plugin.dsa_kernel.backends.cute import cp_layout as csa_cp_layout_kernels
+from megatron.plugin.dsa_kernel.context_parallel.backends.cute import cp_kernel as csa_cp_layout_kernels
 from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     prepare_cp_compressor_input,
 )

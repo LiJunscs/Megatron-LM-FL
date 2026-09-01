@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from unittest import mock
+from unittest import mock  ##### FlagScale Add #####
 from unittest.mock import patch
 
 import pytest
@@ -13,8 +13,8 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-##### FlagScale End #####
 from megatron.core.models.gpt.gpt_model import GPTModel
+##### FlagScale End #####
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -89,18 +89,22 @@ def _make_config(
     dsa_indexer_head_dim=64,
     dsa_indexer_topk=8,
     dsa_indexer_loss_coeff=0.0,
+    bf16=True,
+    params_dtype=None,
     **extra_config_kwargs,
 ):
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
+    if params_dtype is None:
+        params_dtype = torch.bfloat16 if bf16 else torch.float32
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
-        bf16=True,
-        params_dtype=torch.bfloat16,
+        bf16=bf16,
+        params_dtype=params_dtype,
         add_bias_linear=False,
         tensor_model_parallel_size=tensor_model_parallel_size,
         sequence_parallel=sequence_parallel,
@@ -184,6 +188,7 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'core_attention')
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
+
         ##### FlagScale Add #####
         # Q is head-sharded, while the single MQA KV projection is duplicated.
         assert attn.num_local_q_heads == config.num_attention_heads
@@ -194,6 +199,7 @@ class TestDSv4HybridAttentionConstructor:
         assert attn.linear_q_up_proj.weight.shape[0] == attn.query_projection_size_per_partition
         assert attn.linear_kv_proj.weight.shape[0] == config.v_head_dim
         assert not getattr(attn.linear_kv_proj.weight, 'tensor_model_parallel', False)
+
         ##### FlagScale End #####
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
@@ -205,6 +211,7 @@ class TestDSv4HybridAttentionConstructor:
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
         assert attn.q_head_dim == config.v_head_dim
+
     ##### FlagScale Add #####
     def test_compressor_owns_tp_output_gradient_contract(self):
         """Main and indexer compressors expose different TP backward semantics."""
@@ -220,6 +227,7 @@ class TestDSv4HybridAttentionConstructor:
         assert core.compressor.reduce_output_grad_across_tp
         assert core.indexer is not None
         assert not core.indexer.compressor.reduce_output_grad_across_tp
+
     ##### FlagScale End #####
     @pytest.mark.parametrize("layer_number", [1, 2, 3, 4])
     def test_rope_base_varies_with_compress_ratio(self, layer_number):
@@ -401,7 +409,7 @@ class TestDSv4HybridQKV:
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
         ).cuda()
 
-        q, k, v, q_compressed, gathered_hidden_states = attn.get_query_key_value_tensors(hidden) ##### FlagScale Add #####
+        q, k, v, q_compressed, gathered_hidden_states = attn.get_query_key_value_tensors(hidden)  ##### FlagScale Add #####
 
         n_heads = self.config.num_attention_heads
         v_dim = self.config.v_head_dim
@@ -714,8 +722,9 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
-
 ##### FlagScale Add #####
+
+
 def _load_tp1_parameters_into_tpn(module, tp1_parameters, tp_rank, tp_size):
     """Load a TP1 parameter snapshot into a TP-sharded module."""
     with torch.no_grad():

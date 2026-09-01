@@ -4,6 +4,7 @@ import gc
 import os
 import statistics
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -17,6 +18,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -39,15 +41,99 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
 
 _DSV4_CP_PARITY_EPS = 1e-3
 
-# TP/SP/CP changes BF16 GEMM shapes and introduces extra gradient-reduction
-# rounding points. Permit an isolated BF16 ULP in elementwise comparisons, but
-# also require the complete gradient tensor to remain directionally and
-# norm-wise aligned with the TP1+CP1 reference.
-_DSV4_TP_CP_PARAM_GRAD_RTOL = 1e-2
-_DSV4_TP_CP_PARAM_GRAD_ATOL = 3e-2
-_DSV4_TP_CP_PARAM_GRAD_RELATIVE_L2_LIMIT = 2e-2
-_DSV4_TP_CP_PARAM_GRAD_COSINE_MIN = 1.0 - _DSV4_CP_PARITY_EPS
-_DSV4_TP_CP_PARAM_GRAD_NORM_RATIO_TOL = 2e-2
+
+@dataclass(frozen=True)
+class _NumericalTolerance:
+    """Elementwise and whole-tensor gates for one floating-point parity target."""
+
+    rtol: float
+    atol: float
+    relative_l2: float
+    cosine_min: float
+    norm_ratio: float
+
+
+# The unfused values retain the established DSv4 TP/SP/CP budgets. They are
+# intentionally a little wider than the conventional MLA CP output tolerance
+# (5e-3): DSv4 adds compressor/indexer projections and both TP and CP gradient
+# reductions. Whole-tensor gates prevent the elementwise BF16 atol from hiding
+# a systematic drift.
+_DSV4_TP_SP_CP_UNFUSED_OUTPUT = _NumericalTolerance(
+    1e-2, 1e-2, 1.5e-2, 0.9995, 1.5e-2
+)
+_DSV4_TP_SP_CP_UNFUSED_INPUT_GRAD = _NumericalTolerance(
+    2e-2, 2e-2, 2e-2, 0.999, 2e-2
+)
+_DSV4_TP_SP_CP_UNFUSED_PARAM_GRAD = _NumericalTolerance(
+    1e-2, 3e-2, 2e-2, 0.999, 2e-2
+)
+
+# CP acceleration is independent of apply_dsa_kernel_fusion. These limits
+# cover a PyTorch-native non-CP path combined with a complete CuTe or Triton CP
+# bundle. They intentionally match the native baseline initially; the CP
+# provider parity tests require exact layout/index results, so this profile
+# should only need adjustment if end-to-end measurements demonstrate otherwise.
+_DSV4_TP_SP_CP_CP_FUSED_OUTPUT_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(1e-2, 1e-2, 1.5e-2, 0.9995, 1.5e-2)
+    for backend in ("cute", "triton")
+}
+_DSV4_TP_SP_CP_CP_FUSED_INPUT_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(2e-2, 2e-2, 2e-2, 0.999, 2e-2)
+    for backend in ("cute", "triton")
+}
+_DSV4_TP_SP_CP_CP_FUSED_PARAM_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(1e-2, 3e-2, 2e-2, 0.999, 2e-2)
+    for backend in ("cute", "triton")
+}
+_DSV4_TP_SP_CP_CP_FUSED_LOSS_BY_CP_BACKEND = {
+    backend: (2e-3, 2e-3) for backend in ("cute", "triton")
+}
+
+# Triton TP sparse attention independently uses a 2e-2 forward/gradient
+# elementwise budget. Full fused-vs-native DSv4 observes a roughly 0.997
+# cosine floor after fused RoPE and backward, so the combined distributed gate
+# uses that floor for gradients while keeping output at the stricter 0.999.
+# Keep an independent fused end-to-end budget for every CP provider. CuTe and
+# Triton deliberately start with identical limits so backend A/B results are
+# comparable; separate entries let measured provider-specific drift be handled
+# without weakening the other path. ``torch`` covers the CP native fallback
+# combined with a fused non-CP bundle.
+_DSV4_TP_SP_CP_FUSED_OUTPUT_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(1e-2, 2e-2, 2e-2, 0.999, 2e-2)
+    for backend in ("cute", "triton", "torch")
+}
+_DSV4_TP_SP_CP_FUSED_INPUT_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(3e-2, 3e-2, 7e-2, 0.997, 3e-2)
+    for backend in ("cute", "triton", "torch")
+}
+_DSV4_TP_SP_CP_FUSED_PARAM_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(3e-2, 3e-2, 7e-2, 0.997, 3e-2)
+    for backend in ("cute", "triton", "torch")
+}
+
+# Q/KV projections receive the fused sparse-attention dQ/dKV signal. The
+# isolated fused dQ and dKV primitives are gated at rtol=atol=5e-2; use the
+# same elementwise allowance here while retaining the substantially stricter
+# whole-tensor relative-L2, cosine, and norm constraints of the combined gate.
+_DSV4_TP_SP_CP_FUSED_QKV_PROJ_PARAM_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(5e-2, 5e-2, 7e-2, 0.997, 3e-2)
+    for backend in ("cute", "triton", "torch")
+}
+
+# attn_sink is a very small per-head tensor whose gradient directly sums sink
+# probabilities over sequence rows. Existing full-layer fused/native coverage
+# measures a ~0.984 cosine floor, so it needs a dedicated gate rather than
+# weakening every model parameter to that level.
+_DSV4_TP_SP_CP_FUSED_ATTN_SINK_GRAD_BY_CP_BACKEND = {
+    backend: _NumericalTolerance(2e-2, 2e-2, 2e-1, 0.98, 1e-1)
+    for backend in ("cute", "triton", "torch")
+}
+
+_DSV4_TP_SP_CP_LOSS_RTOL = 2e-3
+_DSV4_TP_SP_CP_LOSS_ATOL = 2e-3
+_DSV4_TP_SP_CP_FUSED_LOSS_BY_CP_BACKEND = {
+    backend: (2e-3, 2e-3) for backend in ("cute", "triton", "torch")
+}
 
 # CUDA graph with fused kernels may not be deterministic against eager, so this
 # path uses similarity plus rtol/atol gates. The unfused CUDA graph path is
@@ -287,6 +373,8 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     use_fused_kernels=True,
     apply_rope_fusion=True,
+    dsa_kernel_backend=None,
+    calculate_per_token_loss=False,
 ):
     """Build the DSv4 flash attention config used by CP tests."""
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
@@ -305,9 +393,9 @@ def _make_dsv4_cp_config(
         dsa_indexer_topk=shape["dsa_indexer_topk"],
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        calculate_per_token_loss=calculate_per_token_loss,
         context_parallel_size=context_parallel_size,
         cp_partition_mode="contiguous" if context_parallel_size > 1 else "zigzag",
-        sequence_packing_scheduler="dp_balanced" if context_parallel_size > 1 else None,
         csa_dense_mode=False,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
         layernorm_epsilon=1e-6,
@@ -315,12 +403,21 @@ def _make_dsv4_cp_config(
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
-        dsa_kernel_backend="cudnn" if use_fused_kernels else "none",
+        apply_dsa_kernel_fusion=use_fused_kernels,
+        dsa_kernel_backend=(dsa_kernel_backend if use_fused_kernels else None),
         apply_rope_fusion=apply_rope_fusion,
     )
 
 
-def _make_sbhd_cp_config(context_parallel_size):
+def _make_sbhd_cp_config(
+    context_parallel_size,
+    *,
+    apply_dsa_kernel_fusion=False,
+    dsa_kernel_backend=None,
+    dsa_indexer_loss_coeff=0.0,
+    apply_rope_fusion=False,
+    calculate_per_token_loss=False,
+):
     """Build the small unfused DSv4 configuration used by SBHD CP tests."""
     return _make_config(
         num_layers=3,
@@ -336,9 +433,12 @@ def _make_sbhd_cp_config(context_parallel_size):
         dsa_indexer_n_heads=4,
         dsa_indexer_head_dim=32,
         dsa_indexer_topk=8,
-        dsa_indexer_loss_coeff=0.0,
-        apply_dsa_kernel_fusion=False,
-        apply_rope_fusion=False,
+        dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+        dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=calculate_per_token_loss,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+        dsa_kernel_backend=dsa_kernel_backend,
+        apply_rope_fusion=apply_rope_fusion,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         normalization="RMSNorm",
@@ -769,19 +869,19 @@ def _tp_reference_slice(tensor, parameter, tp_rank, tp_size):
     return tensor.narrow(partition_dim, tp_rank * local_width, local_width)
 
 
-def _assert_tp_cp_parameter_grad_match(actual, expected, label):
-    """Check BF16 gradient parity without hiding a tensor-wide drift.
+def _assert_tp_sp_cp_numerical_match(actual, expected, label, tolerance):
+    """Check floating-point parity without hiding a tensor-wide drift.
 
     ``assert_close`` catches large individual outliers.  Relative L2, cosine
     similarity, and norm ratio additionally reject systematic scale or
-    direction errors that a BF16-sized absolute tolerance could otherwise
+    direction errors that an elementwise absolute tolerance could otherwise
     conceal around zero-valued elements.
     """
     assert actual.shape == expected.shape, (
         f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
     )
-    assert torch.isfinite(actual).all(), f"{label}: actual gradient has NaN or Inf"
-    assert torch.isfinite(expected).all(), f"{label}: reference gradient has NaN or Inf"
+    assert torch.isfinite(actual).all(), f"{label}: actual tensor has NaN or Inf"
+    assert torch.isfinite(expected).all(), f"{label}: reference tensor has NaN or Inf"
     if torch.equal(actual, expected):
         return
 
@@ -815,49 +915,100 @@ def _assert_tp_cp_parameter_grad_match(actual, expected, label):
         torch.testing.assert_close(
             actual,
             expected,
-            rtol=_DSV4_TP_CP_PARAM_GRAD_RTOL,
-            atol=_DSV4_TP_CP_PARAM_GRAD_ATOL,
+            rtol=tolerance.rtol,
+            atol=tolerance.atol,
         )
     except AssertionError:
         failures.append(
             "elementwise close failed at "
-            f"rtol={_DSV4_TP_CP_PARAM_GRAD_RTOL:.0e}, "
-            f"atol={_DSV4_TP_CP_PARAM_GRAD_ATOL:.0e}"
+            f"rtol={tolerance.rtol:.0e}, atol={tolerance.atol:.0e}"
         )
-    if relative_l2 >= _DSV4_TP_CP_PARAM_GRAD_RELATIVE_L2_LIMIT:
+    if relative_l2 >= tolerance.relative_l2:
         failures.append(
             f"relative_l2={relative_l2:.9e} >= "
-            f"{_DSV4_TP_CP_PARAM_GRAD_RELATIVE_L2_LIMIT:.0e}"
+            f"{tolerance.relative_l2:.0e}"
         )
-    if cosine_similarity <= _DSV4_TP_CP_PARAM_GRAD_COSINE_MIN:
+    if cosine_similarity <= tolerance.cosine_min:
         failures.append(
             f"cosine_similarity={cosine_similarity:.9f} <= "
-            f"{_DSV4_TP_CP_PARAM_GRAD_COSINE_MIN:.9f}"
+            f"{tolerance.cosine_min:.9f}"
         )
-    if abs(norm_ratio - 1.0) >= _DSV4_TP_CP_PARAM_GRAD_NORM_RATIO_TOL:
+    if abs(norm_ratio - 1.0) >= tolerance.norm_ratio:
         failures.append(
             f"abs(norm_ratio - 1)={abs(norm_ratio - 1.0):.9e} >= "
-            f"{_DSV4_TP_CP_PARAM_GRAD_NORM_RATIO_TOL:.0e}"
+            f"{tolerance.norm_ratio:.0e}"
         )
     if failures:
         raise AssertionError(f"{label}: {'; '.join(failures)}; {metrics}")
+
+
+def _cp_backend_tolerance(table, cp_backend):
+    assert cp_backend in table, f"Unknown DSv4 CP kernel backend: {cp_backend!r}"
+    return table[cp_backend]
+
+
+def _tp_sp_cp_parameter_grad_tolerance(name, fused, cp_backend):
+    if not fused:
+        if cp_backend != "torch":
+            return _cp_backend_tolerance(
+                _DSV4_TP_SP_CP_CP_FUSED_PARAM_GRAD_BY_CP_BACKEND, cp_backend
+            )
+        return _DSV4_TP_SP_CP_UNFUSED_PARAM_GRAD
+    if name.endswith("core_attention.attn_sink"):
+        return _cp_backend_tolerance(
+            _DSV4_TP_SP_CP_FUSED_ATTN_SINK_GRAD_BY_CP_BACKEND, cp_backend
+        )
+    if name.endswith(
+        ("linear_q_down_proj.weight", "linear_q_up_proj.weight", "linear_kv_proj.weight")
+    ):
+        return _cp_backend_tolerance(
+            _DSV4_TP_SP_CP_FUSED_QKV_PROJ_PARAM_GRAD_BY_CP_BACKEND, cp_backend
+        )
+    return _cp_backend_tolerance(
+        _DSV4_TP_SP_CP_FUSED_PARAM_GRAD_BY_CP_BACKEND, cp_backend
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 @pytest.mark.experimental
 @pytest.mark.parametrize(
-    "apply_rope_fusion", [True, False], ids=["rope_fused", "rope_unfused"]
+    (
+        "apply_dsa_kernel_fusion",
+        "apply_rope_fusion",
+        "layer_number",
+        "sequence_length",
+    ),
+    (
+        (False, False, 2, 64),
+        (False, True, 2, 64),
+        (True, True, 1, 64),
+        (True, True, 2, 64),
+        (True, True, 3, 1024),
+    ),
+    ids=(
+        "unfused-dsa-rope-ratio4",
+        "unfused-dsa-fused-rope-ratio4",
+        "fused-dsa-fused-rope-ratio0",
+        "fused-dsa-fused-rope-ratio4",
+        "fused-dsa-fused-rope-ratio128",
+    ),
 )
 @pytest.mark.parametrize(
     ("tp_size", "cp_size"),
     ((2, 2), (4, 2)),
     ids=("tp2-sp-cp2", "tp4-sp-cp2"),
 )
-def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
-    tp_size, cp_size, apply_rope_fusion, request
+def test_sbhd_tp_sp_cp_matches_tp1_cp1(
+    tp_size,
+    cp_size,
+    apply_dsa_kernel_fusion,
+    apply_rope_fusion,
+    layer_number,
+    sequence_length,
+    request,
 ):
-    """Unfused DSA TP+SP+CP must match a full-sequence TP1+CP1 teacher.
+    """DSv4 TP+SP+CP must match a full-sequence unfused TP1+CP1 teacher.
 
     CP owns a contiguous global sequence block.  SP then shards that block
     across the TP group.  The DSv4 TP exchange must reconstruct the complete
@@ -873,11 +1024,21 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
             f"{required_world_size}"
         )
 
-    sequence_length = 64
+    if apply_dsa_kernel_fusion:
+        try:
+            from megatron.plugin import dsa_kernel
+
+            triton_available = dsa_kernel._triton_backend_available()
+        except (ImportError, RuntimeError):
+            triton_available = False
+        if not triton_available:
+            pytest.skip(
+                "Fused DSv4 TP+SP+CP correctness requires the SM90+ Triton backend"
+            )
+
     batch_size = 2
-    layer_number = 2
     common_config = dict(
-        num_layers=2,
+        num_layers=3,
         hidden_size=128,
         num_attention_heads=8,
         v_head_dim=32,
@@ -885,7 +1046,7 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
         q_lora_rank=32,
         o_groups=8,
         o_lora_rank=32,
-        csa_compress_ratios=[0, 4],
+        csa_compress_ratios=[0, 4, 128],
         csa_window_size=8,
         dsa_indexer_n_heads=4,
         dsa_indexer_head_dim=32,
@@ -898,7 +1059,6 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
         # summed, and would otherwise introduce an exact cp_size multiplier.
         calculate_per_token_loss=True,
         csa_dense_mode=False,
-        apply_dsa_kernel_fusion=False,
         apply_rope_fusion=apply_rope_fusion,
         attention_dropout=0.0,
         hidden_dropout=0.0,
@@ -906,6 +1066,10 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
         qk_layernorm=True,
     )
     assert sequence_length % required_world_size == 0
+    compress_ratio = common_config["csa_compress_ratios"][layer_number - 1]
+    assert compress_ratio == 0 or (
+        compress_ratio * common_config["dsa_indexer_topk"] <= sequence_length
+    ), "The sparse-attention test case must contain enough rows for top-k selection"
 
     def cleanup():
         DSAIndexerLossAutoScaler.main_loss_backward_scale = None
@@ -927,6 +1091,7 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
     model_parallel_cuda_manual_seed(_SEED + 1200)
     config_ref = _make_config(
         **common_config,
+        apply_dsa_kernel_fusion=False,
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         context_parallel_size=1,
@@ -981,12 +1146,29 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
     model_parallel_cuda_manual_seed(_SEED + 1200)
     config_mixed = _make_config(
         **common_config,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
         tensor_model_parallel_size=tp_size,
         sequence_parallel=True,
         context_parallel_size=cp_size,
         cp_partition_mode="contiguous",
     )
     attn_mixed = _build_attention(config_mixed, layer_number, pg_mixed).cuda().train()
+    cp_kernel_backend = attn_mixed.core_attention._cp_kernel_bundle.backend
+    assert cp_kernel_backend in {
+        "cute",
+        "triton",
+        "torch",
+    }
+    if apply_dsa_kernel_fusion:
+        dsa_kernel_backend = attn_mixed.core_attention._dsa_kernel_bundle.backend
+        assert dsa_kernel_backend == "triton", (
+            "TP>1 must route the complete non-CP fused bundle to Triton"
+        )
+    else:
+        dsa_kernel_backend = "torch-native"
+    backend_label = (
+        f"non-CP backend={dsa_kernel_backend}, CP backend={cp_kernel_backend}"
+    )
     _load_tp1_parameters_into_tpn(
         attn_mixed, reference_parameters, tp_rank, tp_size
     )
@@ -995,8 +1177,26 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
     sp_rows = cp_rows // tp_size
     local_start = cp_rank * cp_rows + tp_rank * sp_rows
     local_slice = slice(local_start, local_start + sp_rows)
-    hidden_local = full_hidden_values[local_slice].detach().clone().requires_grad_(True)
-    output_grad_local = full_output_grad[local_slice]
+    # Exercise the same public SBHD contiguous slicer used by pretrain_gpt.py,
+    # then apply SP inside the CP-local block. This prevents the model parity
+    # test from passing with a broken or rank-changing training batch layout.
+    cp_batch = get_batch_on_this_cp_rank(
+        {
+            "hidden": full_hidden_values.transpose(0, 1),
+            "output_grad": full_output_grad.transpose(0, 1),
+        },
+        cp_group=pg_mixed.cp,
+        cp_partition_mode="contiguous",
+    )
+    sp_slice = slice(tp_rank * sp_rows, (tp_rank + 1) * sp_rows)
+    hidden_local = (
+        cp_batch["hidden"][:, sp_slice]
+        .transpose(0, 1)
+        .detach()
+        .clone()
+        .requires_grad_(True)
+    )
+    output_grad_local = cp_batch["output_grad"][:, sp_slice].transpose(0, 1).contiguous()
 
     csa_input_lengths = []
 
@@ -1056,21 +1256,66 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
         f"got {csa_input_lengths} from an SP-local input of {sp_rows} rows"
     )
     assert bias_mixed is None
-    torch.testing.assert_close(
+
+    output_tolerance = (
+        _cp_backend_tolerance(
+            _DSV4_TP_SP_CP_FUSED_OUTPUT_BY_CP_BACKEND, cp_kernel_backend
+        )
+        if apply_dsa_kernel_fusion
+        else (
+            _cp_backend_tolerance(
+                _DSV4_TP_SP_CP_CP_FUSED_OUTPUT_BY_CP_BACKEND, cp_kernel_backend
+            )
+            if cp_kernel_backend != "torch"
+            else _DSV4_TP_SP_CP_UNFUSED_OUTPUT
+        )
+    )
+    input_grad_tolerance = (
+        _cp_backend_tolerance(
+            _DSV4_TP_SP_CP_FUSED_INPUT_GRAD_BY_CP_BACKEND, cp_kernel_backend
+        )
+        if apply_dsa_kernel_fusion
+        else (
+            _cp_backend_tolerance(
+                _DSV4_TP_SP_CP_CP_FUSED_INPUT_GRAD_BY_CP_BACKEND,
+                cp_kernel_backend,
+            )
+            if cp_kernel_backend != "torch"
+            else _DSV4_TP_SP_CP_UNFUSED_INPUT_GRAD
+        )
+    )
+    if apply_dsa_kernel_fusion:
+        loss_rtol, loss_atol = _cp_backend_tolerance(
+            _DSV4_TP_SP_CP_FUSED_LOSS_BY_CP_BACKEND, cp_kernel_backend
+        )
+    else:
+        if cp_kernel_backend != "torch":
+            loss_rtol, loss_atol = _cp_backend_tolerance(
+                _DSV4_TP_SP_CP_CP_FUSED_LOSS_BY_CP_BACKEND,
+                cp_kernel_backend,
+            )
+        else:
+            loss_rtol = _DSV4_TP_SP_CP_LOSS_RTOL
+            loss_atol = _DSV4_TP_SP_CP_LOSS_ATOL
+    _assert_tp_sp_cp_numerical_match(
         output_mixed,
         output_ref[local_slice],
-        rtol=1e-2,
-        atol=1e-2,
-        msg="TP-SP-CP output differs from TP1-CP1",
+        f"TP-SP-CP output [{backend_label}]",
+        output_tolerance,
     )
-    torch.testing.assert_close(
+    _assert_tp_sp_cp_numerical_match(
         hidden_local.grad,
         input_grad_ref[local_slice],
-        rtol=2e-2,
-        atol=2e-2,
-        msg="TP-SP-CP input gradient differs from TP1-CP1",
+        f"TP-SP-CP input gradient [{backend_label}]",
+        input_grad_tolerance,
     )
-    torch.testing.assert_close(loss_mixed, loss_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(
+        loss_mixed,
+        loss_ref,
+        rtol=loss_rtol,
+        atol=loss_atol,
+        msg=f"TP-SP-CP loss differs [{backend_label}]",
+    )
 
     assert mixed_parameters.keys() == reference_parameters.keys()
     for name, parameter in mixed_parameters.items():
@@ -1085,10 +1330,13 @@ def test_sbhd_unfused_tp_sp_cp_matches_tp1_cp1(
         grad_ref_local = _tp_reference_slice(
             expected_grad, parameter, tp_rank, tp_size
         )
-        _assert_tp_cp_parameter_grad_match(
+        _assert_tp_sp_cp_numerical_match(
             reduced_mixed_grads[name],
             grad_ref_local,
-            f"TP-SP-CP parameter gradient {name}",
+            f"TP-SP-CP parameter gradient {name} [{backend_label}]",
+            _tp_sp_cp_parameter_grad_tolerance(
+                name, apply_dsa_kernel_fusion, cp_kernel_backend
+            ),
         )
 
 
