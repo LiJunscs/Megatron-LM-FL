@@ -21,6 +21,7 @@ from .mappings import (
     all_to_all,
     all_to_all_hp2sp,
     all_to_all_sp2hp,
+    coalesced_async_gather_from_sequence_parallel_region,
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -62,6 +63,7 @@ __all__ = [
     "linear_with_grad_accumulation_and_async_allreduce",
     # mappings.py
     "copy_to_tensor_model_parallel_region",
+    "coalesced_async_gather_from_sequence_parallel_region",
     "gather_from_tensor_model_parallel_region",
     "gather_from_sequence_parallel_region",
     "reduce_from_tensor_model_parallel_region",

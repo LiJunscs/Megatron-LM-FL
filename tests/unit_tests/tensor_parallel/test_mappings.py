@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pytest
 import torch
 
@@ -164,6 +166,135 @@ def test_GatherFromSequenceParallelRegion():
     output_data = mappings._GatherFromSequenceParallelRegion.backward(Ctx(), input_data)
     expected_output = torch.ones((1, 4)).cuda() * 4 * int(Utils.rank % 4)
     assert torch.equal(output_data[0], expected_output)
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_AsyncGatherFromSequenceParallelRegion():
+    Utils.initialize_model_parallel(4, 1)
+    group_rank = Utils.rank % 4
+    input_data = (torch.ones((4, 2), device="cuda") * group_rank)[:, 0]
+    input_data.requires_grad_(True)
+    assert not input_data.is_contiguous()
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    handle = mappings.async_gather_from_sequence_parallel_region(input_data, group=tp_group)
+    assert handle._input_buffer is not None
+    output_data = handle.wait()
+    expected_output = torch.concat(
+        (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
+    ).cuda()
+    assert torch.equal(output_data, expected_output)
+    assert handle.wait() is output_data
+    assert handle.work is None
+    assert handle._input_buffer is None
+
+    output_data.sum().backward()
+    assert torch.equal(input_data.grad, torch.ones_like(input_data) * 4)
+
+    split_grad_input = (torch.ones(4, device="cuda") * Utils.rank).requires_grad_(True)
+    split_grad_output = mappings.async_gather_from_sequence_parallel_region(
+        split_grad_input, tensor_parallel_output_grad=False, group=tp_group
+    ).wait()
+    split_grad_output.sum().backward()
+    assert torch.equal(split_grad_input.grad, torch.ones_like(split_grad_input))
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_CoalescedAsyncGatherFromSequenceParallelRegionForwardBackward():
+    Utils.initialize_model_parallel(4, 1)
+    group_rank = Utils.rank % 4
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    reduce_scatter_input = (
+        torch.ones((4, 2), device="cuda") * group_rank
+    )[:, 0].requires_grad_(True)
+    split_input = torch.full(
+        (4,), float(group_rank + 10), device="cuda", requires_grad=True
+    )
+    assert not reduce_scatter_input.is_contiguous()
+
+    handle = mappings.coalesced_async_gather_from_sequence_parallel_region(
+        (reduce_scatter_input, split_input),
+        (True, False),
+        group=tp_group,
+    )
+    assert handle.work is not None
+    reduce_scatter_output, split_output = handle.wait()
+    expected_reduce_scatter_output = torch.concat(
+        tuple(torch.ones(4, device="cuda") * rank for rank in range(4))
+    )
+    expected_split_output = torch.concat(
+        tuple(torch.ones(4, device="cuda") * (rank + 10) for rank in range(4))
+    )
+    assert torch.equal(reduce_scatter_output, expected_reduce_scatter_output)
+    assert torch.equal(split_output, expected_split_output)
+    repeated_outputs = handle.wait()
+    assert repeated_outputs[0] is reduce_scatter_output
+    assert repeated_outputs[1] is split_output
+    assert handle.work is None
+    assert all(child._input_buffer is None for child in handle._handles)
+
+    # Backward must preserve each gather's independent contract: the first
+    # input is reduce-scattered across four TP ranks, while the second is only
+    # split back to this rank's sequence shard.
+    (reduce_scatter_output.sum() + split_output.sum()).backward()
+    assert torch.equal(
+        reduce_scatter_input.grad, torch.ones_like(reduce_scatter_input) * 4
+    )
+    assert torch.equal(split_input.grad, torch.ones_like(split_input))
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_AsyncReduceScatterAlongFirstDim():
+    Utils.initialize_model_parallel(4, 1)
+    group_rank = Utils.rank % 4
+    input_data = (torch.ones((4, 16), device="cuda") * group_rank).t()
+    assert not input_data.is_contiguous()
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    handle = mappings.async_reduce_scatter_along_first_dim(input_data, group=tp_group)
+    assert handle._input_buffer is not None
+    output_data = handle.wait()
+    assert torch.equal(output_data, torch.full_like(output_data, 6))
+    assert handle.wait() is output_data
+    assert handle.work is None
+    assert handle._input_buffer is None
+
+    with pytest.raises(AssertionError, match="First dimension.*divisible"):
+        mappings.async_reduce_scatter_along_first_dim(torch.ones(15, device="cuda"), group=tp_group)
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_AsyncSequenceParallelCollectivesGroupSizeOne():
+    Utils.initialize_model_parallel(1, 1)
+    input_data = torch.arange(8, dtype=torch.float32, device="cuda").reshape(4, 2)[:, 0]
+    input_data.requires_grad_(True)
+    coalesced_input = input_data.detach().clone().requires_grad_(True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+
+    gather_handle = mappings.async_gather_from_sequence_parallel_region(input_data, group=tp_group)
+    reduce_scatter_handle = mappings.async_reduce_scatter_along_first_dim(
+        input_data, group=tp_group
+    )
+    coalesced_gather_handle = mappings.coalesced_async_gather_from_sequence_parallel_region(
+        (coalesced_input,), (True,), group=tp_group
+    )
+    assert gather_handle.wait() is input_data
+    assert reduce_scatter_handle.wait() is input_data
+    coalesced_output = coalesced_gather_handle.wait()[0]
+    assert coalesced_output is coalesced_input
+    assert gather_handle.work is None
+    assert reduce_scatter_handle.work is None
+    assert coalesced_gather_handle.work is None
+
+    gather_handle.wait().sum().backward()
+    assert torch.equal(input_data.grad, torch.ones_like(input_data))
+    coalesced_output.sum().backward()
+    assert torch.equal(coalesced_input.grad, torch.ones_like(coalesced_input))
     Utils.destroy_model_parallel()
 
 
