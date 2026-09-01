@@ -2002,7 +2002,7 @@ def is_submodule(module, parent_module, strict=True):
 
 
 def get_batch_on_this_cp_rank(
-    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None
+    batch: Dict[str, Any], cp_group: Optional[torch.distributed.ProcessGroup] = None, cp_partition_mode: str = "zigzag"
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
@@ -2012,6 +2012,7 @@ def get_batch_on_this_cp_rank(
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel process group.
             If provided, uses this group's size and rank. Otherwise, falls back to
             the current context-parallel settings from parallel_state.
+        cp_partition_mode (str): The mode of context-parallel partitioning. Default is "zigzag".
     """
 
     # With causal masking, each token only attends to its prior tokens. Simply split
@@ -2028,19 +2029,24 @@ def get_batch_on_this_cp_rank(
         cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
 
+    assert cp_partition_mode in ["zigzag", "contiguous"], f"Invalid cp_partition_mode: {cp_partition_mode}"
     if cp_size > 1:
+        num_chunk = 2 * cp_size if cp_partition_mode == "zigzag" else cp_size
         for key, val in batch.items():
             if val is not None:
                 seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
+                    num_chunk,
+                    val.shape[seq_dim] // num_chunk,
                     *val.shape[(seq_dim + 1) :],
                 )
-                index = torch.zeros(2, dtype=torch.int64, device=val.device)
-                index[0].fill_(cp_rank)
-                index[1].fill_(2 * cp_size - cp_rank - 1)
+                if cp_partition_mode == "contiguous":
+                    index = torch.tensor([cp_rank], dtype=torch.int64, device=val.device)
+                else:
+                    index = torch.zeros(2, dtype=torch.int64, device=val.device)
+                    index[0].fill_(cp_rank)
+                    index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
                 batch[key] = val

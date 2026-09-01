@@ -49,6 +49,84 @@ def test_divide_improperly():
         util.divide(4, 5)
 
 
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_get_batch_on_this_cp_rank_contiguous_preserves_batch_ranks(cp_rank):
+    """SBHD training batches must retain their original ranks after contiguous CP slicing."""
+    batch_size, sequence_length = 2, 16
+    sequence = torch.arange(sequence_length)
+    batch = {
+        "tokens": sequence.repeat(batch_size, 1),
+        "labels": (sequence + 100).repeat(batch_size, 1),
+        "loss_mask": torch.ones(batch_size, sequence_length),
+        "position_ids": sequence.repeat(batch_size, 1),
+        "attention_mask": torch.arange(sequence_length)
+        .view(1, 1, sequence_length, 1)
+        .expand(batch_size, 1, sequence_length, sequence_length)
+        .clone(),
+        "cu_seqlens": None,
+    }
+
+    with (
+        patch.object(util.parallel_state, "get_context_parallel_world_size", return_value=2),
+        patch.object(util.parallel_state, "get_context_parallel_rank", return_value=cp_rank),
+    ):
+        result = util.get_batch_on_this_cp_rank(
+            batch, cp_partition_mode="contiguous"
+        )
+
+    start = cp_rank * (sequence_length // 2)
+    expected_positions = sequence[start : start + sequence_length // 2]
+    assert result["tokens"].shape == (batch_size, sequence_length // 2)
+    assert result["attention_mask"].shape == (
+        batch_size,
+        1,
+        sequence_length // 2,
+        sequence_length,
+    )
+    torch.testing.assert_close(result["tokens"][0], expected_positions)
+    torch.testing.assert_close(result["labels"][0], expected_positions + 100)
+    torch.testing.assert_close(result["position_ids"][0], expected_positions)
+    torch.testing.assert_close(
+        result["attention_mask"][0, 0, :, 0], expected_positions
+    )
+    assert result["cu_seqlens"] is None
+
+
+def test_get_batch_on_this_cp_rank_keeps_default_zigzag_contract():
+    sequence = torch.arange(16).view(1, 16)
+    with (
+        patch.object(util.parallel_state, "get_context_parallel_world_size", return_value=2),
+        patch.object(util.parallel_state, "get_context_parallel_rank", return_value=1),
+    ):
+        result = util.get_batch_on_this_cp_rank({"tokens": sequence})
+
+    torch.testing.assert_close(result["tokens"], torch.arange(4, 12).view(1, 8))
+
+
+def test_get_batch_on_this_cp_rank_rejects_invalid_partition_mode():
+    with (
+        patch.object(util.parallel_state, "get_context_parallel_world_size", return_value=1),
+        patch.object(util.parallel_state, "get_context_parallel_rank", return_value=0),
+        pytest.raises(AssertionError, match="Invalid cp_partition_mode"),
+    ):
+        util.get_batch_on_this_cp_rank(
+            {"tokens": torch.arange(8).view(1, 8)},
+            cp_partition_mode="interleaved",
+        )
+
+
+def test_get_batch_on_this_cp_rank_contiguous_uses_native_shape_error():
+    with (
+        patch.object(util.parallel_state, "get_context_parallel_world_size", return_value=2),
+        patch.object(util.parallel_state, "get_context_parallel_rank", return_value=0),
+        pytest.raises(RuntimeError),
+    ):
+        util.get_batch_on_this_cp_rank(
+            {"tokens": torch.arange(15).view(1, 15)},
+            cp_partition_mode="contiguous",
+        )
+
+
 def test_experimental_cls_init():
     with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
         # Check that initialization works

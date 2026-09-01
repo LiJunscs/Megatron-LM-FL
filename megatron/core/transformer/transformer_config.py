@@ -426,14 +426,20 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_dsa_kernel_fusion: bool = False
     ##### FlagScale Begin #####
-    """If True, use fused DSA sparse-attention kernels. ``auto`` selects FlashMLA +
-    cuDNN DSA on SM100+ and Triton on SM90; an explicit Triton request is also
-    supported on SM100+. When False, use the unfused PyTorch implementation."""
+    """If True, require one complete non-CP fused DSA backend bundle. ``auto``
+    probes complete CUDA then Triton bundles; it never fills missing operations
+    from the framework PyTorch backend. When False, the non-CP path uses the
+    complete PyTorch native implementation. CP kernels are selected separately."""
     ##### FlagScale End #####
 
-    dsv4_kernel_backend: Optional[Literal["auto", "torch", "triton", "cuda"]] = None
-    """DSv4 fused-kernel backend. ``None`` allows ``DSV4_KERNEL_BACKEND`` to
-    override the default ``auto`` selection; explicit backends fail fast."""
+    dsa_kernel_backend: Optional[Literal["auto", "torch", "triton", "cuda"]] = None
+    """DSA non-CP fused-kernel bundle. ``None`` allows
+    ``DSSA_KERNEL_BACKEND`` to override the default ``auto`` selection.
+    ``torch`` is invalid when fusion is enabled; explicit fused backends are
+    validated without exploration. This setting does not control CP kernels."""
+
+    # CP kernel selection is deliberately not configurable. When CP is active,
+    # it atomically probes complete CuTe, Triton, then PyTorch-native bundles.
 
     ####################
     # linear attention
@@ -1376,15 +1382,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.cp_partition_mode not in ("zigzag", "contiguous"):
                 raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
-            if self.cp_partition_mode == "contiguous" and (
-                self.context_parallel_size > 1 or self.dynamic_context_parallel
-            ):
-                if self.sequence_packing_scheduler is None:
-                    raise ValueError(
-                        "cp_partition_mode='contiguous' with context parallelism requires THD "
-                        "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
-                    )
-
             if self.context_parallel_size > 1:
                 if (
                     self.experimental_attention_variant == "dsv4_hybrid"
@@ -1410,13 +1407,13 @@ class TransformerConfig(ModelParallelConfig):
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
 
-                requested_dsa_backend = self.dsv4_kernel_backend
+                requested_dsa_backend = self.dsa_kernel_backend
                 if requested_dsa_backend is None:
                     requested_dsa_backend = os.environ.get("DSV4_KERNEL_BACKEND", "auto")
                 requested_dsa_backend = str(requested_dsa_backend).lower()
                 if requested_dsa_backend not in {"auto", "torch", "triton", "cuda"}:
                     raise ValueError(
-                        f"Unsupported dsv4_kernel_backend: {requested_dsa_backend!r}"
+                        f"Unsupported dsa_kernel_backend: {requested_dsa_backend!r}"
                     )
                 if requested_dsa_backend == "torch":
                     raise ValueError(
@@ -1427,13 +1424,13 @@ class TransformerConfig(ModelParallelConfig):
 
                 resolved_family = requested_dsa_backend
                 if resolved_family == "auto":
-                    # Dependency and per-operation fallback are owned by the
-                    # dispatcher. Do not reject auto before it can try Triton.
+                    # Complete-bundle exploration is owned by the dispatcher.
+                    # Do not reject auto before it can try CUDA then Triton.
                     pass
                 elif resolved_family == "cuda":
                     if sm[0] < 10:
                         raise ValueError(
-                            "dsv4_kernel_backend='cuda' requires SM100+ for the "
+                            "dsa_kernel_backend='cuda' requires SM100+ for the "
                             "FlashMLA + cuDNN DSA backend."
                         )
                     # SM100+ (Blackwell): require FlashMLA + cuDNN DSA
