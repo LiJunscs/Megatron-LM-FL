@@ -162,6 +162,80 @@ def _sparse_teacher_total_seq_kernel(
 
 
 @triton.jit
+def _non_compressed_lse_total_seq_kernel(
+    Q_ptr,
+    K_ptr,
+    IDX_ptr,
+    SINK_ptr,
+    OUT_ptr,
+    softmax_scale,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kd,
+    stride_it,
+    stride_ik,
+    stride_ot,
+    stride_oh,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Compute window-plus-sink LSE in absolute total-sequence layout."""
+    row = tl.program_id(0)
+    head_start = tl.program_id(1) * 16
+    head_lane = head_start + tl.arange(0, 16)
+    d_lane = tl.arange(0, BLOCK_D)
+    head_mask = head_lane < HEADS
+    d_mask = d_lane < DIM
+    q_tile = tl.load(
+        Q_ptr
+        + row * stride_qt
+        + head_lane[:, None] * stride_qh
+        + d_lane[None, :] * stride_qd,
+        mask=head_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.bfloat16)
+
+    running_max = tl.load(SINK_ptr + head_lane, mask=head_mask, other=float("-inf"))
+    running_sum = tl.where(head_mask, 1.0, 0.0)
+    for k_start in tl.static_range(0, WINDOW, BLOCK_K):
+        k_lane = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_lane < WINDOW
+        selected = tl.load(
+            IDX_ptr + row * stride_it + k_lane * stride_ik,
+            mask=k_mask,
+            other=-1,
+        )
+        valid = k_mask & (selected >= 0)
+        safe_selected = tl.where(valid, selected, 0)
+        k_tile = tl.load(
+            K_ptr
+            + safe_selected[:, None] * stride_kt
+            + d_lane[None, :] * stride_kd,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * softmax_scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(running_max, tile_max)
+        running_sum = running_sum * tl.exp(running_max - new_max)
+        running_sum += tl.sum(tl.exp(scores - new_max[:, None]), axis=1)
+        running_max = new_max
+
+    lse = running_max + tl.log(running_sum)
+    tl.store(
+        OUT_ptr + row * stride_ot + head_lane * stride_oh,
+        lse,
+        mask=head_mask,
+    )
+
+
+@triton.jit
 def _student_logits_tile(
     Q_ptr,
     K_ptr,
@@ -491,6 +565,45 @@ def sparse_teacher_total_seq(
         num_stages=2,
     )
     return head_sum
+
+
+def non_compressed_lse_total_seq(
+    q_attn: Tensor,
+    k_attn: Tensor,
+    window_indices: Tensor,
+    attn_sink: Tensor,
+    softmax_scale: float,
+) -> Tensor:
+    """Return window-plus-sink LSE using absolute flattened KV indices."""
+    total_q, heads, dim = q_attn.shape
+    window = window_indices.shape[-1]
+    output = torch.empty(total_q, heads, dtype=torch.float32, device=q_attn.device)
+    grid = (total_q, triton.cdiv(heads, 16))
+    _non_compressed_lse_total_seq_kernel[grid](
+        q_attn,
+        k_attn,
+        window_indices,
+        attn_sink,
+        output,
+        softmax_scale,
+        q_attn.stride(0),
+        q_attn.stride(1),
+        q_attn.stride(2),
+        k_attn.stride(0),
+        k_attn.stride(1),
+        window_indices.stride(0),
+        window_indices.stride(1),
+        output.stride(0),
+        output.stride(1),
+        HEADS=heads,
+        DIM=dim,
+        WINDOW=window,
+        BLOCK_D=triton.next_power_of_2(dim),
+        BLOCK_K=_BLOCK_TOPK,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output
 
 
 def sparse_student_total_seq(

@@ -250,7 +250,7 @@ def dense_indexer_score_recompute(
 def dense_attn_score_recompute(
     q_attn: Tensor,
     k_attn: Tensor,
-    lse: "Tensor | None",
+    non_compressed_lse: "Tensor | None",
     softmax_scale: float,
     qhead_per_kv_head: int = 1,
     ratio: int = 1,
@@ -263,12 +263,10 @@ def dense_attn_score_recompute(
     Args:
         q_attn: ``(B, S_q, H_q, D)`` bf16.
         k_attn: ``(B, S_k, D)`` bf16.
-        lse:    ``(B, S_q, H_q)`` fp32, or ``None``.
-                When ``None``, a self-contained softmax over compressed keys is
-                used instead of ``exp(score - external_lse)``.  This matches the
-                unfused reference (``FusedDSAIndexerLoss``) where attention probs
-                are computed over compressed keys only, without window tokens in
-                the denominator.
+        non_compressed_lse: ``(B, S_q, H_q)`` FP32 window-plus-sink LSE.
+            When provided, it is combined with the causally valid compressed
+            logits to form the full teacher denominator. ``None`` preserves the
+            legacy compressed-only behavior.
         softmax_scale: attention scale.
         qhead_per_kv_head: MQA ratio.
         ratio: compression ratio for causal mask.
@@ -299,10 +297,12 @@ def dense_attn_score_recompute(
         # Apply ratio causal mask to scores (before exp/softmax)
         scores_block = scores_block + mask_block.unsqueeze(0).unsqueeze(2)
 
-        if lse is not None:
-            # Use external LSE (includes window tokens in denominator)
-            lse_block = lse[:, q_start:q_end]  # (B, block, H_q)
-            attn_probs_block = torch.exp(scores_block - lse_block.unsqueeze(-1))
+        if non_compressed_lse is not None:
+            compressed_lse = torch.logsumexp(scores_block, dim=-1)
+            full_lse = torch.logaddexp(
+                non_compressed_lse[:, q_start:q_end].float(), compressed_lse
+            )
+            attn_probs_block = torch.exp(scores_block - full_lse.unsqueeze(-1))
         else:
             # Self-contained softmax over compressed keys only (no window tokens)
             attn_probs_block = torch.softmax(scores_block, dim=-1)  # (B, block, H_q, S_k)
@@ -971,7 +971,7 @@ def fused_dense_indexer_loss_and_backward(
     topk_indices_cmp: Tensor,
     q_attn_bshd: Tensor,
     k_attn_bsd: Tensor,
-    lse_bsh: Tensor,  # noqa: ARG001 — kept for API compat; dense uses self-contained softmax
+    non_compressed_lse_bsh: Tensor,
     indexer_softmax_scale: float,  # noqa: ARG001 — scale is embedded in w_bsh; kept for API compat
     softmax_scale: float,
     loss_coeff: float,
@@ -999,7 +999,7 @@ def fused_dense_indexer_loss_and_backward(
         topk_indices_cmp: ``(B, S_q, topk)`` int32 — for row validity.
         q_attn_bshd: ``(B, S_q, np, D_attn)`` bf16 — attention queries.
         k_attn_bsd: ``(B, S_k, D_attn)`` bf16 — attention keys (compressed range).
-        lse_bsh: ``(B, S_q, np)`` fp32 — LSE from attention forward.
+        non_compressed_lse_bsh: ``(B, S_q, np)`` FP32 window-plus-sink LSE.
         indexer_softmax_scale: scale for indexer scores.
         softmax_scale: scale for attention scores.
         loss_coeff: KL loss coefficient.
@@ -1067,7 +1067,11 @@ def fused_dense_indexer_loss_and_backward(
         attn_per_head = attn_per_head.masked_fill(
             ~mask_block.unsqueeze(0).unsqueeze(2), float("-inf")
         )
-        attn_probs = torch.softmax(attn_per_head, dim=-1)
+        compressed_lse = torch.logsumexp(attn_per_head, dim=-1)
+        full_lse = torch.logaddexp(
+            non_compressed_lse_bsh[:, q_start:q_end].float(), compressed_lse
+        )
+        attn_probs = torch.exp(attn_per_head - full_lse.unsqueeze(-1))
         attn_probs = attn_probs.masked_fill(
             ~mask_block.unsqueeze(0).unsqueeze(2), 0.0
         )

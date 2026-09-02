@@ -308,6 +308,60 @@ def unfused_compressed_sparse_attn(
     return output
 
 
+@torch.no_grad()
+def _compute_unfused_csa_non_compressed_lse(
+    query: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    softmax_scale: float,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Compute detached window-plus-sink LSE for the indexer teacher.
+
+    The canonical result is ``[batch, heads, seqlen_q]``. Window logits
+    contribute only to the teacher denominator; they never become compressed
+    target columns.
+    """
+    if query.ndim == 4:
+        seqlen_q, batch_size, num_heads, head_dim = query.shape
+        n_kv = kv_full.shape[0]
+        q_flat = query.detach().permute(1, 0, 2, 3).reshape(-1, num_heads, head_dim)
+        kv_flat = kv_full.detach().permute(1, 0, 2).reshape(-1, head_dim)
+        batch_offsets = (
+            torch.arange(batch_size, device=query.device, dtype=torch.int64) * n_kv
+        ).view(batch_size, 1, 1)
+        window_i64 = window_indices.to(torch.int64)
+        global_indices = torch.where(
+            window_i64 >= 0, window_i64 + batch_offsets, window_i64
+        ).reshape(batch_size * seqlen_q, -1)
+    else:
+        total_q, num_heads, head_dim = query.shape
+        batch_size, seqlen_q = 1, total_q
+        q_flat = query.detach()
+        kv_flat = kv_full.detach()
+        global_indices = window_indices.to(torch.int64)
+
+    sink = attn_sink.detach().float().view(1, num_heads)
+    chunks = []
+    for start in range(0, q_flat.shape[0], chunk_size):
+        end = min(start + chunk_size, q_flat.shape[0])
+        indices = global_indices[start:end]
+        gathered = kv_flat.index_select(0, indices.clamp_min(0).reshape(-1)).reshape(
+            end - start, indices.shape[-1], head_dim
+        )
+        logits = torch.einsum(
+            "rhd,rkd->rhk", q_flat[start:end].float(), gathered.float()
+        )
+        logits = (logits * softmax_scale).masked_fill(
+            (indices < 0).unsqueeze(1), float("-inf")
+        )
+        chunks.append(torch.logaddexp(torch.logsumexp(logits, dim=-1), sink))
+
+    lse_flat = torch.cat(chunks, dim=0)
+    return lse_flat.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Compressor
 # ---------------------------------------------------------------------------
@@ -918,6 +972,13 @@ class CompressedSparseAttention(MegatronModule):
                     # weights-scaling trick so the effective weights match
                     # the pre-scale-split behaviour.
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
+                    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+                        query,
+                        kv_full[:offset],
+                        self.attn_sink,
+                        window_idxs,
+                        self.softmax_scale,
+                    )
                     topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_indexer,
                         weights_for_unfused,
@@ -931,6 +992,7 @@ class CompressedSparseAttention(MegatronModule):
                         getattr(self.config, "dsa_indexer_use_sparse_loss", True),
                         self.indexer.pg_collection,
                         self.config.calculate_per_token_loss,
+                        non_compressed_lse,
                     )
                     if indexer_loss_coeff > 0:
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1415,6 +1477,28 @@ class CompressedSparseAttention(MegatronModule):
                         key_for_loss = compressed_kv_seq_major.unsqueeze(2).expand(
                             -1, -1, query.shape[2], -1
                         )
+                        non_compressed_kv = torch.cat((boundary_kv, kv_local), dim=0)
+                        window_for_loss, _, _ = self._build_attention_indices(
+                            cu_seqlens,
+                            global_start,
+                            l_local,
+                            d_window,
+                            self.window_size,
+                            ratio,
+                            0,
+                            cu_seqlens_compressed=cu_seqlens_compressed,
+                            seq_to_rank_row=seq_to_rank_row,
+                        )
+                        window_for_loss = window_for_loss.unsqueeze(0).expand(
+                            batch_size, -1, -1
+                        )
+                        non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+                            query,
+                            non_compressed_kv,
+                            self.attn_sink,
+                            window_for_loss,
+                            self.softmax_scale,
+                        )
                         compressed_topk, indexer_loss = FusedDSAIndexerLoss.apply(
                             q_indexer_cp,
                             weights_indexer_cp.float() * indexer.softmax_scale,
@@ -1428,6 +1512,7 @@ class CompressedSparseAttention(MegatronModule):
                             self.config.dsa_indexer_use_sparse_loss,
                             indexer.pg_collection,
                             self.config.calculate_per_token_loss,
+                            non_compressed_lse,
                         )
                     else:
                         _, compressed_topk = fused_qk_topk_naive(

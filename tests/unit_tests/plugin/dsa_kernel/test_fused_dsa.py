@@ -3701,6 +3701,17 @@ class TestIndexerLossConsistency:
         query_det = inputs["query"].clone().detach()
         kv_compressed = inputs["kv_full"][kv_offset:kv_offset + n_comp]
         key_for_loss = kv_compressed.unsqueeze(2).expand(-1, -1, np_, -1).detach()
+        from megatron.core.transformer.experimental_attention_variant.csa import (
+            _compute_unfused_csa_non_compressed_lse,
+        )
+
+        non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+            query_det,
+            inputs["kv_full"][:kv_offset],
+            inputs["attn_sink"],
+            inputs["window_idxs"],
+            inputs["softmax_scale"],
+        )
 
         # Build causal mask [b, sq, n_comp]
         causal_mask = (
@@ -3736,6 +3747,7 @@ class TestIndexerLossConsistency:
                 sparse_loss,
                 pg_collection,
                 False,  # calculate_per_token_loss
+                non_compressed_lse,
             )
 
         return loss.item()

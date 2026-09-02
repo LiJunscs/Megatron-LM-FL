@@ -627,6 +627,54 @@ def _compute_dense_attn_score(
     return result["out"], result["denom"]
 
 
+def _compute_dense_teacher_full_lse(
+    q_attn_bshd: Tensor,
+    k_attn_bsd: Tensor,
+    k_full_bsd: Tensor,
+    window_idxs: Tensor,
+    attn_sink: Tensor,
+    softmax_scale: float,
+    ratio: int,
+) -> Tensor:
+    """Build all-compressed plus window/sink LSE in bounded Q tiles."""
+    batch, seqlen_q, heads, _ = q_attn_bshd.shape
+    compressed = k_attn_bsd.shape[1]
+    causal_valid = (
+        torch.arange(compressed, device=q_attn_bshd.device).unsqueeze(0)
+        < torch.arange(1, seqlen_q + 1, device=q_attn_bshd.device).unsqueeze(1)
+        // ratio
+    )
+    output = torch.empty(
+        batch, seqlen_q, heads, dtype=torch.float32, device=q_attn_bshd.device
+    )
+    batch_idx = torch.arange(batch, device=q_attn_bshd.device)[:, None, None]
+    sink = attn_sink.float().view(1, 1, heads)
+    for start in range(0, seqlen_q, 512):
+        end = min(start + 512, seqlen_q)
+        q_block = q_attn_bshd[:, start:end].float()
+        window = window_idxs[:, start:end]
+        window_k = k_full_bsd.float()[batch_idx, window.long().clamp_min(0)]
+        window_scores = torch.einsum("bqhd,bqkd->bqhk", q_block, window_k)
+        window_scores = (window_scores * softmax_scale).masked_fill(
+            (window < 0).unsqueeze(2), float("-inf")
+        )
+        non_compressed_lse = torch.logaddexp(
+            torch.logsumexp(window_scores, dim=-1), sink
+        )
+
+        compressed_scores = torch.einsum(
+            "bqhd,bkd->bqhk", q_block, k_attn_bsd.float()
+        ) * softmax_scale
+        compressed_scores = compressed_scores.masked_fill(
+            ~causal_valid[start:end].view(1, end - start, 1, compressed),
+            float("-inf"),
+        )
+        output[:, start:end] = torch.logaddexp(
+            non_compressed_lse, torch.logsumexp(compressed_scores, dim=-1)
+        )
+    return output
+
+
 def _kl_loss_from_dense_scores(
     attn_score: Tensor,
     attn_l1norm: Tensor,
@@ -753,7 +801,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # ---- 4. FlashMLA forward (non-compact, indexer_topk > 0). ---------
         q_flat = query.reshape(sq * b, np_, d)
         kv_flat = kv_full.reshape(skv * b, d)
-        out_flat, lse, lse_indexer = _dsa_fwd_flash_mla(
+        out_flat, lse, _lse_indexer = _dsa_fwd_flash_mla(
             q_flat,
             kv_flat,
             global_idxs,
@@ -767,7 +815,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # Attention-path tensors (detached — loss is not differentiable through them).
         q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
         k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
-        lse_indexer_bsqh = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
+        full_lse_bsqh = lse.reshape(sq, b, np_).permute(1, 0, 2)
 
         if sparse_loss:
             # Derive predict: gather topk scores from indexer_scores → softmax.
@@ -781,7 +829,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             target = _compute_attn_target(
                 q_attn_bshd,
                 k_attn_compressed_bsd,
-                lse_indexer_bsqh,
+                full_lse_bsqh,
                 topk_indices_cmp,
                 softmax_scale,
                 qhead_per_kv_head=np_,
@@ -797,11 +845,20 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             # Dense: use full indexer_scores directly + logsumexp.
             index_score = indexer_scores  # (b, sq, n_comp) fp32
             index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
+            dense_teacher_lse = _compute_dense_teacher_full_lse(
+                q_attn_bshd,
+                k_attn_compressed_bsd,
+                kv_full.detach().permute(1, 0, 2),
+                window_idxs,
+                attn_sink,
+                softmax_scale,
+                ratio,
+            )
 
             attn_score, attn_l1norm = _compute_dense_attn_score(
                 q_attn_bshd,
                 k_attn_compressed_bsd.unsqueeze(2),
-                lse_indexer_bsqh,
+                dense_teacher_lse,
                 qhead_per_kv_head=np_,
                 softmax_scale=softmax_scale,
                 ratio=ratio,

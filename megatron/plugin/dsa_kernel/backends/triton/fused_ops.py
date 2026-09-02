@@ -49,6 +49,7 @@ from .indexer import (
     ##### FlagScale End #####
 )
 from .indexer_sparse_kernels import (
+    non_compressed_lse_total_seq,
     pack_sbhd_sparse_indices,
     sparse_kl_total_seq,
     sparse_student_total_seq,
@@ -809,6 +810,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # .contiguous() omitted: downstream einsum/indexing handle strided tensors.
         q_attn_bshd = query.permute(1, 0, 2, 3)  # (b, sq, np, d)
         full_lse_bsh = lse.reshape(sq, b, np_).permute(1, 0, 2) if sparse_loss else None
+        non_compressed_lse_bsh = None
+        if not sparse_loss:
+            non_compressed_lse_bsh = non_compressed_lse_total_seq(
+                q_flat,
+                kv_flat[:, :d],
+                attention_indices_flat[:, effective_topk:],
+                attn_sink,
+                softmax_scale,
+            ).reshape(sq, b, np_).permute(1, 0, 2)
 
         q_idx_flat = q_indexer.reshape(sq * b, idx_nh, idx_hd)
         k_idx_flat = k_indexer.reshape(n_comp * b, idx_hd)
@@ -970,15 +980,13 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         else:
             # Dense path
             k_attn_bsd = kv_full[kv_offset:kv_offset + n_comp, :, :d].permute(1, 0, 2)
-            lse_bsh = lse.reshape(sq, b, np_).permute(1, 0, 2)
-
             if needs_grad:
                 # Fused: loss + backward in one pass
                 indexer_loss, precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights = (
                     fused_dense_indexer_loss_and_backward(
                         q_idx_bshd, k_idx_bsd, w_bsh_scaled,
                         topk_indices_cmp,
-                        q_attn_bshd, k_attn_bsd, lse_bsh,
+                        q_attn_bshd, k_attn_bsd, non_compressed_lse_bsh,
                         indexer_softmax_scale=indexer_softmax_scale,
                         softmax_scale=softmax_scale,
                         loss_coeff=loss_coeff,
@@ -1000,12 +1008,8 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     q_idx_bshd, k_idx_bsd, w_bsh_scaled,
                     qhead_per_kv_head=idx_nh, sm_scale=1.0, ratio=ratio,
                 )
-                # Pass lse=None so dense_attn_score_recompute uses self-contained
-                # softmax over compressed keys only (matching unfused reference).
-                # Using the full LSE (which includes window tokens in the
-                # denominator) would make compressed-token probabilities too small.
                 dense_attn_result = dense_attn_score_recompute(
-                    q_attn_bshd, k_attn_bsd, None,
+                    q_attn_bshd, k_attn_bsd, non_compressed_lse_bsh,
                     qhead_per_kv_head=np_, softmax_scale=softmax_scale, ratio=ratio,
                 )
                 indexer_loss = _kl_loss_from_dense_scores(
