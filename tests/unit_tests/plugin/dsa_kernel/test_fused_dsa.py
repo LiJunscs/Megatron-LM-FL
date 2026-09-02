@@ -258,6 +258,72 @@ def _run_unfused_with_same_indices(inputs: dict) -> Tuple[Tensor, Tensor]:
     return output, combined_idxs
 
 
+def _sparse_full_lse_loss_reference(
+    inputs: dict,
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights_scaled: Tensor,
+    loss_coeff: float = 0.1,
+) -> Tensor:
+    """Materialized sparse-loss oracle with the production teacher contract.
+
+    The teacher numerator is limited to selected compressed positions, while
+    its per-head denominator covers compressed TopK + local window + sink.
+    ``weights_scaled`` is a leaf in the same parameterization used by the core
+    unfused indexer reference.
+    """
+    sq, b, np_, d = inputs["query"].shape
+    n_comp = inputs["n_comp"]
+    kv_offset = inputs["kv_offset"]
+    effective_topk = min(inputs["indexer_topk"], n_comp)
+
+    q_idx_bshd = q_indexer.permute(1, 0, 2, 3)
+    k_idx_bsd = k_indexer.permute(1, 0, 2)
+    w_scaled_bsh = weights_scaled.permute(1, 0, 2)
+    topk_indices_cmp, _, _ = _indexer_topk_bshd(
+        q_idx_bshd,
+        k_idx_bsd,
+        w_scaled_bsh,
+        effective_topk,
+        inputs["ratio"],
+    )
+
+    compressed_global = torch.where(
+        topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
+    )
+    combined = torch.cat((compressed_global, inputs["window_idxs"]), dim=-1)
+
+    kv_bsd = inputs["kv_full"].permute(1, 0, 2)
+    safe_combined = combined.long().clamp(min=0)
+    batch_idx = torch.arange(b, device=combined.device)[:, None, None]
+    gathered = kv_bsd[batch_idx, safe_combined].float()
+    q_attn = inputs["query"].permute(1, 0, 2, 3).float()
+    full_logits = torch.einsum("bqhd,bqtd->bqht", q_attn, gathered)
+    full_logits = full_logits * inputs["softmax_scale"]
+    full_logits = full_logits.masked_fill(combined[:, :, None, :] < 0, float("-inf"))
+    sink = inputs["attn_sink"].view(1, 1, np_, 1).float()
+    full_lse = torch.logsumexp(torch.cat((full_logits, sink.expand(b, sq, -1, -1)), dim=-1), dim=-1)
+
+    predict = sparse_indexer_score_recompute(
+        q_idx_bshd,
+        k_idx_bsd,
+        w_scaled_bsh,
+        topk_indices_cmp,
+        qhead_per_kv_head=q_idx_bshd.shape[2],
+    )["predict"]
+    target = sparse_attn_score_recompute(
+        q_attn,
+        kv_bsd[:, :, :d],
+        full_lse,
+        compressed_global,
+        inputs["softmax_scale"],
+        qhead_per_kv_head=np_,
+    )["target"]
+    return _kl_loss_from_target_predict(
+        target, predict, topk_indices_cmp, loss_coeff, False
+    )
+
+
 # ---------------------------------------------------------------------------
 # Accuracy tests
 # ---------------------------------------------------------------------------
@@ -909,24 +975,6 @@ class TestFusedIndexerSparseAttnPerformance:
             w_scaled = w_raw * inputs["indexer_softmax_scale"]
 
             if sparse_loss:
-                # Partial LSE over compressed indices only
-                safe_cmp_global = topk_indices_cmp.clone()
-                valid_m = safe_cmp_global >= 0
-                safe_cmp_global[valid_m] += kv_offset
-                safe_cmp_idx = safe_cmp_global.clamp(min=0).long()
-                safe_cmp_idx_exp = safe_cmp_idx.unsqueeze(-1).expand(-1, -1, -1, hn)
-                kv_cmp = torch.gather(
-                    kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=safe_cmp_idx_exp
-                ).float()
-                scores_cmp = torch.einsum("bnsh,bskh->bnsk", q_perm, kv_cmp) * inputs["softmax_scale"]
-                inv_cmp_mask = (~valid_m).unsqueeze(1)
-                scores_cmp = scores_cmp.masked_fill(inv_cmp_mask, float("-inf"))
-                sc_max = torch.max(scores_cmp.max(dim=-1, keepdim=True).values, sink_val)
-                ec = torch.exp(scores_cmp - sc_max)
-                es = torch.exp(sink_val - sc_max)
-                se = ec.sum(dim=-1, keepdim=True) + es
-                lse_indexer_bsh = (sc_max + torch.log(se)).squeeze(-1).permute(0, 2, 1).contiguous()
-
                 predict_result = sparse_indexer_score_recompute(
                     qi_bshd, ki_bsd, w_scaled, topk_indices_cmp,
                     qhead_per_kv_head=idx_nh_val,
@@ -938,7 +986,7 @@ class TestFusedIndexerSparseAttnPerformance:
                 valid_perf = topk_for_target_perf >= 0
                 topk_for_target_perf[valid_perf] += kv_offset
                 target_result = sparse_attn_score_recompute(
-                    q_attn_bshd, k_attn_bsd, lse_indexer_bsh,
+                    q_attn_bshd, k_attn_bsd, lse_bsh,
                     topk_for_target_perf,
                     inputs["softmax_scale"], qhead_per_kv_head=np_,
                 )
@@ -1203,26 +1251,6 @@ class TestFusedIndexerSparseAttnPerformance:
                 lse_full = (scores_max + torch.log(sum_exp)).squeeze(-1)  # (b, np, sq)
                 lse_bsh = lse_full.permute(0, 2, 1).contiguous()  # (b, sq, np)
 
-                # Only need LSE from first effective_topk positions (indexer subset)
-                # Recompute with only compressed indices for the partial LSE
-                safe_cmp_global = (topk_indices_cmp.clone())
-                valid_cmp_mask = safe_cmp_global >= 0
-                safe_cmp_global[valid_cmp_mask] += kv_offset
-                safe_cmp_idx = safe_cmp_global.clamp(min=0).long()
-                safe_cmp_idx_exp = safe_cmp_idx.unsqueeze(-1).expand(-1, -1, -1, hn_val)
-                kv_cmp = torch.gather(
-                    kv_t.unsqueeze(1).expand(-1, sq_val, -1, -1), dim=2, index=safe_cmp_idx_exp
-                ).float()
-                scores_cmp = torch.einsum("bnsh,bskh->bnsk", q_perm, kv_cmp) * inputs["softmax_scale"]
-                invalid_cmp_mask = (~valid_cmp_mask).unsqueeze(1)
-                scores_cmp = scores_cmp.masked_fill(invalid_cmp_mask, float("-inf"))
-                scores_cmp_max = torch.max(scores_cmp.max(dim=-1, keepdim=True).values, sink_val)
-                exp_cmp = torch.exp(scores_cmp - scores_cmp_max)
-                exp_sink_cmp = torch.exp(sink_val - scores_cmp_max)
-                sum_exp_cmp = exp_cmp.sum(dim=-1, keepdim=True) + exp_sink_cmp
-                lse_cmp = (scores_cmp_max + torch.log(sum_exp_cmp)).squeeze(-1)
-                lse_indexer_bsh = lse_cmp.permute(0, 2, 1).contiguous()  # (b, sq, np)
-
                 predict_result = sparse_indexer_score_recompute(
                     qi_bshd, ki_bsd, w_scaled, topk_indices_cmp,
                     qhead_per_kv_head=idx_nh,
@@ -1237,7 +1265,7 @@ class TestFusedIndexerSparseAttnPerformance:
                 valid_e2e = topk_for_target_e2e >= 0
                 topk_for_target_e2e[valid_e2e] += kv_offset
                 target_result = sparse_attn_score_recompute(
-                    q_attn_bshd, k_attn_bsd, lse_indexer_bsh,
+                    q_attn_bshd, k_attn_bsd, lse_bsh,
                     topk_for_target_e2e,
                     inputs["softmax_scale"], qhead_per_kv_head=np_,
                 )
@@ -3235,12 +3263,12 @@ class TestSparseIndexerExtremeProbability:
 
 
 class TestIndexerGradAccuracy:
-    """Validate indexer gradient accuracy: fused plugin vs Megatron core reference.
+    """Validate fused indexer gradients against a materialized/core oracle.
 
     The fused path pre-computes indexer gradients in forward via
     ``fused_sparse_indexer_loss_and_backward`` / ``fused_dense_indexer_loss_and_backward``
-    (triton plugin). The unfused path uses ``FusedDSAIndexerLoss`` + autograd
-    (``bwd_fused_indexer_loss_naive``) from Megatron core.
+    (triton plugin). Sparse mode uses a materialized full-LSE oracle; dense
+    mode uses ``FusedDSAIndexerLoss`` + autograd from Megatron core.
 
     We verify: grad_q_indexer, grad_k_indexer, grad_weights match between the two.
     """
@@ -3302,7 +3330,7 @@ class TestIndexerGradAccuracy:
 
     @staticmethod
     def _run_unfused_indexer_grads(inputs: dict, sparse_loss: bool) -> dict:
-        """Run Megatron core FusedDSAIndexerLoss, extract indexer gradients."""
+        """Run a materialized oracle and extract indexer gradients."""
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             FusedDSAIndexerLoss,
         )
@@ -3321,6 +3349,25 @@ class TestIndexerGradAccuracy:
         # weights_for_unfused = weights * indexer_softmax_scale (pre-scaled)
         weights_raw = inputs["weights"].clone().detach().float()
         weights_for_unfused = (weights_raw * inputs["indexer_softmax_scale"]).requires_grad_(True)
+
+        if sparse_loss:
+            loss = _sparse_full_lse_loss_reference(
+                inputs,
+                q_indexer,
+                k_indexer,
+                weights_for_unfused,
+                loss_coeff=0.1,
+            )
+            loss.backward()
+            return {
+                "loss": loss.item(),
+                "grad_q_indexer": q_indexer.grad,
+                "grad_k_indexer": k_indexer.grad,
+                "grad_weights": weights_for_unfused.grad,
+                "grad_q_norm": q_indexer.grad.norm().item(),
+                "grad_k_norm": k_indexer.grad.norm().item(),
+                "grad_w_norm": weights_for_unfused.grad.norm().item(),
+            }
 
         # query and key are detached in the real unfused path
         query_det = inputs["query"].clone().detach()
@@ -3389,7 +3436,7 @@ class TestIndexerGradAccuracy:
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
         indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
-        """grad_q_indexer from fused plugin matches Megatron core reference."""
+        """grad_q_indexer matches the mode-appropriate reference."""
         kv_offset = sq
         inputs = _make_fused_inputs(
             sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
@@ -3456,7 +3503,7 @@ class TestIndexerGradAccuracy:
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
         indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
-        """grad_k_indexer from fused plugin matches Megatron core reference."""
+        """grad_k_indexer matches the mode-appropriate reference."""
         kv_offset = sq
         inputs = _make_fused_inputs(
             sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
@@ -3523,7 +3570,7 @@ class TestIndexerGradAccuracy:
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
         indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
-        """grad_weights from fused plugin matches Megatron core reference.
+        """grad_weights matches the mode-appropriate reference.
 
         Note: fused returns d(loss)/d(weights_raw), unfused returns
         d(loss)/d(weights_scaled) where scaled = raw * indexer_softmax_scale.
@@ -3588,17 +3635,17 @@ class TestIndexerGradAccuracy:
 
 
 # ---------------------------------------------------------------------------
-# Indexer loss value consistency: fused (triton plugin) vs unfused (Megatron core)
+# Indexer loss consistency: fused vs materialized/core oracle
 # ---------------------------------------------------------------------------
 
 
 class TestIndexerLossConsistency:
-    """Validate indexer loss value matches between fused and unfused paths.
+    """Validate the indexer loss against a materialized/core oracle.
 
     The fused path computes indexer loss inside ``FusedIndexerSparseAttnFunc.forward``
     via ``fused_sparse_indexer_loss_and_backward`` / ``fused_dense_indexer_loss_and_backward``.
-    The unfused path uses ``FusedDSAIndexerLoss.forward`` → ``fwd_fused_indexer_loss_naive``
-    from Megatron core.
+    Sparse mode uses the materialized full-LSE oracle; dense mode uses
+    ``FusedDSAIndexerLoss.forward`` from Megatron core.
 
     We compare the scalar loss values and verify they agree within bf16 tolerance.
     """
@@ -3622,7 +3669,7 @@ class TestIndexerLossConsistency:
 
     @staticmethod
     def _get_unfused_loss(inputs: dict, sparse_loss: bool) -> float:
-        """Run Megatron core FusedDSAIndexerLoss, return indexer loss scalar."""
+        """Run the materialized loss oracle and return its scalar value."""
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             FusedDSAIndexerLoss,
         )
@@ -3639,6 +3686,17 @@ class TestIndexerLossConsistency:
         k_indexer = inputs["k_indexer"].clone().detach()
         weights_raw = inputs["weights"].clone().detach().float()
         weights_for_unfused = weights_raw * inputs["indexer_softmax_scale"]
+
+        if sparse_loss:
+            with torch.no_grad():
+                loss = _sparse_full_lse_loss_reference(
+                    inputs,
+                    q_indexer,
+                    k_indexer,
+                    weights_for_unfused,
+                    loss_coeff=0.1,
+                )
+            return loss.item()
 
         query_det = inputs["query"].clone().detach()
         kv_compressed = inputs["kv_full"][kv_offset:kv_offset + n_comp]
@@ -3702,7 +3760,7 @@ class TestIndexerLossConsistency:
         self, sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,
         indexer_topk, ratio, sparse_loss, device, dsa_metrics,
     ):
-        """Indexer loss from fused plugin matches Megatron core reference."""
+        """Indexer loss matches the mode-appropriate reference."""
         kv_offset = sq
         inputs = _make_fused_inputs(
             sq, b, np_, hn, n_comp, win_topk, idx_nh, idx_hd,

@@ -24,6 +24,8 @@ Key MLA/DSA properties exploited:
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -756,6 +758,39 @@ def sorted_scatter_add(
         dkv_out.stride(0), dkv_out.stride(1),
         BLOCK_D=BLOCK_D,
         MAX_RUN=effective_max_run,
+    )
+
+
+def scatter_dkv(
+    dkv_gathered: Tensor,
+    flat_idxs: Tensor,
+    valid_flat: Tensor,
+    dkv_out: Tensor,
+    backend: str | None = None,
+) -> None:
+    """Scatter gathered dKV rows with an explicitly selectable backend.
+
+    ``sorted`` is the production default: it groups duplicate targets before
+    issuing atomics.  ``atomic`` keeps the direct one-row/one-atomic kernel as
+    an experiment for H800 shape/contention measurements.  Reading the
+    environment at call time lets one benchmark both variants in one process.
+
+    Set ``MEGATRON_DSA_DKV_SCATTER=atomic`` to opt into the experimental path.
+    """
+    selected = (
+        backend
+        if backend is not None
+        else os.environ.get("MEGATRON_DSA_DKV_SCATTER", "sorted")
+    ).lower()
+    if selected == "sorted":
+        sorted_scatter_add(dkv_gathered, flat_idxs, valid_flat, dkv_out)
+        return
+    if selected in ("atomic", "direct_atomic"):
+        fused_mask_scatter_add(dkv_gathered, flat_idxs, valid_flat, dkv_out)
+        return
+    raise ValueError(
+        "MEGATRON_DSA_DKV_SCATTER must be 'sorted' or 'atomic', "
+        f"got {selected!r}"
     )
 
 

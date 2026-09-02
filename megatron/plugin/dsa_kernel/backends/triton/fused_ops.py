@@ -32,7 +32,7 @@ from .sparse_attention import (
 from .sparse_attention_backward import (
     fused_dq,
     fused_dkv,
-    sorted_scatter_add,
+    scatter_dkv,
 )
 from .indexer import (
     sparse_indexer_score_recompute,
@@ -60,8 +60,11 @@ _DSA_PROFILE = os.environ.get("DSA_PROFILE", "0") == "1"
 
 ##### FlagScale Add #####
 # TP overlap for sparse indexer loss: async all-reduce + predict overlap.
-# Default off; enable after distributed correctness is validated.
-_DSA_TP_OVERLAP = os.environ.get("MEGATRON_DSA_TP_OVERLAP", "0") == "1"
+# This is the production default.  Set MEGATRON_DSA_TP_OVERLAP=0 only for the
+# synchronous A/B baseline.  ``Work.wait`` is called before the reduced tensor
+# is consumed; for NCCL it establishes the required dependency on the current
+# CUDA stream while the independent student computation can be enqueued first.
+_DSA_TP_OVERLAP = os.environ.get("MEGATRON_DSA_TP_OVERLAP", "1") != "0"
 
 ##### FlagScale End #####
 
@@ -380,10 +383,10 @@ class _DSASparseAttnFunc(torch.autograd.Function):
         )
         del scores
 
-        # --- Scatter with sorted local reduction ---
+        # --- Configured scatter (sorted local reduction by default) ---
         valid_flat = valid_shared.reshape(-1)
         dkv = torch.zeros(total_Skv, D_full, dtype=torch.float32, device=query.device)
-        sorted_scatter_add(dkv_gathered, flat_idxs, valid_flat, dkv)
+        scatter_dkv(dkv_gathered, flat_idxs, valid_flat, dkv)
 
         dq_out = dq.to(query.dtype)
         dkv_out = dkv.to(kv.dtype)
@@ -423,8 +426,10 @@ def dsa_sparse_attn(
         attn_sink: ``(H,)`` f32 — per-head sink bias (optional).
         topk_length: ``(total_S_q, H_kv)`` int32 — valid count per query (optional,
             for compact mode). If None, -1 entries in topk_idxs are used as mask.
-        indexer_topk: if > 0, compute separate LSE for first ``indexer_topk``
-            positions (used by fused indexer path).
+        indexer_topk: if > 0, expose the full attention LSE through the legacy
+            ``lse_indexer`` result slot.  The sparse teacher uses selected
+            compressed logits as its numerator and the full attention LSE
+            (compressed TopK + window + sink) as its denominator.
 
     Returns:
         ``(out, lse, lse_indexer)``
@@ -437,26 +442,10 @@ def dsa_sparse_attn(
     if topk_idxs.shape[1] == 1 and H > 1:
         topk_idxs = topk_idxs.expand(-1, H, -1)
 
-    if indexer_topk > 0:
-        # Split computation: full attention + indexer-only LSE
-        out, lse = _DSASparseAttnFunc.apply(
-            query, kv, topk_idxs, softmax_scale, d_v, attn_sink
-        )
-        # Compute LSE for first indexer_topk positions
-        TopK = topk_idxs.shape[-1]
-        if indexer_topk >= TopK:
-            lse_indexer = lse.clone()
-        else:
-            idx_subset = topk_idxs[:, :, :indexer_topk].contiguous()
-            _, lse_indexer, _ = triton_sparse_attn_forward(
-                query, kv, idx_subset, softmax_scale, d_v, attn_sink
-            )
-        return out, lse, lse_indexer
-    else:
-        out, lse = _DSASparseAttnFunc.apply(
-            query, kv, topk_idxs, softmax_scale, d_v, attn_sink
-        )
-        return out, lse, None
+    out, lse = _DSASparseAttnFunc.apply(
+        query, kv, topk_idxs, softmax_scale, d_v, attn_sink
+    )
+    return out, lse, lse if indexer_topk > 0 else None
 
 
 def dsa_sparse_attn_sbhd(
@@ -702,13 +691,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
         # 5. Sparse attention forward
         prof.start("step5_sparse_attn_fwd")
-        # When sparse_loss is enabled, compute partial LSE for the first
-        # effective_topk positions (compressed indices) in a single pass,
-        # avoiding a redundant second forward call.
-        _indexer_topk_for_lse = effective_topk if sparse_loss else 0
-        out_flat, lse, lse_indexer_raw = triton_sparse_attn_forward(
+        # The sparse teacher denominator is the full sparse-attention LSE:
+        # compressed TopK + local window + attention sink.  Only its numerator
+        # is restricted to compressed TopK positions.
+        out_flat, lse, _ = triton_sparse_attn_forward(
             q_flat, kv_flat, global_idxs_expanded, softmax_scale, d, attn_sink,
-            indexer_topk=_indexer_topk_for_lse,
         )
         prof.stop()
         # 6. Compute indexer loss
@@ -747,7 +734,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # Prepare attention tensors in BSHD layout (shared by both paths).
         # .contiguous() omitted: downstream einsum/indexing handle strided tensors.
         q_attn_bshd = query.permute(1, 0, 2, 3)  # (b, sq, np, d)
-        lse_indexer_bsh = lse_indexer_raw.reshape(sq, b, np_).permute(1, 0, 2) if sparse_loss else None
+        full_lse_bsh = lse.reshape(sq, b, np_).permute(1, 0, 2) if sparse_loss else None
 
         if sparse_loss:
             k_attn_bsd = kv_full[:, :, :d].permute(1, 0, 2)  # (b, skv, d)
@@ -777,7 +764,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                         ##### FlagScale Add #####
                         q_attn_bshd,
                         k_attn_bsd,
-                        lse_indexer_bsh,
+                        full_lse_bsh,
                         ##### FlagScale End #####
                         indexer_softmax_scale=indexer_softmax_scale,
                         softmax_scale=softmax_scale,
@@ -792,7 +779,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     local_head_sum = compute_sparse_local_target_head_sum(
                         q_attn_bshd,
                         k_attn_bsd,
-                        lse_indexer_bsh,
+                        full_lse_bsh,
                         topk_indices_cmp,
                         softmax_scale=softmax_scale,
                         kv_offset=kv_offset,
@@ -852,7 +839,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 local_head_sum = compute_sparse_local_target_head_sum(
                     q_attn_bshd,
                     k_attn_bsd,
-                    lse_indexer_bsh,
+                    full_lse_bsh,
                     topk_indices_cmp,
                     softmax_scale=softmax_scale,
                     kv_offset=kv_offset,
@@ -1023,10 +1010,10 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         prof.stop()
 
         prof.start("bwd_scatter")
-        # Sorted scatter with local reduction (less atomic contention)
+        # Configured scatter backend (sorted local reduction by default)
         valid_flat = valid_shared.reshape(-1)
         dkv = torch.zeros(skv * b, d_kv, dtype=torch.float32, device=q_flat.device)
-        sorted_scatter_add(dkv_gathered, flat_idxs, valid_flat, dkv)
+        scatter_dkv(dkv_gathered, flat_idxs, valid_flat, dkv)
 
         grad_query = dq.to(q_flat.dtype).reshape(sq, b, np_, d)
         grad_kv_full = dkv.to(kv_flat.dtype).reshape(skv, b, -1)

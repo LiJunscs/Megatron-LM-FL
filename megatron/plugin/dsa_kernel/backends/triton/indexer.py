@@ -134,7 +134,10 @@ def sparse_attn_score_recompute(
     Args:
         q_attn: ``(B, S_q, H_q, D)`` bf16.
         k_attn: ``(B, S_k, D)`` bf16.
-        lse:    ``(B, S_q, H_q)`` fp32 — log-sum-exp from attention forward.
+        lse:    ``(B, S_q, H_q)`` fp32 — full sparse-attention log-sum-exp,
+            including compressed TopK, local-window positions, and the
+            attention sink.  Only ``topk_indices`` contribute to the teacher
+            numerator below.
         topk_indices: ``(B, S_q, topk)`` int32.
         softmax_scale: attention scale factor.
         qhead_per_kv_head: MQA ratio.
@@ -603,7 +606,8 @@ def compute_sparse_local_target_head_sum(
     Args:
         q_attn_bshd: ``(B, S_q, np, D_attn)`` bf16 — attention queries.
         k_attn_bsd: ``(B, S_kv, D_attn)`` bf16 — full attention keys.
-        lse_bsh: ``(B, S_q, np)`` fp32 — LSE from sparse attention forward.
+        lse_bsh: ``(B, S_q, np)`` fp32 — full sparse-attention LSE
+            (compressed TopK + local window + attention sink).
         topk_indices_cmp: ``(B, S_q, topk)`` int32 — indices into [0, n_comp).
         softmax_scale: scale for attention scores.
         kv_offset: offset where compressed KV starts in k_attn_bsd.
@@ -803,7 +807,8 @@ def fused_sparse_indexer_loss_and_backward(
         topk_indices_cmp: ``(B, S_q, topk)`` int32 — indices into [0, n_comp).
         q_attn_bshd: ``(B, S_q, np, D_attn)`` bf16 — attention queries.
         k_attn_bsd: ``(B, S_kv, D_attn)`` bf16 — attention keys (full KV buffer).
-        lse_bsh: ``(B, S_q, np)`` fp32 — LSE from attention forward.
+        lse_bsh: ``(B, S_q, np)`` fp32 — full sparse-attention LSE
+            (compressed TopK + local window + attention sink).
         indexer_softmax_scale: scale for indexer scores.
         softmax_scale: scale for attention scores.
         loss_coeff: KL loss coefficient.

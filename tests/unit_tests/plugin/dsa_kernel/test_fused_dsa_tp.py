@@ -1,3 +1,4 @@
+##### FlagScale Add #####
 # Copyright (c) 2026, FlagOS Contributors. All rights reserved.
 
 """
@@ -979,10 +980,10 @@ class TestDistributedTPCorrectness:
     def _run_fused_tp(self, inputs, rank, tp_group, tp_size, overlap: bool):
         """Run fused path with TP group."""
         import os as _os
-        old_val = _os.environ.get("MEGATRON_DSA_TP_OVERLAP", "0")
+        old_val = _os.environ.get("MEGATRON_DSA_TP_OVERLAP")
         _os.environ["MEGATRON_DSA_TP_OVERLAP"] = "1" if overlap else "0"
-        # Reload the module-level flag
         import megatron.plugin.dsa_kernel.backends.triton.fused_ops as _mod
+        old_flag = _mod._DSA_TP_OVERLAP
         _mod._DSA_TP_OVERLAP = overlap
 
         query_local, sink_local, np_local = _shard_for_rank(inputs, rank, tp_size)
@@ -993,24 +994,28 @@ class TestDistributedTPCorrectness:
         k_indexer = inputs["k_indexer"].clone().requires_grad_(True)
         weights = inputs["weights"].clone().requires_grad_(True)
 
-        output, loss = fused_indexer_sparse_attn(
-            query_local, kv_full, sink_local, inputs["window_idxs"],
-            q_indexer, k_indexer, weights,
-            indexer_topk=inputs["topk"], ratio=4,
-            softmax_scale=inputs["d"] ** -0.5,
-            indexer_softmax_scale=q_indexer.shape[-1] ** -0.5,
-            loss_coeff=0.1,
-            sparse_loss=True,
-            kv_offset=inputs["sq"],
-            calculate_per_token_loss=False,
-            tp_group=tp_group,
-        )
+        try:
+            output, loss = fused_indexer_sparse_attn(
+                query_local, kv_full, sink_local, inputs["window_idxs"],
+                q_indexer, k_indexer, weights,
+                indexer_topk=inputs["topk"], ratio=4,
+                softmax_scale=inputs["d"] ** -0.5,
+                indexer_softmax_scale=q_indexer.shape[-1] ** -0.5,
+                loss_coeff=0.1,
+                sparse_loss=True,
+                kv_offset=inputs["sq"],
+                calculate_per_token_loss=False,
+                tp_group=tp_group,
+            )
 
-        # Backward
-        (output.sum() + loss).backward()
-
-        _os.environ["MEGATRON_DSA_TP_OVERLAP"] = old_val
-        _mod._DSA_TP_OVERLAP = old_val == "1"
+            # Backward
+            (output.sum() + loss).backward()
+        finally:
+            if old_val is None:
+                _os.environ.pop("MEGATRON_DSA_TP_OVERLAP", None)
+            else:
+                _os.environ["MEGATRON_DSA_TP_OVERLAP"] = old_val
+            _mod._DSA_TP_OVERLAP = old_flag
 
         return {
             "output": output.detach(),

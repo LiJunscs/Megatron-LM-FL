@@ -302,9 +302,12 @@ def _triton_sparse_attn_fwd_hp(
     # Allocate outputs
     out = torch.empty((total_Sq, H, d_v), dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((total_Sq, H), dtype=torch.float32, device=q.device)
+    # Sparse-indexer teacher probabilities use the *full* attention
+    # denominator (compressed TopK + local window + attention sink).  The
+    # selected compressed logits are the numerator only, so there is no
+    # separate partial/indexer LSE to compute here.  Keep the legacy return
+    # slot for API compatibility and alias it to the full LSE below.
     lse_indexer = None
-    if indexer_topk > 0:
-        lse_indexer = torch.empty((total_Sq, H), dtype=torch.float32, device=q.device)
 
     # Grid: one program per (query_position, head_block)
     num_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
@@ -314,7 +317,7 @@ def _triton_sparse_attn_fwd_hp(
     _sparse_attn_fwd_hp_kernel[grid](
         q, kv, topk_idxs, out, lse,
         attn_sink if attn_sink is not None else torch.empty(0, device=q.device),
-        lse_indexer if lse_indexer is not None else torch.empty(0, device=q.device),
+        torch.empty(0, device=q.device),
         softmax_scale,
         total_Sq, total_Skv, TopK, D, d_v,
         H,
@@ -324,14 +327,13 @@ def _triton_sparse_attn_fwd_hp(
         out.stride(0), out.stride(1), out.stride(2),
         lse.stride(0), lse.stride(1),
         HAS_SINK=(attn_sink is not None),
-        HAS_LSE_IDX=(indexer_topk > 0),
-        INDEXER_TOPK=indexer_topk if indexer_topk > 0 else 0,
+        HAS_LSE_IDX=False,
+        INDEXER_TOPK=0,
         BLOCK_H=BLOCK_H,
     )
 
-    # Handle edge case
-    if indexer_topk > 0 and indexer_topk >= TopK:
-        lse_indexer = lse.clone()
+    if indexer_topk > 0:
+        lse_indexer = lse
 
     return out, lse, lse_indexer
 
@@ -366,7 +368,10 @@ def triton_sparse_attn_fwd(
         d_v: value dimension (may differ from D for MLA).
         attn_sink: ``(H,)`` f32 — per-head bias-only sink.
         topk_length: unused (kept for API compatibility).
-        indexer_topk: if > 0, compute separate LSE for first positions.
+        indexer_topk: if > 0, return the full attention LSE in the legacy
+            ``lse_indexer`` result slot.  Sparse teacher numerators are still
+            restricted to the selected compressed positions by the indexer
+            loss code.
 
     Returns:
         out: ``(total_S_q, H, d_v)`` bf16.
@@ -400,9 +405,10 @@ def triton_sparse_attn_fwd(
     from ..pytorch.sparse_attention import (
         pytorch_sparse_attn_fwd,
     )
-    return pytorch_sparse_attn_fwd(
-        q, kv, topk_idxs, softmax_scale, d_v, attn_sink, indexer_topk
+    out, lse, _ = pytorch_sparse_attn_fwd(
+        q, kv, topk_idxs, softmax_scale, d_v, attn_sink, 0
     )
+    return out, lse, lse if indexer_topk > 0 else None
 
 
 # ---------------------------------------------------------------------------
