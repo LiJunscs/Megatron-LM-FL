@@ -18,9 +18,16 @@ import pytest
 
 from megatron.plugin.dsa_kernel.backends.triton.indexer import (
     _SPARSE_KL_EPS,
+    _sparse_kl_grad_logits,
     compute_sparse_indexer_predict_state,
     compute_sparse_local_target_head_sum,
     sparse_indexer_kl_and_backward,
+)
+from megatron.plugin.dsa_kernel.backends.triton.indexer_sparse_kernels import (
+    pack_sbhd_sparse_indices,
+    sparse_kl_total_seq,
+    sparse_student_total_seq,
+    sparse_teacher_total_seq,
 )
 
 
@@ -255,4 +262,284 @@ def test_fused_sparse_loss_wires_attention_full_lse_into_teacher():
 
     expected_lse = full_lse_flat.reshape(sq, batch, heads).permute(1, 0, 2)
     torch.testing.assert_close(captured["lse"], expected_lse)
+    assert torch.isfinite(loss)
+
+
+def _requires_cuda_bf16():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Triton compile/launch parity")
+
+
+def test_total_seq_index_packing_matches_sbhd_reference():
+    _requires_cuda_bf16()
+    device = torch.device("cuda")
+    batch, seqlen_q, cmp_topk, win_topk, kv_offset = 2, 3, 3, 2, 5
+    compressed = torch.tensor(
+        [
+            [[0, 2, -1], [1, 3, 4], [-1, -1, -1]],
+            [[4, 1, 0], [2, -1, 3], [1, 0, -1]],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    window = torch.tensor(
+        [
+            [[0, -1], [1, 0], [2, 1]],
+            [[0, -1], [1, 0], [2, 1]],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    indexer_flat, attention_flat = pack_sbhd_sparse_indices(
+        compressed, window, kv_offset
+    )
+
+    compressed_sb = compressed.permute(1, 0, 2).reshape(seqlen_q * batch, cmp_topk)
+    window_sb = window.permute(1, 0, 2).reshape(seqlen_q * batch, win_topk)
+    batch_ids = torch.arange(seqlen_q * batch, device=device) % batch
+    expected_indexer = torch.where(
+        compressed_sb >= 0,
+        compressed_sb * batch + batch_ids[:, None],
+        -1,
+    )
+    expected_attention_cmp = torch.where(
+        compressed_sb >= 0,
+        (compressed_sb + kv_offset) * batch + batch_ids[:, None],
+        -1,
+    )
+    expected_attention_win = torch.where(
+        window_sb >= 0,
+        window_sb * batch + batch_ids[:, None],
+        -1,
+    )
+    expected_attention = torch.cat(
+        (expected_attention_cmp, expected_attention_win), dim=-1
+    ).to(torch.int32)
+    expected_indexer = expected_indexer.to(torch.int32)
+
+    torch.testing.assert_close(indexer_flat, expected_indexer)
+    torch.testing.assert_close(attention_flat, expected_attention)
+
+
+def test_total_seq_sparse_teacher_matches_materialized_reference():
+    _requires_cuda_bf16()
+    torch.manual_seed(41)
+    device = torch.device("cuda")
+    total_q, total_k, heads, dim, topk = 4, 13, 16, 16, 7
+    query = torch.randn(total_q, heads, dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(total_k, dim, device=device, dtype=torch.bfloat16)
+    indices = torch.tensor(
+        [[0, 2, 4, 6, 8, 10, 12], [1, 3, 5, 7, 9, 11, -1],
+         [12, 10, 8, 6, 4, -1, -1], [0, 1, 2, 3, 4, 5, 6]],
+        dtype=torch.int32,
+        device=device,
+    )
+    scale = dim**-0.5
+    lse = torch.randn(total_q, heads, device=device) + 5.0
+
+    actual = sparse_teacher_total_seq(query, key, lse, indices, scale)
+
+    safe = indices.long().clamp(min=0)
+    gathered = key.float()[safe]
+    scores = torch.einsum("thd,tkd->thk", query.float(), gathered) * scale
+    expected = torch.exp(scores - lse.unsqueeze(-1)).sum(dim=1)
+    expected = expected.masked_fill(indices < 0, 0.0)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
+
+
+def test_total_seq_sparse_student_and_kl_match_reference():
+    _requires_cuda_bf16()
+    torch.manual_seed(43)
+    device = torch.device("cuda")
+    total_q, total_k, heads, dim, topk = 4, 13, 16, 16, 7
+    query = torch.randn(total_q, heads, dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(total_k, dim, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(total_q, heads, device=device, dtype=torch.float32)
+    indices = torch.tensor(
+        [[0, 2, 4, 6, 8, 10, 12], [1, 3, 5, 7, 9, 11, -1],
+         [12, 10, 8, 6, 4, -1, -1], [0, 1, 2, 3, 4, 5, 6]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    predict = sparse_student_total_seq(query, key, weights, indices)
+    safe = indices.long().clamp(min=0)
+    gathered = key.float()[safe]
+    per_head = torch.relu(torch.einsum("thd,tkd->thk", query.float(), gathered))
+    logits = (per_head * weights.unsqueeze(-1)).sum(dim=1)
+    logits = logits.masked_fill(indices < 0, float("-inf"))
+    expected_predict = torch.softmax(logits, dim=-1).masked_fill(indices < 0, 0.0)
+    torch.testing.assert_close(predict, expected_predict, rtol=2e-2, atol=2e-3)
+
+    head_sum = torch.rand(total_q, topk, device=device)
+    head_sum = head_sum.masked_fill(indices < 0, 0.0)
+    predict_for_kernel = predict.clone()
+    loss_coeff = 0.13
+    loss, grad_logits = sparse_kl_total_seq(
+        head_sum, predict_for_kernel, indices, loss_coeff, False
+    )
+    target = head_sum / head_sum.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    expected_rows = (
+        target
+        * (
+            torch.log(target + _SPARSE_KL_EPS)
+            - torch.log(predict + _SPARSE_KL_EPS)
+        )
+    ).sum(dim=-1)
+    expected_loss = loss_coeff * expected_rows.mean()
+    expected_grad = _sparse_kl_grad_logits(predict, target)
+    expected_grad = expected_grad.masked_fill(indices < 0, 0.0)
+    expected_grad = expected_grad * (loss_coeff / total_q)
+    torch.testing.assert_close(loss, expected_loss, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(grad_logits, expected_grad, rtol=2e-5, atol=2e-6)
+
+
+def test_total_seq_sparse_loss_and_backward_matches_materialized_reference():
+    _requires_cuda_bf16()
+    from megatron.plugin.dsa_kernel.backends.triton.fused_ops import (
+        _sparse_total_seq_loss_and_backward,
+    )
+
+    torch.manual_seed(47)
+    device = torch.device("cuda")
+    total_q, total_k, heads, dim, topk = 4, 11, 16, 16, 5
+    q_indexer = torch.randn(
+        total_q, heads, dim, device=device, dtype=torch.bfloat16
+    )
+    k_indexer = torch.randn(total_k, dim, device=device, dtype=torch.bfloat16)
+    weights_scaled = torch.rand(total_q, heads, device=device)
+    q_attn = torch.randn_like(q_indexer)
+    k_attn = torch.randn_like(k_indexer)
+    indices = torch.tensor(
+        [[0, 2, 4, 6, 8], [1, 3, 5, 7, -1],
+         [10, 8, 6, -1, -1], [0, 1, 2, 3, 4]],
+        device=device,
+        dtype=torch.int32,
+    )
+    softmax_scale = dim**-0.5
+    selected = k_attn.float()[indices.long().clamp(min=0)]
+    selected_scores = (
+        torch.einsum("thd,tkd->thk", q_attn.float(), selected)
+        * softmax_scale
+    )
+    selected_scores = selected_scores.masked_fill(
+        indices[:, None, :] < 0, float("-inf")
+    )
+    extra_logits = torch.randn(total_q, heads, 3, device=device)
+    lse = torch.logsumexp(torch.cat((selected_scores, extra_logits), dim=-1), dim=-1)
+    loss_coeff = 0.17
+    indexer_scale = 0.25
+
+    actual = _sparse_total_seq_loss_and_backward(
+        q_indexer,
+        k_indexer,
+        weights_scaled,
+        indices,
+        q_attn,
+        k_attn,
+        lse,
+        indices,
+        softmax_scale,
+        indexer_scale,
+        loss_coeff,
+        False,
+        True,
+        None,
+    )
+
+    head_sum = compute_sparse_local_target_head_sum(
+        q_attn.unsqueeze(0),
+        k_attn.unsqueeze(0),
+        lse.unsqueeze(0),
+        indices.unsqueeze(0),
+        softmax_scale,
+    )
+    predict_state = compute_sparse_indexer_predict_state(
+        q_indexer.unsqueeze(0),
+        k_indexer.unsqueeze(0),
+        weights_scaled.unsqueeze(0),
+        indices.unsqueeze(0),
+    )
+    expected_loss, expected_q, expected_k, expected_w = (
+        sparse_indexer_kl_and_backward(
+            head_sum,
+            predict_state,
+            q_indexer.unsqueeze(0),
+            k_indexer.unsqueeze(0),
+            weights_scaled.unsqueeze(0),
+            loss_coeff,
+            False,
+        )
+    )
+    torch.testing.assert_close(actual[0], expected_loss, rtol=2e-2, atol=2e-4)
+    torch.testing.assert_close(actual[1], expected_q.squeeze(0), rtol=3e-2, atol=3e-3)
+    torch.testing.assert_close(actual[2], expected_k.squeeze(0), rtol=3e-2, atol=3e-3)
+    torch.testing.assert_close(
+        actual[3], expected_w.squeeze(0) * indexer_scale, rtol=3e-2, atol=3e-3
+    )
+
+
+def test_fused_sparse_loss_routes_large_heads_to_total_seq_kernels():
+    _requires_cuda_bf16()
+    from unittest.mock import patch
+
+    import megatron.plugin.dsa_kernel.backends.triton.fused_ops as fused_ops
+
+    torch.manual_seed(53)
+    device = torch.device("cuda")
+    sq, batch, heads, dim, compressed = 4, 1, 16, 16, 4
+    query = torch.randn(sq, batch, heads, dim, device=device, dtype=torch.bfloat16)
+    kv_full = torch.randn(
+        sq + compressed, batch, dim, device=device, dtype=torch.bfloat16
+    )
+    sink = torch.randn(heads, device=device)
+    window = torch.tensor(
+        [[[0, -1], [1, 0], [2, 1], [3, 2]]],
+        device=device,
+        dtype=torch.int32,
+    )
+    q_indexer = torch.randn_like(query)
+    k_indexer = torch.randn(
+        compressed, batch, dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.rand(
+        sq, batch, heads, device=device, dtype=torch.bfloat16
+    )
+    fake_output = torch.zeros(sq * batch, heads, dim, device=device)
+    full_lse = torch.randn(sq * batch, heads, device=device) + 8.0
+    original = fused_ops._sparse_total_seq_loss_and_backward
+
+    with (
+        patch.object(
+            fused_ops,
+            "triton_sparse_attn_forward",
+            return_value=(fake_output, full_lse, None),
+        ),
+        patch.object(
+            fused_ops,
+            "_sparse_total_seq_loss_and_backward",
+            wraps=original,
+        ) as total_seq_path,
+    ):
+        _, loss = fused_ops.fused_indexer_sparse_attn(
+            query,
+            kv_full,
+            sink,
+            window,
+            q_indexer,
+            k_indexer,
+            weights,
+            indexer_topk=3,
+            ratio=1,
+            softmax_scale=dim**-0.5,
+            indexer_softmax_scale=dim**-0.5,
+            loss_coeff=0.1,
+            sparse_loss=True,
+            kv_offset=sq,
+            calculate_per_token_loss=False,
+            tp_group=None,
+        )
+
+    total_seq_path.assert_called_once()
     assert torch.isfinite(loss)

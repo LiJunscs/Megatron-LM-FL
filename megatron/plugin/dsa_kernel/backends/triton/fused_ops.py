@@ -45,7 +45,15 @@ from .indexer import (
     compute_sparse_local_target_head_sum,
     compute_sparse_indexer_predict_state,
     sparse_indexer_kl_and_backward,
+    sparse_indexer_backward_total_seq,
     ##### FlagScale End #####
+)
+from .indexer_sparse_kernels import (
+    pack_sbhd_sparse_indices,
+    sparse_kl_total_seq,
+    sparse_student_total_seq,
+    sparse_teacher_total_seq,
+    sparse_total_seq_eligible,
 )
 
 
@@ -196,12 +204,16 @@ def _sbhd_to_bshd_indexer_inputs(
     """
     q_bshd = q_indexer.permute(1, 0, 2, 3)   # (b, sq, nh, hd)
     k_bsd = k_indexer.permute(1, 0, 2)       # (b, sk, hd)
-    w_bsh = weights.permute(1, 0, 2)         # (b, sq, nh)
     # Scale weights in FP32 to match the unfused oracle, which pre-scales as
     # ``weights_indexer_cp.float() * indexer.softmax_scale``.  Scaling in
     # BF16 would round the scale factor itself and the product, shifting
     # near-tie top-K boundaries against the oracle.
-    w_bsh_scaled = w_bsh.float() * indexer_softmax_scale
+    # Keep the physical allocation in SBH order so the total-sequence path can
+    # flatten it without another transpose/copy.  BSH consumers receive a
+    # strided view, which their PyTorch operations already support.
+    w_sbh_scaled = weights.float() * indexer_softmax_scale
+    w_bsh = weights.permute(1, 0, 2)         # (b, sq, nh)
+    w_bsh_scaled = w_sbh_scaled.permute(1, 0, 2)
     return q_bshd, k_bsd, w_bsh, w_bsh_scaled
 
 
@@ -590,6 +602,84 @@ def _kl_loss_from_dense_scores(
     return loss_coeff * loss
 
 
+def _sparse_total_seq_loss_and_backward(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights_scaled: Tensor,
+    indexer_topk_indices: Tensor,
+    q_attn: Tensor,
+    k_attn: Tensor,
+    lse: Tensor,
+    attention_topk_indices: Tensor,
+    softmax_scale: float,
+    indexer_softmax_scale: float,
+    loss_coeff: float,
+    calculate_per_token_loss: bool,
+    needs_grad: bool,
+    tp_group,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Run the layout-neutral sparse training path on flattened token rows."""
+    local_head_sum = sparse_teacher_total_seq(
+        q_attn,
+        k_attn,
+        lse,
+        attention_topk_indices,
+        softmax_scale,
+    )
+
+    tp_size = tp_group.size() if tp_group is not None and hasattr(tp_group, "size") else 1
+    tp_work = None
+    if tp_size > 1:
+        if _DSA_TP_OVERLAP:
+            tp_work = torch.distributed.all_reduce(
+                local_head_sum,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+                async_op=True,
+            )
+        else:
+            torch.distributed.all_reduce(
+                local_head_sum,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+
+    # This is independent of the teacher target, so it overlaps the TP
+    # reduction when NCCL is active.
+    predict = sparse_student_total_seq(
+        q_indexer,
+        k_indexer,
+        weights_scaled,
+        indexer_topk_indices,
+    )
+    if tp_work is not None:
+        tp_work.wait()
+
+    indexer_loss, grad_logits = sparse_kl_total_seq(
+        local_head_sum,
+        predict,
+        indexer_topk_indices,
+        loss_coeff,
+        calculate_per_token_loss,
+    )
+    if needs_grad:
+        grad_q, grad_k, grad_w = sparse_indexer_backward_total_seq(
+            grad_logits,
+            q_indexer,
+            k_indexer,
+            weights_scaled,
+            indexer_topk_indices,
+        )
+        # weights_scaled = weights_raw * indexer_softmax_scale.
+        grad_w = grad_w * indexer_softmax_scale
+    else:
+        grad_q = torch.zeros_like(q_indexer)
+        grad_k = torch.zeros_like(k_indexer)
+        grad_w = torch.zeros_like(weights_scaled)
+
+    return indexer_loss, grad_q, grad_k, grad_w
+
+
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
     """Path B: fused indexer (+KL loss) + sparse attention.
 
@@ -646,45 +736,29 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
         # 2. Indexer scoring + top-K
         prof.start("step2_indexer_topk")
-        topk_indices_cmp, _, indexer_scores = _indexer_topk_bshd(
+        topk_indices_cmp, _, _indexer_scores = _indexer_topk_bshd(
             q_idx_bshd, k_idx_bsd, w_bsh_scaled, effective_topk, ratio
         )
         prof.stop()
 
-        # 3. Combine indices (compressed + window)
+        # 3+4. Lower SBHD batch-local indices once into the layout-neutral
+        # total-sequence contract used by sparse attention and indexer loss.
         prof.start("step3_4_combine_flatten")
-        # Add kv_offset to compressed indices
-        topk_indices_global = topk_indices_cmp.clone()
-        valid_cmp = topk_indices_global >= 0
-        topk_indices_global[valid_cmp] += kv_offset
+        indexer_topk_flat, attention_indices_flat = pack_sbhd_sparse_indices(
+            topk_indices_cmp,
+            window_idxs,
+            kv_offset,
+        )
+        total_topk = attention_indices_flat.shape[-1]
 
-        # Combine: compressed first, then window
-        combined_idxs = torch.cat([topk_indices_global, window_idxs], dim=-1)  # (b, sq, total_topk)
-        total_topk = combined_idxs.shape[-1]
-
-        # 4. Flatten for sparse attention
         # Use SB (seq-major) flat layout: flat[s * b + batch_idx] = orig[s, batch_idx]
         # query: (sq, b, np, d) -> (sq*b, np, d)  — already SB order via reshape
         # kv_full: (skv, b, d) -> (skv*b, d)      — already SB order via reshape
         q_flat = query.reshape(sq * b, np_, d)
         kv_flat = kv_full.reshape(skv * b, -1)
-
-        # Convert local per-batch indices to global flat indices (SB layout).
-        # For SB flat KV: global_idx = local_kv_idx * b + batch_idx
-        # combined_idxs: (b, sq, total_topk) with local values in [0, skv)
-        batch_ids = torch.arange(b, device=query.device, dtype=combined_idxs.dtype)
-        global_idxs = combined_idxs.clone()
-        valid_mask = global_idxs >= 0
-        global_idxs = torch.where(
-            valid_mask,
-            global_idxs * b + batch_ids.view(b, 1, 1),
-            global_idxs,
-        )  # (b, sq, total_topk)
-        # Permute to SB order then flatten: (b, sq, topk) -> (sq, b, topk) -> (sq*b, topk)
-        global_idxs = global_idxs.permute(1, 0, 2).reshape(sq * b, total_topk)
         # MLA: all heads share KV indices. Keep as (sq*b, 1, TopK) to avoid
         # redundant np_ copies in save_for_backward and backward gather.
-        global_idxs = global_idxs.unsqueeze(1)  # (sq*b, 1, total_topk)
+        global_idxs = attention_indices_flat.unsqueeze(1)  # (sq*b, 1, total_topk)
         # Expand for forward (uses stride trick, no memory allocation)
         global_idxs_expanded = global_idxs.expand(-1, np_, -1)  # (sq*b, np, total_topk)
         prof.stop()
@@ -736,7 +810,36 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         q_attn_bshd = query.permute(1, 0, 2, 3)  # (b, sq, np, d)
         full_lse_bsh = lse.reshape(sq, b, np_).permute(1, 0, 2) if sparse_loss else None
 
-        if sparse_loss:
+        q_idx_flat = q_indexer.reshape(sq * b, idx_nh, idx_hd)
+        k_idx_flat = k_indexer.reshape(n_comp * b, idx_hd)
+        w_scaled_flat = w_bsh_scaled.permute(1, 0, 2).reshape(sq * b, idx_nh)
+
+        if sparse_loss and sparse_total_seq_eligible(q_idx_flat, q_flat):
+            (
+                indexer_loss,
+                grad_q_flat,
+                grad_k_flat,
+                grad_w_flat,
+            ) = _sparse_total_seq_loss_and_backward(
+                q_idx_flat,
+                k_idx_flat,
+                w_scaled_flat,
+                indexer_topk_flat,
+                q_flat,
+                kv_flat[:, :d],
+                lse,
+                attention_indices_flat[:, :effective_topk],
+                softmax_scale,
+                indexer_softmax_scale,
+                loss_coeff,
+                calculate_per_token_loss,
+                needs_grad,
+                tp_group,
+            )
+            precomputed_grad_q_indexer = grad_q_flat.reshape_as(q_indexer)
+            precomputed_grad_k_indexer = grad_k_flat.reshape_as(k_indexer)
+            precomputed_grad_weights = grad_w_flat.reshape_as(weights)
+        elif sparse_loss:
             k_attn_bsd = kv_full[:, :, :d].permute(1, 0, 2)  # (b, skv, d)
 
             ##### FlagScale Add #####

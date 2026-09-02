@@ -590,6 +590,61 @@ def dense_indexer_backward(
 # ---------------------------------------------------------------------------
 
 
+def sparse_indexer_backward_total_seq(
+    grad_logits: Tensor,
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Backpropagate selected student logits in layout-neutral flat form.
+
+    The forward-side score, softmax, and KL work is handled by Triton.  The
+    many-to-one key accumulation intentionally stays on PyTorch's tuned
+    ``scatter_add_`` implementation.
+
+    Args:
+        grad_logits: ``(total_q, topk)`` scaled gradient of student logits.
+        q_indexer: ``(total_q, heads, dim)``.
+        k_indexer: ``(total_k, dim)``.
+        weights: ``(total_q, heads)`` scaled indexer weights.
+        topk_indices: ``(total_q, topk)`` absolute flat key rows.
+
+    Returns:
+        Gradients for ``q_indexer``, ``k_indexer``, and scaled ``weights``.
+    """
+    total_k, dim = k_indexer.shape
+    safe_indices = topk_indices.long().clamp(min=0)
+    valid = topk_indices >= 0
+
+    q_float = q_indexer.float()
+    k_gathered = k_indexer.float()[safe_indices]
+    w_float = weights.float()
+    per_head_scores = torch.einsum("thd,tkd->thk", q_float, k_gathered)
+    relu_mask = per_head_scores > 0
+    relu_scores = torch.relu(per_head_scores)
+
+    grad_logits = grad_logits.masked_fill(~valid, 0.0)
+    grad_w = (grad_logits.unsqueeze(1) * relu_scores).sum(dim=-1)
+    grad_pre_relu = (
+        grad_logits.unsqueeze(1) * w_float.unsqueeze(-1) * relu_mask.float()
+    )
+    grad_q = torch.einsum("thk,tkd->thd", grad_pre_relu, k_gathered)
+    grad_k_gathered = torch.einsum("thk,thd->tkd", grad_pre_relu, q_float)
+
+    grad_k = torch.zeros(
+        total_k, dim, dtype=torch.float32, device=k_indexer.device
+    )
+    flat_indices = safe_indices.reshape(-1, 1).expand(-1, dim)
+    grad_k.scatter_add_(0, flat_indices, grad_k_gathered.reshape(-1, dim))
+
+    return (
+        grad_q.to(q_indexer.dtype),
+        grad_k.to(k_indexer.dtype),
+        grad_w.to(weights.dtype),
+    )
+
+
 def compute_sparse_local_target_head_sum(
     q_attn_bshd: Tensor,
     k_attn_bsd: Tensor,
