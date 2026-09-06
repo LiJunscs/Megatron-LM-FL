@@ -317,10 +317,10 @@ def compute_dsa_indexer_loss(
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
-    attention_scores = attention_scores.sum(dim=1)
+    attention_scores = attention_scores.sum(dim=1).contiguous()
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
-        torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
+        torch.distributed.all_reduce(attention_scores, group=pg_collection.tp)
     # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
     # obtained from softmax so they are already non-negative.
     target_denom_floor = (
