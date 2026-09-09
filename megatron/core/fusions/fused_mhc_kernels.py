@@ -3119,6 +3119,10 @@ def _torch_proj_rms_compute_h(
     eps: float,
     compute_h_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    # mHC mapping parameters stay in FP32 under Float16Module. The native
+    # fallback must also upcast activations, as the non-fused mHC path does.
+    x = x.float()
+    weight = weight.float()
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
