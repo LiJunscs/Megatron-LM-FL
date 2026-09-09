@@ -646,6 +646,12 @@ class TopKRouter(Router):
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h]
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
+        if self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+
+            flat_ids = scatter_to_sequence_parallel_region(flat_ids.contiguous(), self.tp_group)
+        if flat_ids.numel() != num_tokens:
+            raise ValueError("HashRouter input_ids must match the local hidden-state token rows.")
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
 
         probs = scores.gather(1, top_indices)
