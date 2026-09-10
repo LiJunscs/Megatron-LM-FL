@@ -45,7 +45,7 @@ def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
 
 
 def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:
-    """Lazily import a configured provider; legacy Triton runs directly in CSA."""
+    """Lazily import the configured provider."""
     global _BACKEND, _BACKEND_SELECTION
     backend = _get_dsa_kernel_backend(config)
     module_name = _BACKEND_MODULE_NAME_BY_BACKEND.get(backend) if backend != "none" else None
@@ -97,20 +97,21 @@ def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
 
 
 def configure_dsa_kernel_backend(config: TransformerConfig) -> None:
-    """Reset lazy fused CSA providers when building a model configuration."""
-    _get_dsa_kernel_backend(config)
+    """Select the fused CSA provider when building a model configuration."""
+    backend = _get_dsa_kernel_backend(config)
     from megatron.core.transformer.experimental_attention_variant.csa_utils import (
         fused_sparse_attention,
     )
 
-    # Legacy Triton is called only by CSA's guarded SBHD branch.
-    # It does not implement the reference repository's fused kernel-chain API.
+    if backend == "triton":
+        fused_sparse_attention.force_triton_dsa_backend()
+        return
     fused_sparse_attention.reset_triton_dsa_backend()
 
 
 def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
     """Return whether the configured effective DSA provider owns the kernel chain."""
-    return _get_dsa_kernel_backend(config) == "cudnn"
+    return _get_dsa_kernel_backend(config) in ("cudnn", "triton")
 
 
 def run_fused_qk_topk(

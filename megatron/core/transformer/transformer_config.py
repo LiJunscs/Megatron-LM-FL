@@ -436,7 +436,7 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_kernel_backend: Optional[Literal["none", "cudnn", "triton"]] = None
     """Explicit DSv4 backend; None preserves apply_dsa_kernel_fusion selection.
-    Legacy Triton is restricted to SBHD with CP=1. THD uses none or cudnn.
+    Triton uses THD kernels; SBHD inputs are packed into THD before CSA computation.
     """
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"

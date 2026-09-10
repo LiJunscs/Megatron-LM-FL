@@ -10,6 +10,8 @@ package, but built on top of
   cuDNN Frontend.
 * :mod:`flash_mla` — production sparse-attention forward kernel, expected to
   be available as a separate PyPI package.
+* :mod:`megatron.plugin.dsa_kernel` — optional THD Triton attention and
+  PyTorch indexer provider, selected by ``force_triton_dsa_backend``.
 
 Public API (same shape as the old ``dsa_kernels`` package):
 
@@ -40,20 +42,23 @@ from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_ls
 
 _flash_mla_sparse_fwd = None
 _DSA = None
+_DSA_FORCE_TRITON = False
 
 _CSA_TEACHER_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 
 
 def force_triton_dsa_backend() -> None:
-    """Reject the reference-only Triton namespace; FL routes legacy SBHD in CSA."""
-    raise NotImplementedError(
-        "The new Triton kernel chain is not integrated. Use CSA's SBHD CP=1 legacy path."
-    )
+    """Select the THD Triton provider for the shared CSA kernel chain."""
+    global _DSA_FORCE_TRITON, _DSA, _flash_mla_sparse_fwd
+    _DSA_FORCE_TRITON = True
+    _DSA = None
+    _flash_mla_sparse_fwd = None
 
 
 def reset_triton_dsa_backend() -> None:
     """Reset lazy cuDNN/FlashMLA handles between backend configurations."""
-    global _DSA, _flash_mla_sparse_fwd
+    global _DSA_FORCE_TRITON, _DSA, _flash_mla_sparse_fwd
+    _DSA_FORCE_TRITON = False
     _DSA = None
     _flash_mla_sparse_fwd = None
 
@@ -154,6 +159,19 @@ def _csa_fwd_flash_mla(
     assert not (
         indexer_topk > 0 and topk_length is not None
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
+    if _DSA_FORCE_TRITON:
+        from megatron.plugin.dsa_kernel import triton_csa_fwd_flash_mla
+
+        return triton_csa_fwd_flash_mla(
+            q,
+            kv,
+            topk_idxs,
+            softmax_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+        )
     _ensure_flash_mla()
 
     _total_S_q, _H, _D = q.shape
@@ -194,9 +212,14 @@ def _csa_fwd_flash_mla(
 
 
 def _ensure_dsa_namespace():
-    """Lazily import the cudnn-frontend DSA namespace."""
+    """Lazily import the selected CSA compute namespace."""
     global _DSA
     if _DSA is not None:
+        return
+    if _DSA_FORCE_TRITON:
+        from megatron.plugin.dsa_kernel import build_triton_dsa_namespace
+
+        _DSA = build_triton_dsa_namespace()
         return
     try:
         from cudnn import DSA as _ns

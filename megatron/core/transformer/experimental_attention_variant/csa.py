@@ -1984,19 +1984,9 @@ class CompressedSparseAttention(MegatronModule):
         topk_idxs = topk_idxs.int()
 
         nvtx_range_push("sparse_attn_kernel")
-        if self.config.dsa_kernel_backend == "triton":
-            # Preserve FL's existing SBHD kernel; index selection and teacher loss
-            # above use the synchronized implementation, including the window/sink LSE.
-            from megatron.plugin.dsa_kernel.triton_dsa_kernels import dsa_sparse_attn_sbhd
-
-            flat_idxs, _ = build_flat_topk_idxs(topk_idxs, batch_size=b)
-            output = dsa_sparse_attn_sbhd(
-                query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale
-            )
-        else:
-            output = unfused_compressed_sparse_attn(
-                query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
-            )
+        output = unfused_compressed_sparse_attn(
+            query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+        )
         nvtx_range_pop("sparse_attn_kernel")
         return output, indexer_loss
 
@@ -2169,14 +2159,6 @@ class CompressedSparseAttention(MegatronModule):
 
             cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
             qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
-            if self.config.dsa_kernel_backend == "triton" and (
-                cp_size != 1
-                or (packed_seq_params is not None and packed_seq_params.qkv_format == "thd")
-            ):
-                raise ValueError(
-                    "Legacy DSv4 Triton supports only SBHD with actual CP=1; "
-                    "use dsa_kernel_backend='none' or 'cudnn' for THD/CP."
-                )
             if cp_size > 1 and qkv_format != 'thd':
                 raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
             if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
@@ -2195,6 +2177,9 @@ class CompressedSparseAttention(MegatronModule):
                 return output
 
             sq, b, np, hn = query.size()
+
+            if self.config.dsa_kernel_backend == "triton":
+                return self._forward_triton_sbhd_as_thd(query, key, x, qr)
 
             kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
             kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
@@ -2243,6 +2228,35 @@ class CompressedSparseAttention(MegatronModule):
     # ------------------------------------------------------------------
     # THD per-path helpers (called from _forward_thd)
     # ------------------------------------------------------------------
+
+    def _forward_triton_sbhd_as_thd(self, query, key, x, qr):
+        """Pack SBHD batches as independent THD sequences before any CSA kernels.
+
+        Packing is batch-major: each sample's sequence occupies a contiguous
+        segment. A plain S*B reshape would interleave samples and corrupt
+        compression, causal windows and indexer offsets.
+        """
+        sq, batch, heads, dim = query.shape
+        total = sq * batch
+        cu_seqlens = torch.arange(batch + 1, device=query.device, dtype=torch.int32) * sq
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=sq,
+            max_seqlen_kv=sq,
+            cp_partition_mode="contiguous",
+        )
+        output = self._forward_thd(
+            query.transpose(0, 1).reshape(total, heads, dim),
+            key.transpose(0, 1).reshape(total, 1, 1, key.shape[-1]),
+            x.transpose(0, 1).reshape(total, 1, x.shape[-1]),
+            qr.transpose(0, 1).reshape(total, 1, qr.shape[-1]),
+            packed,
+        )
+        return output.reshape(batch, sq, -1).transpose(0, 1).contiguous()
 
     def _forward_unfused_csa_thd(
         self,
