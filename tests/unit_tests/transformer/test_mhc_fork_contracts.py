@@ -46,7 +46,9 @@ def test_fork_configuration_and_exports():
     assert config.mhc_sinkhorn_iterations == 20
     assert replace(config).num_residual_streams == 2
     assert "mhc_num_residual_streams" not in asdict(config)
-    assert tensor_parallel.CheckpointManager.__name__ == "CheckpointManager"
+    assert (
+        tensor_parallel.CheckpointWithoutOutputManager.__name__ == "CheckpointWithoutOutputManager"
+    )
     with pytest.raises(ValueError, match="mhc_fused_backend"):
         _config(mhc_fused_backend="invalid")
 
@@ -129,7 +131,7 @@ def test_retained_input_alias_and_forward_order_replay(model_parallel):
     reference = x.detach().clone().requires_grad_()
     (reference.view(2, 8).square() + reference.view(2, 8).sin()).sum().backward()
     calls = []
-    manager = tensor_parallel.CheckpointManager()
+    manager = tensor_parallel.CheckpointWithoutOutputManager()
 
     def first(value):
         calls.append("first")
@@ -251,7 +253,7 @@ def test_existing_fine_grained_callables(model_parallel, moe):
     )
     layer = _block(config, moe).layers[0]
     functions, _ = build_transformer_layer_callables(layer)
-    manager = tensor_parallel.CheckpointManager()
+    manager = tensor_parallel.CheckpointWithoutOutputManager()
     manager.is_last_layer_in_recompute_block = True
     node = SimpleNamespace(
         layer_state=SimpleNamespace(mhc_recompute_manager=manager),

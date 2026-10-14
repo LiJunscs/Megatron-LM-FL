@@ -775,7 +775,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class CheckpointManager:
+class CheckpointWithoutOutputManager:
     """
     Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
     within a TransformerBlock, enabling unified recomputation during backward pass.
@@ -783,7 +783,7 @@ class CheckpointManager:
     sequential dependencies (i.e., the output of one checkpoint is the input of the next).
 
     Usage:
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
         ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
@@ -840,7 +840,7 @@ class CheckpointWithoutOutput(object):
 
         Args:
             fp8: Whether to use FP8 activation recomputation. Defaults to False.
-            ckpt_manager: Optional CheckpointManager instance. When provided,
+            ckpt_manager: Optional CheckpointWithoutOutputManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.

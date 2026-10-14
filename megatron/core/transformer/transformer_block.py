@@ -22,7 +22,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.tensor_parallel.random import CheckpointManager  # FlagScale Modify
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager  # FlagScale Modify
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (  # FlagScale Modify
     HyperConnectionModule,
@@ -560,7 +560,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+    ) -> Tuple[List[Optional[CheckpointWithoutOutputManager]], List[bool]]:
         """Build per-layer managers using the shared mHC recompute contract."""
         return build_mhc_recompute_layer_plan(
             len(self.layers), self.config.mhc_recompute_layer_num, use_mhc_recompute
@@ -568,7 +568,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[CheckpointManager],
+        mhc_manager: Optional[CheckpointWithoutOutputManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:

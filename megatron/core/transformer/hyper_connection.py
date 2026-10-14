@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.tensor_parallel.random import CheckpointManager
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
@@ -20,15 +20,15 @@ _MHC_COMPUTE_H_EPS = 1e-6
 
 def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
-) -> Tuple[list[Optional[CheckpointManager]], list[bool]]:
+) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
     """Build per-layer mHC recompute managers and recompute-block end markers."""
-    layer_managers: list[Optional[CheckpointManager]] = [None] * num_layers
+    layer_managers: list[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
     is_recompute_block_end = [False] * num_layers
 
     if not use_mhc_recompute or num_layers == 0:
         return layer_managers, is_recompute_block_end
 
-    mhc_manager = CheckpointManager()
+    mhc_manager = CheckpointWithoutOutputManager()
     for layer_index in range(num_layers):
         is_last_in_transformer_block = layer_index == num_layers - 1
         is_last_in_recompute_block = is_last_in_transformer_block
@@ -41,13 +41,13 @@ def build_mhc_recompute_layer_plan(
         is_recompute_block_end[layer_index] = is_last_in_recompute_block
 
         if is_last_in_recompute_block and not is_last_in_transformer_block:
-            mhc_manager = CheckpointManager()
+            mhc_manager = CheckpointWithoutOutputManager()
 
     return layer_managers, is_recompute_block_end
 
 
 def finalize_mhc_recompute_layer(
-    mhc_manager: Optional[CheckpointManager],
+    mhc_manager: Optional[CheckpointWithoutOutputManager],
     hidden_states: Tensor,
     is_last_in_recompute_block: bool,
 ) -> None:
@@ -433,7 +433,7 @@ class HyperConnectionModule(MegatronModule):
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
         h_post: Tensor,
-        manager: Optional[CheckpointManager] = None,
+        manager: Optional[CheckpointWithoutOutputManager] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Apply H_post to x and optionally bias, with optional checkpointing.
@@ -446,7 +446,7 @@ class HyperConnectionModule(MegatronModule):
                 - x: [s, b, C] - hidden states
                 - bias: [C] or None - optional bias tensor
             h_post: [s, b, n] - expansion weights
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional CheckpointWithoutOutputManager for checkpoint management.
                 When provided, wraps _apply_h_post with CheckpointWithoutOutput.
 
         Returns:
@@ -522,7 +522,7 @@ class HyperConnectionModule(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        mhc_recompute_manager: Optional[CheckpointManager] = None,
+        mhc_recompute_manager: Optional[CheckpointWithoutOutputManager] = None,
         return_residual: bool = False,
     ) -> Tuple[Tensor, ...]:
         """
@@ -535,7 +535,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint
+            mhc_recompute_manager: Optional CheckpointWithoutOutputManager for checkpoint
                 management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
 
@@ -582,7 +582,7 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post, hs_for_residual
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: CheckpointManager
+        self, hidden_states: Tensor, manager: CheckpointWithoutOutputManager
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -594,7 +594,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            manager: CheckpointManager for unified recomputation
+            manager: CheckpointWithoutOutputManager for unified recomputation
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -672,7 +672,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: Optional[CheckpointManager] = None,
+        manager: Optional[CheckpointWithoutOutputManager] = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -695,7 +695,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional CheckpointWithoutOutputManager for checkpoint management.
                 When provided, each operation is wrapped with CheckpointWithoutOutput.
 
         Returns:
@@ -784,7 +784,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: CheckpointManager,
+        manager: CheckpointWithoutOutputManager,
     ) -> Tensor:
         """
         Checkpointed variant of _fused_h_res_h_post_bda_native.
@@ -802,7 +802,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: CheckpointManager for checkpoint management
+            manager: CheckpointWithoutOutputManager for checkpoint management
 
         Returns:
             output: [s, b, n*C] - final output
