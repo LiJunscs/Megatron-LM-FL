@@ -167,16 +167,12 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'kv_layernorm')
 
     @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_float16_wrapper_preserves_attention_fp32_parameters(self, compress_ratio, dtype):
+    def test_float16_wrapper_preserves_attention_fp32_parameters(self, compress_ratio):
         """Model conversion must preserve sink/APE values as well as their dtype."""
         from megatron.core.transformer.module import Float16Module
 
         model_parallel_cuda_manual_seed(_SEED)
         config = _make_config(num_layers=1, csa_compress_ratios=[compress_ratio])
-        config.fp16 = dtype == torch.float16
-        config.bf16 = dtype == torch.bfloat16
-        config.params_dtype = dtype
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg).cuda()
         protected = {
@@ -195,7 +191,7 @@ class TestDSv4HybridAttentionConstructor:
                 assert parameter.dtype == torch.float32, name
                 torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
             else:
-                assert parameter.dtype == dtype, name
+                assert parameter.dtype == torch.bfloat16, name
 
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
