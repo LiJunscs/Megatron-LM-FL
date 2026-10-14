@@ -588,7 +588,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 if enable_mhc:
                     # Save hidden_states and mhc scalar for later use.
                     hidden_states, mlp_h_res, mlp_h_post, residual = layer.mlp_hyper_connection(
-                        hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                        hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
                     )
                     node.layer_state.residual = node.detach(residual)
                     node.layer_state.mlp_h_res = node.detach(mlp_h_res)

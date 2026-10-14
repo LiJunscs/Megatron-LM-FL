@@ -318,17 +318,12 @@ class TransformerConfig(ModelParallelConfig):
     """Initial value of Gating Factor (alpha in paper)."""
 
     use_fused_mhc: bool = False
-    """Use unified fused kernels for mHC operations.
+    """Use unified fused kernels for mHC operations."""
 
-    When True, attempts to replace the reference mHC modules (SinkhornKnopp,
-    H_aggregate, H_post_bda, ProjRms) with fused/autograd implementations for
-    better performance on supported GPUs.  Backend selection is internal and
-    op-specific: Triton for Sinkhorn and H_post_bda backward when available,
-    cuTile for the remaining fused kernels when available, then native torch
-    fallback. If every mHC operation uses the native torch fallback,
-    use_fused_mhc remains enabled and a rank-0 warning is emitted. The all-native
-    fallback is functionally equivalent, but may not provide fused backend
-    performance benefits.
+    mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
+    """Backend policy for fused mHC operations; auto selects per operation.
+
+    Explicit backends fail if unavailable instead of silently falling back.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
@@ -1946,6 +1941,8 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_modules.append("moe")
 
         ######## FlagScale Begin ########
+        if self.mhc_fused_backend not in ("auto", "native", "triton", "cutile"):
+            raise ValueError("mhc_fused_backend must be auto, native, triton, or cutile")
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:

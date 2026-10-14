@@ -26,6 +26,8 @@ from megatron.core.tensor_parallel.random import CheckpointManager  # FlagScale 
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (  # FlagScale Modify
     HyperConnectionModule,
+    build_mhc_recompute_layer_plan,
+    finalize_mhc_recompute_layer,
     learned_output_contract,
 )
 from megatron.core.transformer.module import (
@@ -559,32 +561,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
     ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
-        """Pre-build per-layer MHC recompute managers and block-end markers."""
-        num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
-        is_recompute_block_end: List[bool] = [False] * num_layers
-
-        if not use_mhc_recompute or num_layers == 0:
-            return layer_managers, is_recompute_block_end
-
-        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointManager()
-
-        for l_no in range(num_layers):
-            is_last_in_transformer_block = l_no == num_layers - 1
-            is_last_in_recompute_block = is_last_in_transformer_block
-            if mhc_recompute_layer_num is not None:
-                is_last_in_recompute_block = is_last_in_transformer_block or (
-                    (l_no + 1) % mhc_recompute_layer_num == 0
-                )
-
-            layer_managers[l_no] = mhc_manager
-            is_recompute_block_end[l_no] = is_last_in_recompute_block
-
-            if is_last_in_recompute_block and not is_last_in_transformer_block:
-                mhc_manager = CheckpointManager()
-
-        return layer_managers, is_recompute_block_end
+        """Build per-layer managers using the shared mHC recompute contract."""
+        return build_mhc_recompute_layer_plan(
+            len(self.layers), self.config.mhc_recompute_layer_num, use_mhc_recompute
+        )
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
@@ -592,9 +572,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:
-        """Finalize MHC recompute state for the current layer when block ends."""
-        if mhc_manager is not None and is_last_in_recompute_block:
-            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        """Finalize the manager at a recompute block boundary."""
+        finalize_mhc_recompute_layer(mhc_manager, hidden_states, is_last_in_recompute_block)
 
     def forward(
         self,

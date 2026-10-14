@@ -810,7 +810,20 @@ else:
 
 
 def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-    """Keep DSv4 compressor and indexer operations outside an enclosing FP8 context."""
+    """Return a context manager that disables TE quantization.
+
+    Use this around submodule construction or execution that must stay in a higher
+    precision while its enclosing module uses an FP8 or FP4 context.
+
+    Args:
+        config: Transformer configuration that controls quantization.
+        is_init: Whether to disable the parameter-initialization context instead of
+            the forward autocast context.
+
+    Returns:
+        A disabled TE quantization context when quantization is active, otherwise a
+        no-op context.
+    """
     if not HAVE_TE:
         return nullcontext()
     if is_init:
