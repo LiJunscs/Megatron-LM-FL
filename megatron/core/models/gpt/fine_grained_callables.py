@@ -15,14 +15,21 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor, HyperConnectionTransformerLayer
-from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+    make_viewless_tensor,
+)
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -178,6 +185,11 @@ class PreProcessNode(ScheduleNode):
         self.chunk_state.sequence_len_offset = sequence_len_offset
         self.chunk_state.padding_mask = padding_mask
         self.chunk_state.rotary_pos_cos_sin = rotary_pos_cos_sin  # FlagScale Modify
+        decoder = self.gpt_model.decoder
+        if decoder.config.enable_hyper_connections and decoder.pre_process:
+            decoder_input = HyperConnectionModule.input_expand(
+                decoder_input, decoder.config.num_residual_streams
+            )
         return decoder_input
 
 
@@ -575,10 +587,10 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 # Preprocess mhc for moe layers. Because these op are moved away layer._forward_mlp, we have to do it here.
                 if enable_mhc:
                     # Save hidden_states and mhc scalar for later use.
-                    node.layer_state.residual = node.detach(hidden_states)
-                    hidden_states, mlp_h_res, mlp_h_post = layer.mlp_hyper_connection(
+                    hidden_states, mlp_h_res, mlp_h_post, residual = layer.mlp_hyper_connection(
                         hidden_states, mhc_recompute_manager=mhc_recompute_manager
                     )
+                    node.layer_state.residual = node.detach(residual)
                     node.layer_state.mlp_h_res = node.detach(mlp_h_res)
                     node.layer_state.mlp_h_post = node.detach(mlp_h_post)
                 # Save bda_manager to register backward hook for moe forward output. If not enable_mhc, it is None and does not affect anything.

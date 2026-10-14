@@ -311,7 +311,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of residual branches for hyper connections.
     Only used when enable_hyper_connections is True."""
 
-    mhc_sinkhorn_iterations: int = 10
+    mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
     mhc_init_gating_factor: float = 0.01
