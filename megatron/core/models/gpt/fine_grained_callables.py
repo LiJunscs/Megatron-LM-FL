@@ -607,7 +607,8 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 ## NOTE: If not enable mhc, layer is an instance of TransformerLayer,
                 # it does not has attribute mhc_checkpoint_pre_mlp_layernorm.
                 # But mhc_recompute_manager is always None in this case.
-                # If enable mhc, layer is an instance of HyperConnectionTransformerLayer and has attribute mhc_checkpoint_pre_mlp_layernorm.
+                # If enable mhc, layer is an instance of HyperConnectionTransformerLayer.
+                # It has attribute mhc_checkpoint_pre_mlp_layernorm.
                 # So this statement can cover both cases and avoid attribute error.
                 checkpoint_pre_mlp_layernorm = layer.recompute_pre_mlp_layernorm or (
                     mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
@@ -758,7 +759,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 )
             else:
                 # mhc_fused_h_res_h_post_bda,
-                # see megatron/core/transformer/hyper_connection.py:HyperConnectionTransformerLayer for more details.
+                # see HyperConnectionTransformerLayer for more details.
                 hidden_states = layer.mlp_hyper_connection.fused_h_res_h_post_bda(
                     node.layer_state.mlp_h_res,
                     residual,
