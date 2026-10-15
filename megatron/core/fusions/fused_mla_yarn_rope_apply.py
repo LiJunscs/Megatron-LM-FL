@@ -23,7 +23,7 @@ try:
         version.parse(triton.__version__) < version.parse("3.4.0")
         and not cur_platform.is_available()
     ):
-    ######## FlagScale End ########
+        ######## FlagScale End ########
         HAVE_TRITON = False
     else:
         HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))

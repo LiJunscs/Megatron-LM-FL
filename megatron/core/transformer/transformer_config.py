@@ -32,14 +32,15 @@ from megatron.core.transformer.cuda_graph_config import (
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
+from megatron.core.transformer.enums import LayerType  # FlagScale Modify
 from megatron.core.transformer.enums import (
     AttnBackend,
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
-    LayerType,  # FlagScale Modify
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.plugin.decorators import overridable  # FlagScale Modify
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -52,7 +53,7 @@ from ..utils import (
     mup_scaled_init_method_normal,
     scaled_init_method_normal,
 )
-from megatron.plugin.decorators import overridable  # FlagScale Modify
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -1360,6 +1361,7 @@ class TransformerConfig(ModelParallelConfig):
 
     lora_out_init_method: str = "zero"
     """Initialization method for LoRA B matrix."""
+
     ######## FlagScale End ########
     @overridable  # FlagScale Modify
     def __post_init__(self):
@@ -3035,7 +3037,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         return result
+
     ######## FlagScale End ########
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):

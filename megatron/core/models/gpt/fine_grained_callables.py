@@ -588,7 +588,9 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 if enable_mhc:
                     # Save hidden_states and mhc scalar for later use.
                     hidden_states, mlp_h_res, mlp_h_post, residual = layer.mlp_hyper_connection(
-                        hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+                        hidden_states,
+                        mhc_recompute_manager=mhc_recompute_manager,
+                        return_residual=True,
                     )
                     node.layer_state.residual = node.detach(residual)
                     node.layer_state.mlp_h_res = node.detach(mlp_h_res)
@@ -607,8 +609,10 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                     mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
                 )
                 if checkpoint_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(ckpt_manager=mhc_recompute_manager)
-                ######## FlagScale End ########
+                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                        ckpt_manager=mhc_recompute_manager
+                    )
+                    ######## FlagScale End ########
                     with off_interface(
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
@@ -636,7 +640,9 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, input_ids=input_ids)  # FlagScale Modify
+                probs, routing_map = layer.mlp.route(
+                    pre_mlp_layernorm_output, input_ids=input_ids
+                )  # FlagScale Modify
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
@@ -652,7 +658,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
             input_ids=node.chunk_state.input_ids,  # FlagScale Modify
-            mhc_recompute_manager=node.layer_state.mhc_recompute_manager  # FlagScale Modify
+            mhc_recompute_manager=node.layer_state.mhc_recompute_manager,  # FlagScale Modify
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
@@ -710,9 +716,10 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
 
         ######## FlagScale Begin ########
         if layer.recompute_pre_mlp_layernorm or (
-            node.layer_state.mhc_mlp_bda_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
+            node.layer_state.mhc_mlp_bda_manager is not None
+            and layer.mhc_checkpoint_pre_mlp_layernorm
         ):
-        ######## FlagScale End ########
+            ######## FlagScale End ########
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
@@ -795,7 +802,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                     node.chunk_state.hc_head_base,
                     node.chunk_state.hc_head_scale,
                     node.chunk_state.num_residual_streams,
-                    node.chunk_state.layernorm_epsilon
+                    node.chunk_state.layernorm_epsilon,
                 )
             output = final_layernorm(output)
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
@@ -806,7 +813,10 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
         """Wrapper for Dense forward."""
         ######## FlagScale Begin ########
         kwargs["input_ids"] = node.chunk_state.input_ids
-        if isinstance(layer, HyperConnectionTransformerLayer) and node.layer_state.mhc_recompute_manager is not None:
+        if (
+            isinstance(layer, HyperConnectionTransformerLayer)
+            and node.layer_state.mhc_recompute_manager is not None
+        ):
             kwargs["mhc_recompute_manager"] = node.layer_state.mhc_recompute_manager
         ######## FlagScale End ########
         return layer._forward_mlp(*args, **kwargs)

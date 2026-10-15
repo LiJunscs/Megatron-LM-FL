@@ -434,17 +434,21 @@ class Float16Module(MegatronModule):
         self.vp_size = config.virtual_pipeline_model_parallel_size
         self.vp_stage = getattr(module, 'vp_stage', None)
         self.dualpipev_size = config.dualpipev_pipeline_model_parallel_size
-        self.dualpipev_stage = getattr(module, 'dualpipev_stage',  None)
+        self.dualpipev_stage = getattr(module, 'dualpipev_stage', None)
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', convert_module_to_dtype_except_fp32_marked(module, torch.float16))
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.float16)
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16))
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()
@@ -499,7 +503,9 @@ class Float16Module(MegatronModule):
         ######## FlagScale Begin ########
         # TODO: Fix the dualpipev import issue in the latest Megatron codebase
         if self.config.use_dualpipev:
-            if is_dualpipev_first_stage(self.dualpipev_stage, self.dualpipev_size) and is_pp_first_stage(pp_group):
+            if is_dualpipev_first_stage(
+                self.dualpipev_stage, self.dualpipev_size
+            ) and is_pp_first_stage(pp_group):
                 inputs = fp32_to_float16(inputs, self.float16_convertor)
             outputs = self.module(*inputs, **kwargs)
             if (
