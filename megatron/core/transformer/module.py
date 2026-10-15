@@ -495,6 +495,7 @@ class Float16Module(MegatronModule):
             is_vp_first_stage,
             is_vp_last_stage,
         )
+
         # isort: on
 
         if self.pg_collection is None:

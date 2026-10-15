@@ -584,7 +584,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 hidden_states, _ = layer._forward_attention(**fwd_attn_kwargs)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
-                # Preprocess mhc for moe layers. 
+                # Preprocess mhc for moe layers.
                 # Because these op are moved away layer._forward_mlp, we have to do it here.
                 if enable_mhc:
                     # Save hidden_states and mhc scalar for later use.
@@ -596,7 +596,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                     node.layer_state.residual = node.detach(residual)
                     node.layer_state.mlp_h_res = node.detach(mlp_h_res)
                     node.layer_state.mlp_h_post = node.detach(mlp_h_post)
-                # Save bda_manager to register backward hook for moe forward output. 
+                # Save bda_manager to register backward hook for moe forward output.
                 # If not enable_mhc, it is None and does not affect anything.
                 is_last_in_recompute_block = bool(
                     mhc_recompute_manager is not None
@@ -604,9 +604,9 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                 )
                 mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
                 node.layer_state.mhc_mlp_bda_manager = mhc_mlp_bda_manager
-                ## NOTE: If not enable mhc, layer is an instance of TransformerLayer, 
+                ## NOTE: If not enable mhc, layer is an instance of TransformerLayer,
                 # it does not has attribute mhc_checkpoint_pre_mlp_layernorm.
-                # But mhc_recompute_manager is always None in this case. 
+                # But mhc_recompute_manager is always None in this case.
                 # If enable mhc, layer is an instance of HyperConnectionTransformerLayer and has attribute mhc_checkpoint_pre_mlp_layernorm.
                 # So this statement can cover both cases and avoid attribute error.
                 checkpoint_pre_mlp_layernorm = layer.recompute_pre_mlp_layernorm or (
@@ -668,7 +668,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
             return hidden_states
 
         ######## FlagScale Begin ########
-        # Detach here for mlp_bda residual connection. 
+        # Detach here for mlp_bda residual connection.
         # If enable_mhc, residual is saved before mlp_hyper_connection.
         if not enable_mhc:
             node.layer_state.residual = node.detach(hidden_states)
@@ -757,7 +757,7 @@ def build_transformer_layer_callables(layer: TransformerLayer | HyperConnectionT
                     mlp_output_with_bias, residual, layer.hidden_dropout
                 )
             else:
-                # mhc_fused_h_res_h_post_bda, 
+                # mhc_fused_h_res_h_post_bda,
                 # see megatron/core/transformer/hyper_connection.py:HyperConnectionTransformerLayer for more details.
                 hidden_states = layer.mlp_hyper_connection.fused_h_res_h_post_bda(
                     node.layer_state.mlp_h_res,
