@@ -23,6 +23,15 @@ from megatron.core.transformer.hyper_connection import (
     native_sinkhorn,
 )
 
+##### FlagScale Begin #####
+# Keep FP64 references and error comparisons on CPU for non-CUDA platforms.
+# Move tensors before casting so unsupported devices never need FP64 tensors.
+from megatron.plugin.platform import get_platform
+
+cur_platform = get_platform().platform_name()
+fp64_device = "cuda" if cur_platform == "cuda" else "cpu"
+##### FlagScale End #####
+
 _require_cutile = pytest.mark.skipif(
     not is_cutile_available(), reason="cuTile unavailable for current device"
 )
@@ -1412,8 +1421,8 @@ class TestFusedProjRmsComputeHKeepFp32:
 
     @staticmethod
     def _rms_rel(actual: Tensor, ref64: Tensor) -> float:
-        a = actual.detach().to(torch.float64)
-        r = ref64.detach().to(torch.float64)
+        a = actual.detach().to(device=fp64_device).to(torch.float64)
+        r = ref64.detach().to(device=fp64_device).to(torch.float64)
         return ((a - r).pow(2).mean().sqrt() / r.abs().max().clamp_min(1e-30)).item()
 
     @pytest.mark.parametrize("M,n,hidden", [(256, 4, 4096), (128, 4, 1024)])
@@ -1438,19 +1447,21 @@ class TestFusedProjRmsComputeHKeepFp32:
             x, w, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
         )
 
-        # fp64 reference from the same input values.
-        x64, w64 = x.to(torch.float64), w.to(torch.float64)
+        # FP64 reference from the same input values, on CPU for non-CUDA platforms.
+        x64 = x.to(device=fp64_device).to(torch.float64)
+        w64 = w.to(device=fp64_device).to(torch.float64)
         proj64 = x64 @ w64.t()
         r64 = x64.norm(dim=-1, keepdim=True) / math.sqrt(K)
         alpha64 = torch.cat(
             [
-                alpha_pre.to(torch.float64).expand(n),
-                alpha_post.to(torch.float64).expand(n),
-                alpha_res.to(torch.float64).expand(N - 2 * n),
+                alpha_pre.to(device=fp64_device).to(torch.float64).expand(n),
+                alpha_post.to(device=fp64_device).to(torch.float64).expand(n),
+                alpha_res.to(device=fp64_device).to(torch.float64).expand(N - 2 * n),
             ],
             dim=-1,
         )
-        h64 = proj64 * alpha64.unsqueeze(0) / (r64 + eps) + bias.to(torch.float64).unsqueeze(0)
+        bias64 = bias.to(device=fp64_device).to(torch.float64)
+        h64 = proj64 * alpha64.unsqueeze(0) / (r64 + eps) + bias64.unsqueeze(0)
 
         assert self._rms_rel(h_pre, h64[..., :n].sigmoid() + compute_h_eps) < self.MAPPING_RMS_TOL
         assert self._rms_rel(h_post, h64[..., n : 2 * n].sigmoid() * 2) < self.MAPPING_RMS_TOL
