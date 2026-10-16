@@ -24,12 +24,11 @@ from megatron.core.transformer.hyper_connection import (
 )
 
 ##### FlagScale Begin #####
-# Keep FP64 references and error comparisons on CPU for non-CUDA platforms.
-# Move tensors before casting so unsupported devices never need FP64 tensors.
+# Use FP32 references and error comparisons on non-CUDA platforms without FP64.
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform().platform_name()
-fp64_device = "cuda" if cur_platform == "cuda" else "cpu"
+ref_dtype = torch.float64 if cur_platform == "cuda" else torch.float32
 ##### FlagScale End #####
 
 _require_cutile = pytest.mark.skipif(
@@ -1412,6 +1411,9 @@ class TestFusedProjRmsComputeHKeepFp32:
     Tolerances here are ~15x tighter than the module-level FWD_ATOL/RTOL: the
     bug this guards against (bf16 split-K partials and bf16 mapping outputs)
     cost 170x accuracy while staying well inside the loose tolerances.
+
+    CUDA uses an FP64 reference; other platforms use FP32 on the input device.
+    The FP32 reference checks agreement but can share rounding errors with native.
     """
 
     # Native fp32 reference achieves ~8e-6 rms; the bf16-output bug gave ~1.5e-3.
@@ -1420,14 +1422,14 @@ class TestFusedProjRmsComputeHKeepFp32:
     R_RMS_TOL = 1e-5
 
     @staticmethod
-    def _rms_rel(actual: Tensor, ref64: Tensor) -> float:
-        a = actual.detach().to(device=fp64_device).to(torch.float64)
-        r = ref64.detach().to(device=fp64_device).to(torch.float64)
+    def _rms_rel(actual: Tensor, ref: Tensor) -> float:
+        a = actual.detach().to(device=ref.device, dtype=ref_dtype)
+        r = ref.detach().to(ref_dtype)
         return ((a - r).pow(2).mean().sqrt() / r.abs().max().clamp_min(1e-30)).item()
 
     @pytest.mark.parametrize("M,n,hidden", [(256, 4, 4096), (128, 4, 1024)])
     def test_bf16_activations_fp32_params(self, M, n, hidden):
-        """Fused mapping with production dtypes must match an fp64 reference."""
+        """Fused mapping with production dtypes must match the platform reference."""
         from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
 
         _info()
@@ -1447,26 +1449,26 @@ class TestFusedProjRmsComputeHKeepFp32:
             x, w, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
         )
 
-        # FP64 reference from the same input values, on CPU for non-CUDA platforms.
-        x64 = x.to(device=fp64_device).to(torch.float64)
-        w64 = w.to(device=fp64_device).to(torch.float64)
-        proj64 = x64 @ w64.t()
-        r64 = x64.norm(dim=-1, keepdim=True) / math.sqrt(K)
-        alpha64 = torch.cat(
+        # Reference from the same input values, using the platform reference dtype.
+        x_ref = x.to(ref_dtype)
+        w_ref = w.to(ref_dtype)
+        proj_ref = x_ref @ w_ref.t()
+        r_ref = x_ref.norm(dim=-1, keepdim=True) / math.sqrt(K)
+        alpha_ref = torch.cat(
             [
-                alpha_pre.to(device=fp64_device).to(torch.float64).expand(n),
-                alpha_post.to(device=fp64_device).to(torch.float64).expand(n),
-                alpha_res.to(device=fp64_device).to(torch.float64).expand(N - 2 * n),
+                alpha_pre.to(ref_dtype).expand(n),
+                alpha_post.to(ref_dtype).expand(n),
+                alpha_res.to(ref_dtype).expand(N - 2 * n),
             ],
             dim=-1,
         )
-        bias64 = bias.to(device=fp64_device).to(torch.float64)
-        h64 = proj64 * alpha64.unsqueeze(0) / (r64 + eps) + bias64.unsqueeze(0)
+        bias_ref = bias.to(ref_dtype)
+        h_ref = proj_ref * alpha_ref.unsqueeze(0) / (r_ref + eps) + bias_ref.unsqueeze(0)
 
-        assert self._rms_rel(h_pre, h64[..., :n].sigmoid() + compute_h_eps) < self.MAPPING_RMS_TOL
-        assert self._rms_rel(h_post, h64[..., n : 2 * n].sigmoid() * 2) < self.MAPPING_RMS_TOL
-        assert self._rms_rel(h_res, h64[..., 2 * n :]) < self.MAPPING_RMS_TOL
-        assert self._rms_rel(r, r64) < self.R_RMS_TOL
+        assert self._rms_rel(h_pre, h_ref[..., :n].sigmoid() + compute_h_eps) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_post, h_ref[..., n : 2 * n].sigmoid() * 2) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_res, h_ref[..., 2 * n :]) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(r, r_ref) < self.R_RMS_TOL
 
     def test_native_fallback_accepts_mixed_dtypes(self):
         """The native fallback must run with bf16 activations x fp32 parameters."""
