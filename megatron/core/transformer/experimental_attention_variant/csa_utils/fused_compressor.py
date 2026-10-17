@@ -295,7 +295,7 @@ def _prepare_grouped_compressor_inputs(
         starts = torch.where(group_ids == 0, rows, 0).cummax(dim=0).values
         comp_offsets = torch.cat((starts.new_zeros(1), starts, starts.new_full((1,), groups + 1)))
     else:
-        comp_offsets = torch.tensor([0, groups], device=group_ids.device, dtype=torch.int32)
+        comp_offsets = torch.arange(2, device=group_ids.device, dtype=torch.int32) * groups
     return kv, score, comp_offsets * ratio, comp_offsets
 
 

@@ -317,3 +317,25 @@ def test_real_compile_keeps_public_pooling(monkeypatch, ratio):
     ):
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
     torch.compiler.reset()
+
+
+@pytest.mark.parametrize('ratio', [4, 128])
+@pytest.mark.parametrize('ids', [[0, 1, 0, -1], [7, 8, 0, -1], [-1, -1]])
+def test_group_adapter_cuda_graph_capture_and_replay(ratio, ids):
+    """Capture only the public group ABI adapter; this does not validate fused SM100."""
+    coff = 2 if ratio == 4 else 1
+    group_ids = torch.tensor(ids, device='cuda', dtype=torch.int32)
+    kv = torch.randn(len(ids) * ratio, 1, coff * 8, device='cuda')
+    score = torch.randn_like(kv)
+    # Prime allocator/dispatch outside capture; no frontend is involved.
+    fused._prepare_grouped_compressor_inputs(kv, score, group_ids, ratio, coff)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused._prepare_grouped_compressor_inputs(kv, score, group_ids, ratio, coff)
+    for step in range(2):
+        kv.add_(0.25)
+        score.add_(0.125)
+        graph.replay()
+        expected = fused._prepare_grouped_compressor_inputs(kv, score, group_ids, ratio, coff)
+        for got, want in zip(captured, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
