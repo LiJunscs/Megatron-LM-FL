@@ -23,6 +23,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     rotate_activation,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_backend import (
+    _get_dsa_kernel_backend,
     use_fused_dsa_kernels,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -32,6 +33,7 @@ from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .csa_utils import cp_utils, packed_layout
+from .csa_utils.fused_compressor import maybe_compress_grouped_fused
 from .csa_utils.fused_sparse_attention import (
     build_flat_topk_idxs,
     csa_sparse_attn,
@@ -498,6 +500,7 @@ class Compressor(MegatronModule):
         self.head_dim = head_dim
         self.overlap = compress_ratio == 4
         self.coff = 1 + int(self.overlap)
+        self.use_fused_compressor = _get_dsa_kernel_backend(config) == "cudnn"
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
@@ -675,13 +678,24 @@ class Compressor(MegatronModule):
         total_comp = compressed_group_ids.shape[0]
         ratio = self.compress_ratio
         kv, score = self._project(x)
-        kv = kv.reshape(total_comp, ratio, 1, -1)
-        score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
-        if self.overlap:
-            is_first = compressed_group_ids == 0
-            kv = self._overlap_transform_thd(kv, is_first, fill_value=0)
-            score = self._overlap_transform_thd(score, is_first, fill_value=float("-inf"))
-        compressed = _pool_compressor_values(kv, score, x.dtype)
+        compressed = maybe_compress_grouped_fused(
+            kv,
+            score,
+            self.ape,
+            compressed_group_ids,
+            ratio=ratio,
+            head_dim=self.head_dim,
+            coff=self.coff,
+            enabled=self.use_fused_compressor,
+        )
+        if compressed is None:
+            kv = kv.reshape(total_comp, ratio, 1, -1)
+            score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
+            if self.overlap:
+                is_first = compressed_group_ids == 0
+                kv = self._overlap_transform_thd(kv, is_first, fill_value=0)
+                score = self._overlap_transform_thd(score, is_first, fill_value=float("-inf"))
+            compressed = _pool_compressor_values(kv, score, x.dtype)
         compressed = apply_module(self.norm)(compressed)
         if self.config.apply_rope_fusion:
             cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
