@@ -41,6 +41,7 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.plugin.decorators import overridable  # FlagScale Modify
+from megatron.plugin.platform import get_platform  # FlagScale Modify
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1946,6 +1947,23 @@ class TransformerConfig(ModelParallelConfig):
         ######## FlagScale Begin ########
         if self.mhc_fused_backend not in ("auto", "native", "triton", "cutile"):
             raise ValueError("mhc_fused_backend must be auto, native, triton, or cutile")
+        if self.use_fused_mhc and self.mhc_fused_backend in ("auto", "triton"):
+            platform_name = get_platform().platform_name()
+            # MetaX exposes the CUDA API rather than a separate platform.
+            if platform_name == "cuda" and getattr(torch.version, "maca", None):
+                platform_name = "metax"
+            if platform_name in ("kunlunxin", "metax"):
+                raise ValueError(
+                    f"Triton fused mHC kernels are incompatible with {platform_name} "
+                    f"(mhc_fused_backend={self.mhc_fused_backend!r}). "
+                    "Set mhc_fused_backend='native' or use_fused_mhc=False."
+                )
+            if platform_name in ("npu", "enflame"):
+                warnings.warn(
+                    f"Triton fused mHC kernels have known compilation timeouts on {platform_name} "
+                    f"(mhc_fused_backend={self.mhc_fused_backend!r}). "
+                    "Set mhc_fused_backend='native' or use_fused_mhc=False to avoid this path."
+                )
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
