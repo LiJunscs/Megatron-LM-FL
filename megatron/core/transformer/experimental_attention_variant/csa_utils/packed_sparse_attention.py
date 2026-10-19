@@ -25,7 +25,7 @@ from .fused_sparse_attention import (
     _csa_sparse_attention_backward,
 )
 from .fused_sparse_attention import _get_topk_alignment as get_flash_mla_topk_alignment
-from .fused_sparse_attention import _kl_loss_from_dense_scores, _pad_cudnn_indexer_topk
+from .fused_sparse_attention import _kl_loss_from_dense_scores
 
 _DSA: Any = None
 
@@ -317,8 +317,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         # Preserve the fixed window suffix for the dense teacher before
         # compacting the complete attention index set.
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
-        indexer_topk_idxs = _pad_cudnn_indexer_topk(indexer_topk_idxs)
-        indexer_topk = indexer_topk_idxs.shape[-1]
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
 
         # Do not request FlashMLA's partial indexer LSE: it omits both the
@@ -348,26 +346,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
 
         if sparse_loss:
-            cu_q, cu_k, q_offsets = indexer_layout
-            teacher_compressed_kv = compressed_kv.detach()
-            if indexer_rank_map is not None:
-                teacher_compressed_kv = teacher_compressed_kv.index_select(
-                    0, indexer_rank_map.clamp_min(0)
-                )
-            full_teacher_lse = fused_csa_teacher_lse(
-                query,
-                kv_full,
-                teacher_compressed_kv,
-                attn_sink,
-                window_topk_idxs,
-                softmax_scale,
-                ratio,
-                cu_seqlens_q=cu_q,
-                cu_seqlens_k=cu_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_q // ratio,
-                q_causal_offsets=q_offsets,
-            )
             indexer_topk_idxs_for_loss = indexer_topk_idxs
             if q_padding_mask is not None:
                 indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
@@ -385,7 +363,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             target = _compute_attn_target(
                 query.detach(),
                 compressed_kv.detach(),
-                full_teacher_lse,
+                torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_)),
                 indexer_topk_idxs_for_loss,
                 softmax_scale,
                 qhead_per_kv_head=np_,
@@ -720,7 +698,7 @@ def indexer_topk(
 ):
     """Select packed BF16 indexer keys with ratio-causal offsets and sanitized padding."""
     _ensure_dsa_namespace()
-    w = weights
+    w = (weights.float() * indexer_softmax_scale).to(weights.dtype)
     if max_seqlen_kv == 0 or k.shape[0] == 0:
         return torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32), torch.zeros(
             q.shape[0], device=q.device, dtype=torch.int32
@@ -734,7 +712,6 @@ def indexer_topk(
         k.unsqueeze(1),
         w,
         ratio=ratio,
-        sm_scale=indexer_softmax_scale,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_kv,
         max_seqlen_q=max_seqlen_q,

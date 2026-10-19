@@ -547,16 +547,13 @@ def compute_dsa_indexer_loss(
 
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
-        if non_compressed_lse is None:
-            attention_scores += index_mask.view(b, 1, sq, sk)
+        attention_scores += index_mask.view(b, 1, sq, sk)
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
         index_scores += index_mask
         index_valid_mask = base_valid_mask & (index_mask == 0)
     else:
         index_valid_mask = base_valid_mask
-    attention_valid_mask = (
-        index_valid_mask if sparse_loss and non_compressed_lse is None else base_valid_mask
-    )
+    attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
     attention_scores = _compute_indexer_teacher_probabilities(
@@ -566,9 +563,6 @@ def compute_dsa_indexer_loss(
     index_log_scores = dsa_masking.masked_log_softmax(
         index_scores.float(), index_valid_mask, dim=-1
     )
-
-    if sparse_loss and non_compressed_lse is not None:
-        attention_scores = attention_scores.masked_fill(~index_valid_mask.unsqueeze(1), 0)
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
@@ -892,8 +886,7 @@ def bwd_fused_indexer_loss_naive(
 
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
-        if non_compressed_lse is None:
-            attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
+        attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
         index_scores = index_scores + index_mask
 
@@ -902,16 +895,10 @@ def bwd_fused_indexer_loss_naive(
         index_valid_mask = base_valid_mask & (index_mask == 0)
     else:
         index_valid_mask = base_valid_mask
-    attention_valid_mask = (
-        index_valid_mask if sparse_loss and non_compressed_lse is None else base_valid_mask
-    )
+    attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
     attention_scores_softmax = _compute_indexer_teacher_probabilities(
         attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
-    if sparse_loss and non_compressed_lse is not None:
-        attention_scores_softmax = attention_scores_softmax.masked_fill(
-            ~index_valid_mask.unsqueeze(1), 0
-        )
     # Free attention_scores immediately
     del attention_scores
 

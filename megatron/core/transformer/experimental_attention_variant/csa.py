@@ -24,6 +24,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_backend import (
     _get_dsa_kernel_backend,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -33,7 +35,6 @@ from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .csa_utils import cp_utils, packed_layout
-from .csa_utils.fused_compressor import maybe_compress_grouped_fused
 from .csa_utils.fused_sparse_attention import (
     build_flat_topk_idxs,
     csa_sparse_attn,
@@ -225,28 +226,6 @@ def _apply_rope(
 # ---------------------------------------------------------------------------
 
 
-class _GatherSparseKV(torch.autograd.Function):
-    """Gather sparse values with an FP32, fixed-order gradient reduction."""
-
-    @staticmethod
-    def forward(ctx, values, indices):
-        order = torch.argsort(indices, stable=True)
-        sorted_indices = indices.index_select(0, order)
-        unique, counts = torch.unique_consecutive(sorted_indices, return_counts=True)
-        ctx.save_for_backward(order, unique, counts)
-        ctx.input_shape = values.shape
-        return values.index_select(0, indices)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        order, unique, counts = ctx.saved_tensors
-        contributions = grad_output.float().index_select(0, order)
-        summed = torch.segment_reduce(contributions, "sum", lengths=counts)
-        grad_input = grad_output.new_zeros(ctx.input_shape)
-        grad_input.index_copy_(0, unique, summed)
-        return grad_input, None
-
-
 def unfused_compressed_sparse_attn(
     query: torch.Tensor,
     kv_full: torch.Tensor,
@@ -282,11 +261,10 @@ def unfused_compressed_sparse_attn(
     # dense shape before reducing the stride-0 query dimension.
     n_kv = kv_full.size(0)
     topk = topk_indices.size(-1)
-    # Accumulate repeated KV gather gradients in FP32 before casting once.
-    kv_flat = kv_full.float().permute(1, 0, 2).reshape(b * n_kv, hn)
+    kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn)
     batch_offsets = (torch.arange(b, device=kv_full.device, dtype=torch.int64) * n_kv).view(b, 1, 1)
     safe_indices = topk_indices.clamp(min=0).to(dtype=torch.int64) + batch_offsets
-    kv_gathered = _GatherSparseKV.apply(kv_flat, safe_indices.reshape(-1)).view(b, sq, topk, hn)
+    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(b, sq, topk, hn)
 
     # --- Attention scores ---
     # query: [sq, b, np, hn] -> [b, np, sq, hn]
@@ -500,7 +478,6 @@ class Compressor(MegatronModule):
         self.head_dim = head_dim
         self.overlap = compress_ratio == 4
         self.coff = 1 + int(self.overlap)
-        self.use_fused_compressor = _get_dsa_kernel_backend(config) == "cudnn"
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
@@ -678,24 +655,13 @@ class Compressor(MegatronModule):
         total_comp = compressed_group_ids.shape[0]
         ratio = self.compress_ratio
         kv, score = self._project(x)
-        compressed = maybe_compress_grouped_fused(
-            kv,
-            score,
-            self.ape,
-            compressed_group_ids,
-            ratio=ratio,
-            head_dim=self.head_dim,
-            coff=self.coff,
-            enabled=self.use_fused_compressor,
-        )
-        if compressed is None:
-            kv = kv.reshape(total_comp, ratio, 1, -1)
-            score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
-            if self.overlap:
-                is_first = compressed_group_ids == 0
-                kv = self._overlap_transform_thd(kv, is_first, fill_value=0)
-                score = self._overlap_transform_thd(score, is_first, fill_value=float("-inf"))
-            compressed = _pool_compressor_values(kv, score, x.dtype)
+        kv = kv.reshape(total_comp, ratio, 1, -1)
+        score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
+        if self.overlap:
+            is_first = compressed_group_ids == 0
+            kv = self._overlap_transform_thd(kv, is_first, fill_value=0)
+            score = self._overlap_transform_thd(score, is_first, fill_value=float("-inf"))
+        compressed = _pool_compressor_values(kv, score, x.dtype)
         compressed = apply_module(self.norm)(compressed)
         if self.config.apply_rope_fusion:
             cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
@@ -860,8 +826,7 @@ class CSAIndexer(MegatronModule):
             )
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
-        self.compressor = build_module(
-            not_none(submodules.compressor),
+        self.compressor = not_none(submodules.compressor)(
             config=config,
             compress_ratio=compress_ratio,
             head_dim=self.index_head_dim,
@@ -1060,7 +1025,13 @@ class CompressedSparseAttention(MegatronModule):
             softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
         self.use_fused_kernels = use_fused_dsa_kernels(config)
-        self.n_local_heads = self.num_attention_heads
+        if self.use_fused_kernels and _get_dsa_kernel_backend(config) == "triton":
+            # TODO(next PR): correct the Triton CSA indexer KL loss formulas
+            # and verify forward/backward parity before enabling this backend.
+            assert False, (
+                "Triton CSA is disabled due to indexer KL loss mathematical formula issues; "
+                "resolve them in the next PR before enabling this backend."
+            )
 
         # Learnable attention sink per head, kept in reference-checkpoint FP32.
         self.attn_sink = mark_keep_in_fp32(
@@ -1070,8 +1041,7 @@ class CompressedSparseAttention(MegatronModule):
         # Conditionally build Compressor (ratio > 1)
         self.compressor: CompressorInterface | None
         if self.compress_ratio > 1 and submodules.compressor is not None:
-            self.compressor = build_module(
-                submodules.compressor,
+            self.compressor = submodules.compressor(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 head_dim=config.v_head_dim,
@@ -1090,8 +1060,7 @@ class CompressedSparseAttention(MegatronModule):
             and not config.csa_dense_mode
             and submodules.indexer is not None
         ):
-            self.indexer = build_module(
-                submodules.indexer,
+            self.indexer = submodules.indexer(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1112,19 +1081,6 @@ class CompressedSparseAttention(MegatronModule):
         self, query: torch.Tensor, key: torch.Tensor, x: torch.Tensor, qr: torch.Tensor
     ) -> torch.Tensor:
         """Run the cuDNN/FlashMLA CSA path for an SBHD input."""
-        sbhd_build = build_flat_topk_idxs
-        sbhd_attention = csa_sparse_attn
-        sbhd_fused_indexer = fused_csa_indexer_sparse_attn
-        sbhd_topk = indexer_topk
-        if getattr(self.config, "dsa_kernel_backend", "cudnn") == "triton":
-            from megatron.plugin.dsa_kernel import triton_dsa_kernels as sbhd_backend
-            from megatron.plugin.dsa_kernel.sbhd_compat import build_flat_topk_idxs as triton_build
-
-            sbhd_build = triton_build
-            sbhd_attention = sbhd_backend.dsa_sparse_attn_sbhd
-            sbhd_fused_indexer = sbhd_backend.fused_indexer_sparse_attn
-            sbhd_topk = sbhd_backend.indexer_topk
-
         sq, batch, _num_heads, _head_dim = query.size()
         kv = key.squeeze(-2)
 
@@ -1156,7 +1112,7 @@ class CompressedSparseAttention(MegatronModule):
 
             indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
             nvtx_range_push("sparse_attn_kernel")
-            output, indexer_loss = sbhd_fused_indexer(
+            output, indexer_loss = fused_csa_indexer_sparse_attn(
                 query,
                 kv_full,
                 self.attn_sink.float(),
@@ -1186,7 +1142,7 @@ class CompressedSparseAttention(MegatronModule):
             q_indexer, k_indexer, indexer_weights = self.indexer.forward_before_topk(
                 x.detach(), qr.detach()
             )
-            compressed_indices, _ = sbhd_topk(
+            compressed_indices, _ = indexer_topk(
                 q_indexer,
                 k_indexer,
                 indexer_weights,
@@ -1197,13 +1153,13 @@ class CompressedSparseAttention(MegatronModule):
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
             )
-            flat_indices, flat_topk_length = sbhd_build(
+            flat_indices, flat_topk_length = build_flat_topk_idxs(
                 window_indices, compressed_indices, batch_size=batch, compact=True
             )
             nvtx_range_pop("compressed_indices")
 
             nvtx_range_push("sparse_attn_kernel")
-            output = sbhd_attention(
+            output = csa_sparse_attn(
                 query,
                 kv_full,
                 self.attn_sink.float(),
@@ -1218,13 +1174,15 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_indices = get_compress_topk_idxs(
                     self.compress_ratio, batch, sq, compressed_offset, query.device
                 )
-                flat_indices, _ = sbhd_build(window_indices, compressed_indices, batch_size=batch)
+                flat_indices, _ = build_flat_topk_idxs(
+                    window_indices, compressed_indices, batch_size=batch
+                )
             else:
-                flat_indices, _ = sbhd_build(window_indices, batch_size=batch)
+                flat_indices, _ = build_flat_topk_idxs(window_indices, batch_size=batch)
             nvtx_range_pop("compressed_indices")
 
             nvtx_range_push("sparse_attn_kernel")
-            output = sbhd_attention(
+            output = csa_sparse_attn(
                 query, kv_full, self.attn_sink.float(), flat_indices, self.softmax_scale
             )
             nvtx_range_pop("sparse_attn_kernel")
@@ -1725,7 +1683,7 @@ class CompressedSparseAttention(MegatronModule):
                 local_compressed_kv_grad_edge,
                 cp_group,
                 d_window + l_local,
-                seq_to_rank_row,
+                seq_to_rank_row if not sparse_indexer_loss else None,
                 indexer_k_rs_state,
                 compressed_kv_rs_state,
                 self.window_size,
