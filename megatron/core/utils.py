@@ -2330,6 +2330,7 @@ def get_sft_batch_on_this_cp_rank(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
+        _validate_per_document_cp_lengths(cu_seqlens_for_te, cp_size)
         index = tex.thd_get_partitioned_indices(
             cu_seqlens_for_te,
             (
@@ -3062,6 +3063,19 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     return batch
 
 
+def _validate_per_document_cp_lengths(cu_seqlens: torch.Tensor, cp_size: int) -> None:
+    """Reject physical document layouts that THD zigzag attention cannot represent."""
+    # Equal front/back segments are required by both TE attention and THD RoPE.
+    # Complete token ownership alone does not establish a valid document layout.
+    document_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    if torch.any(document_lengths % (2 * cp_size) != 0):
+        raise ValueError(
+            "Per-document context parallelism requires each physical document length "
+            f"to be divisible by 2 * CP size ({2 * cp_size}); got "
+            f"{document_lengths.tolist()}. Supply aligned cu_seqlens_padded or use CP=1."
+        )
+
+
 def _get_batch_on_this_cp_rank_per_document_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
@@ -3097,6 +3111,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
+        _validate_per_document_cp_lengths(cu_seqlens_for_te, cp_size)
         index = tex.thd_get_partitioned_indices(
             cu_seqlens_for_te,
             (

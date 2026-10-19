@@ -2602,6 +2602,7 @@ def training_log(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
