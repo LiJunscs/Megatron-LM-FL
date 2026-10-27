@@ -425,7 +425,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             and decoder.config.recompute_granularity == 'selective'
             and "mhc" in decoder.config.recompute_modules
         )
-        # If not enable_hyper_connections, the mhc_layer_managers will be all None and mhc_is_last_in_recompute_block will be all False, so it won't have effect on execution.
+        # If not enable_hyper_connections, the mhc_layer_managers will be all None and mhc_is_last_in_recompute_block will be all False,
+        # so it won't have effect on execution.
         self.mhc_layer_managers, self.mhc_is_last_in_recompute_block = (
             decoder._build_mhc_recompute_layer_plan(use_mhc_recompute)
         )
