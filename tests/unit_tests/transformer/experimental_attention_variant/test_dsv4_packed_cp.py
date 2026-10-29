@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""DSv4 backend, packed-layout and CP parity; run with two or four ranks."""
+"""DSv4 backend, packed-layout and CP parity; run with two, four or eight ranks."""
 
 import json
 from copy import copy
@@ -365,8 +365,8 @@ def test_packed_cp_matches_full_attention_and_gradients(
 )
 def test_packed_cp2_optimizer_steps_match_cp1():
     """Two real cuDNN training steps preserve replicated parameters and the CP1 update."""
-    if Utils.world_size != 2:
-        pytest.skip("requires exactly two ranks")
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip("requires a multiple of two ranks for independent CP2 groups")
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
     )

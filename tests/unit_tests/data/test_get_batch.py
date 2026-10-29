@@ -920,7 +920,10 @@ def test_packed_gpt_batch_keeps_real_and_physical_metadata(tp, pp, cp, dsv4):
 
     if Utils.world_size % (tp * pp * cp):
         pytest.skip("launch size does not support this TP/PP/CP topology")
-    args = initialize_test_environment(tp, pp, cp, 64, 2, global_batch_size=4, sft=True)
+    data_parallel_size = Utils.world_size // (tp * pp * cp)
+    args = initialize_test_environment(
+        tp, pp, cp, 64, 2, global_batch_size=2 * data_parallel_size, sft=True
+    )
     try:
         if dsv4:
             args.experimental_attention_variant = 'dsv4_hybrid'
@@ -957,5 +960,71 @@ def test_packed_gpt_batch_keeps_real_and_physical_metadata(tp, pp, cp, dsv4):
                 )
         if parallel_state.is_pipeline_last_stage():
             assert batch[4].shape == (1, local_count)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_pretraining_packed_metadata_reaches_intermediate_pipeline_stages():
+    """Inter-document GPT pretraining needs data and THD metadata on every PP stage."""
+    from pretrain_gpt import forward_step, is_dataset_built_on_rank
+
+    if Utils.world_size != 8:
+        pytest.skip("requires PP4/CP2 on eight ranks, including intermediate pipeline stages")
+    args = initialize_test_environment(1, 4, 2, 512, 1, global_batch_size=4, sft=False)
+    try:
+        args.experimental_attention_variant = "dsv4_hybrid"
+        args.multi_latent_attention = True
+        args.csa_compress_ratios = [0, 0, 4, 128]
+        args.v_head_dim = 512
+        args.qk_pos_emb_head_dim = 64
+        args.q_lora_rank = 64
+        args.dsa_kernel_backend = "cudnn"
+        args.dataloader_inter_document_masking = True
+        args.variable_seq_lengths = True
+        built = torch.tensor(int(is_dataset_built_on_rank()), device="cuda")
+        torch.distributed.all_reduce(built)
+        assert (
+            built.item() == Utils.world_size
+        ), "packed pretraining omitted intermediate PP datasets"
+        real = torch.tensor([[0, 96, 216, 456]], dtype=torch.int32, device="cuda")
+        physical = torch.tensor([[0, 128, 256, 512]], dtype=torch.int32, device="cuda")
+        tokens = torch.arange(512, device="cuda").view(1, -1)
+        sample = dict(
+            tokens=tokens,
+            labels=tokens.clone(),
+            loss_mask=torch.ones_like(tokens).float(),
+            position_ids=tokens.clone(),
+            cu_seqlens=real,
+            cu_seqlens_padded=physical,
+            max_seqlen=torch.tensor([256], device="cuda", dtype=torch.int32),
+        )
+        cp_rank = parallel_state.get_context_parallel_rank()
+
+        class Consumer(torch.nn.Module):
+            vp_stage = None
+
+            def forward(self, tokens, positions, attention_mask, **kwargs):
+                packed = kwargs["packed_seq_params"]
+                assert packed.qkv_format == "thd"
+                assert packed.cu_seqlens_q.tolist() == real[0].tolist()
+                assert packed.cu_seqlens_q_padded.tolist() == physical[0].tolist()
+                assert packed.total_tokens == 512
+                assert packed.max_seqlen_q == 256
+                mask = kwargs["padding_mask"]
+                positions_local = torch.arange(cp_rank * 256, (cp_rank + 1) * 256, device="cuda")
+                expected = (
+                    ((positions_local >= 96) & (positions_local < 128))
+                    | ((positions_local >= 248) & (positions_local < 256))
+                    | (positions_local >= 496)
+                )
+                assert torch.equal(mask, expected.view(1, -1))
+                if parallel_state.is_pipeline_first_stage():
+                    assert torch.equal(tokens, positions_local.view(1, -1))
+                elif not parallel_state.is_pipeline_last_stage():
+                    assert tokens is None and kwargs["labels"] is None
+                return torch.zeros((1, 256), device="cuda")
+
+        output, _ = forward_step(iter([sample]), Consumer())
+        assert output.shape == (1, 256)
     finally:
         Utils.destroy_model_parallel()

@@ -319,7 +319,9 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or args.dataloader_inter_document_masking:
+        # Packed pretraining needs document metadata on intermediate PP/VPP
+        # stages too, even though those stages do not consume token payloads.
         return True
     return (
         is_first_or_last_pipeline_stage(vp_stage)

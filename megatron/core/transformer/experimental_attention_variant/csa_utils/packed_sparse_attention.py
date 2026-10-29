@@ -25,7 +25,7 @@ from .fused_sparse_attention import (
     _csa_sparse_attention_backward,
 )
 from .fused_sparse_attention import _get_topk_alignment as get_flash_mla_topk_alignment
-from .fused_sparse_attention import _kl_loss_from_dense_scores
+from .fused_sparse_attention import _kl_loss_from_dense_scores, _pad_cudnn_indexer_topk
 
 _DSA: Any = None
 
@@ -346,6 +346,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
 
         if sparse_loss:
+            indexer_topk_idxs = _pad_cudnn_indexer_topk(indexer_topk_idxs)
+            indexer_topk = indexer_topk_idxs.shape[-1]
             indexer_topk_idxs_for_loss = indexer_topk_idxs
             if q_padding_mask is not None:
                 indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
